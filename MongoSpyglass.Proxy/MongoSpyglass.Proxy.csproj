@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>net7.0</TargetFramework>
@@ -9,12 +9,20 @@
 
   <ItemGroup>
     <PackageReference Include="Autofac.Extensions.DependencyInjection" Version="*" />
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.7.0" />
     <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="*" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="*" />
     <PackageReference Include="Microsoft.IO.RecyclableMemoryStream" Version="2.3.2" />
     <PackageReference Include="MongoDB.Bson" Version="2.19.1" />
     <PackageReference Include="Polly" Version="*" />
     <PackageReference Include="Simple.Arena" Version="1.7.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\MongoSpyglass.Proxy.SourceGenerators\MongoSpyglass.Proxy.SourceGenerators.csproj" 
+                      OutputItemType="Analyzer" 
+                      PrivateAssets="all"
+                      ReferenceOutputAssembly="false" />
   </ItemGroup>
 
 </Project>

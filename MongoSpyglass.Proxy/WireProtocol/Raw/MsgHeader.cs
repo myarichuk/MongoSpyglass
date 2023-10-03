@@ -8,7 +8,7 @@ using System.Threading.Tasks;
 namespace MongoSpyglass.Proxy.WireProtocol.Raw;
 
 [StructLayout(LayoutKind.Sequential, Pack = 0)]
-internal ref struct MsgHeader
+public ref struct MsgHeader
 {
     public int MessageLength;
 

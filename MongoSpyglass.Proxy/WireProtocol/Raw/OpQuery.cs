@@ -3,7 +3,7 @@
 namespace MongoSpyglass.Proxy.WireProtocol.Raw
 {
     [StructLayout(LayoutKind.Sequential, Pack = 0)]
-    internal ref struct OpQuery
+    public ref struct OpQuery
     {
         [Flags]
         public enum OperationFlags : int
