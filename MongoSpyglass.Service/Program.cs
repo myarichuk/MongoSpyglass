@@ -14,7 +14,7 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddRazorPages();
 builder.Services.AddServerSideBlazor();
 builder.Services.AddSingleton<WeatherForecastService>();
-builder.Services.AddHostedService<MongoDbProxy>();
+//builder.Services.AddHostedService<MongoDbProxy>();
 
 // Create a container builder
 var containerBuilder = new ContainerBuilder();

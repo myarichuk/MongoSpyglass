@@ -1,12 +1,13 @@
 ﻿using System.Runtime.InteropServices;
+using MongoSpyglass.Proxy.WireProtocol.Raw.Parts;
 
-namespace MongoSpyglass.Proxy.WireProtocol
+namespace MongoSpyglass.Proxy.WireProtocol.Raw
 {
     [StructLayout(LayoutKind.Sequential)]
-    internal unsafe struct OpMsg
+    public unsafe ref struct OpMsg
     {
         [Flags]
-        internal enum FlagBits : uint
+        public enum FlagBits : uint
         {
             None = 0,
             ChecksumPresent = 1 << 0,
@@ -15,6 +16,6 @@ namespace MongoSpyglass.Proxy.WireProtocol
         }
 
         public FlagBits Flags;
-        public Section* Sections;
+        public Span<byte> Sections;
     }
 }

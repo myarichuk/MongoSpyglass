@@ -19,10 +19,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\MongoSpyglass.Proxy.SourceGenerators\MongoSpyglass.Proxy.SourceGenerators.csproj" 
-                      OutputItemType="Analyzer" 
-                      PrivateAssets="all"
-                      ReferenceOutputAssembly="false" />
+    <ProjectReference Include="..\MongoSpyglass.Proxy.SourceGenerators\MongoSpyglass.Proxy.SourceGenerators.csproj" OutputItemType="Analyzer" PrivateAssets="all" ReferenceOutputAssembly="false" />
   </ItemGroup>
 
 </Project>

@@ -6,8 +6,8 @@ public class GrowableArena : IDisposable
 {
     private readonly bool _isOwnerOfArenaPool;
     private readonly List<Arena> _arenas = new();
-    private List<IDisposable>? _arenaHandles = new();
-    private ArenaPool? _arenaPool;
+    private readonly List<IDisposable> _arenaHandles = new();
+    private ArenaPool _arenaPool;
     
     public GrowableArena(ArenaPool? arenaPool = null)
     {
@@ -37,12 +37,12 @@ public class GrowableArena : IDisposable
         {
             h.Dispose();
         });
-        _arenaHandles = null;
+        
         _arenas.Clear();
+
         if (_isOwnerOfArenaPool)
         {
             _arenaPool.Dispose();
-            _arenaPool = null;
         }
     }
 }

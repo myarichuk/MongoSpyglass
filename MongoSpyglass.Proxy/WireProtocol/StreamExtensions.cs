@@ -1,15 +1,13 @@
 ﻿using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
-using Microsoft.IO;
+
 // ReSharper disable ComplexConditionExpression
 
 namespace MongoSpyglass.Proxy.WireProtocol
 {
     public static class StreamExtensions
     {
-        private static readonly RecyclableMemoryStreamManager MemoryStreamManager = new();
-
         public static bool TryRead<TValue>(this Stream stream, out TValue value) where TValue : unmanaged
         {
             value = default;
