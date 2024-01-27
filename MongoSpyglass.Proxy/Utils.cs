@@ -81,12 +81,5 @@ internal unsafe class Utils
         return documentBytes;
     }
 
-    public static unsafe BsonDocument BytePtrToBsonDocument(byte* ptr, int length)
-    {
-        // Create a MemoryStream and a BsonBinaryReader for deserialization
-        using var memoryStream = new UnmanagedMemoryStream(ptr, length);
-        using var reader = new BsonBinaryReader(memoryStream);
 
-        return BsonSerializer.Deserialize<BsonDocument>(reader);
-    }
 }

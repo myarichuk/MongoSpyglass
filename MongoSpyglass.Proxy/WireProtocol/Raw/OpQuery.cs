@@ -1,24 +1,11 @@
-﻿using System.Runtime.InteropServices;
+﻿using Simple.Arena;
+using System.Runtime.InteropServices;
 
 namespace MongoSpyglass.Proxy.WireProtocol.Raw
 {
     [StructLayout(LayoutKind.Sequential, Pack = 0)]
     public ref struct OpQuery
     {
-        [Flags]
-        public enum OperationFlags : int
-        {
-            None = 0,                 // 0 is reserved. Must be set to 0
-            TailableCursor = 1 << 0,  // 1 corresponds to TailableCursor
-            SlaveOk = 1 << 1,         // 2 corresponds to SlaveOk
-            OplogReplay = 1 << 2,     // 3 corresponds to OplogReplay
-            NoCursorTimeout = 1 << 3, // 4 corresponds to NoCursorTimeout
-            AwaitData = 1 << 4,       // 5 corresponds to AwaitData
-            Exhaust = 1 << 5,         // 6 corresponds to Exhaust
-            Partial = 1 << 6          // 7 corresponds to Partial
-            // 8-31 are reserved. Must be set to 0.
-        }
-
         public OperationFlags Flags;
 
         public Span<char> FullCollectionName; //C-style string
@@ -28,5 +15,37 @@ namespace MongoSpyglass.Proxy.WireProtocol.Raw
 
         public Span<byte> Query; //BSON document
         public Span<byte> ReturnFieldsSelector; //BSON document
+
+        public static unsafe OpQuery FromBytes(Span<byte> pBytes)
+        {
+            var pOpQuery = (OpQuery*)pBytes.ToIntPtr().ToPointer();
+
+            return new OpQuery
+            {
+                Flags = pOpQuery->Flags,
+                FullCollectionName = pOpQuery->FullCollectionName,
+                NumberToSkip = pOpQuery->NumberToSkip,
+                NumberToReturn = pOpQuery->NumberToReturn,
+                Query = pOpQuery->Query,
+                ReturnFieldsSelector = pOpQuery->ReturnFieldsSelector
+            };
+        }
+
+        public unsafe Span<byte> ToBytes(GrowableArena allocator)
+        {
+            var opQuery = this;
+            var outputValue = allocator.Allocate<byte>((sizeof(int) * 3) + opQuery.FullCollectionName.Length + opQuery.Query.Length + opQuery.ReturnFieldsSelector.Length);
+
+            var pOpQuery = (OpQuery*)outputValue.ToIntPtr().ToPointer();
+
+            pOpQuery->Flags = opQuery.Flags;
+            pOpQuery->FullCollectionName = opQuery.FullCollectionName;
+            pOpQuery->NumberToSkip = opQuery.NumberToSkip;
+            pOpQuery->NumberToReturn = opQuery.NumberToReturn;
+            pOpQuery->Query = opQuery.Query;
+            pOpQuery->ReturnFieldsSelector = opQuery.ReturnFieldsSelector;
+
+            return outputValue;
+        }
     }
 }

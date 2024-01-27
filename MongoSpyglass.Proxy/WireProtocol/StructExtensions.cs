@@ -1,4 +1,8 @@
-﻿using System.Runtime.InteropServices;
+﻿using MongoDB.Bson.IO;
+using MongoDB.Bson.Serialization;
+using MongoDB.Bson;
+using System.Runtime.InteropServices;
+using Simple.Arena;
 
 namespace MongoSpyglass.Proxy.WireProtocol
 {
@@ -12,6 +16,25 @@ namespace MongoSpyglass.Proxy.WireProtocol
             pValue.CopyTo(outputValue);
 
             return outputValue;
+        }
+
+        public static unsafe string AsString(this Span<char> data) =>
+            new string((char*)data.ToIntPtr().ToPointer());
+
+        public static unsafe BsonDocument AsBson(this Span<byte> data)
+        {              
+            if(data.Length == 0)
+            {
+                return BsonDocument.Parse("{}");
+            }
+
+            using var memoryStream = new UnmanagedMemoryStream(
+                (byte*)data.ToIntPtr().ToPointer(), 
+                data.Length);
+
+            using var reader = new BsonBinaryReader(memoryStream);
+
+            return BsonSerializer.Deserialize<BsonDocument>(reader);
         }
     }
 }

@@ -13,7 +13,12 @@ Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "MongoSpyglass.Proxy.Tests",
 EndProject
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Benchmarks", "Benchmarks\Benchmarks.csproj", "{D3F4187E-EB12-4A0D-959D-54D3FCA058F3}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MongoSpyglass.Proxy.SourceGenerators", "MongoSpyglass.Proxy.SourceGenerators\MongoSpyglass.Proxy.SourceGenerators.csproj", "{759DE95D-47D5-4E39-B86A-D93F6B497D43}"
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "MongoSpyglass.Proxy.SourceGenerators", "MongoSpyglass.Proxy.SourceGenerators\MongoSpyglass.Proxy.SourceGenerators.csproj", "{759DE95D-47D5-4E39-B86A-D93F6B497D43}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Solution Items", "Solution Items", "{09A8184A-5C4B-4929-92AA-923AE13D6E00}"
+	ProjectSection(SolutionItems) = preProject
+		.editorconfig = .editorconfig
+	EndProjectSection
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution

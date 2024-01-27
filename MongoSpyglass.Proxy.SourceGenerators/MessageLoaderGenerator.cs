@@ -1,25 +1,23 @@
 ﻿using System.Collections.Generic;
 using System.Diagnostics;
-using System.Linq;
 using System.Text;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Text;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.CSharp;
-// ReSharper disable ComplexConditionExpression
+using System.Linq;
 
 namespace MongoSpyglass.Proxy
 {
     [Generator]
-    public class MessageVisitorGenerator : ISourceGenerator
+    public class MessageLoaderGenerator : ISourceGenerator
     {
         private static readonly string[] NetCoreAssemblies = { 
             "System.Private.CoreLib", 
             "System.Runtime", 
             "netstandard" 
         };
-
-        private readonly HashSet<string> _candidatesForVisitors = new();
+        private readonly HashSet<string> _candidatesForMutateors = new();
 
         public void Initialize(GeneratorInitializationContext context)
         {
@@ -49,7 +47,7 @@ namespace MongoSpyglass.Proxy
                             .StartsWith("MongoSpyglass.Proxy.WireProtocol.Raw"))
                         continue;
 
-                    _candidatesForVisitors.Add(symbol.ToDisplayString());
+                    _candidatesForMutateors.Add(symbol.ToDisplayString());
                 }
             }
 
@@ -70,29 +68,30 @@ namespace MongoSpyglass.Proxy
                                   .StartsWith("MongoSpyglass.Proxy.WireProtocol.Raw"))
                         continue;
 
-                    var sourceCode = GenerateVisitorCode(symbol);
-                    context.AddSource($"{symbol.Name}.VisitorBase", SourceText.From(sourceCode, Encoding.UTF8));
+                    var sourceCode = GenerateMutatorCode(symbol);
+                    context.AddSource($"{symbol.Name}.LoaderBase", SourceText.From(sourceCode, Encoding.UTF8));
                 }
             }
         }
 
-        private string GenerateVisitorCode(INamedTypeSymbol symbol)
+        private string GenerateMutatorCode(INamedTypeSymbol symbol)
         {
             var sb = new StringBuilder();
+
             sb.AppendLine("using System;");
             sb.AppendLine($"namespace {symbol.ContainingNamespace}");
             sb.AppendLine("{");
-            sb.AppendLine($"    public abstract class {symbol.Name}VisitorBase");
+            sb.AppendLine($"    public abstract class {symbol.Name}LoaderBase<TSource>");
             sb.AppendLine("    {");
 
-            GenerateVisitorMethods(symbol, sb);
+            GenerateMutateMethods(symbol, sb);
 
             sb.AppendLine("    }");
             sb.AppendLine("}");
             return sb.ToString();
         }
 
-        private void GenerateVisitorMethods(INamedTypeSymbol symbol, StringBuilder sb)
+        private void GenerateMutateMethods(INamedTypeSymbol symbol, StringBuilder sb)
         {
             foreach (var member in 
                      symbol.GetMembers()
@@ -101,31 +100,31 @@ namespace MongoSpyglass.Proxy
                 //var memberType = member.Type.ToDisplayString();
                 //var memberName = member.Name;
 
-                // if member type is another ref struct, generate an abstract factory method for its visitor
                 if (!IsPrimitive(member.Type) &&
                     !IsCoreBclType(member.Type) &&
                     member.Type is INamedTypeSymbol { TypeKind: TypeKind.Struct, IsRefLikeType: true } nestedSymbol)
                 {
-                    sb.AppendLine($"        protected abstract {nestedSymbol.Name}VisitorBase Create{nestedSymbol.Name}Visitor();");
+                    sb.AppendLine($"        protected abstract {nestedSymbol.Name}LoaderBase<TSource> Create{nestedSymbol.Name}Loader();");
                 }
             }
 
             foreach (var member in symbol.GetMembers()
                          .OfType<IFieldSymbol>()
                          .Where(member => 
-                             !_candidatesForVisitors.Contains(member.ToDisplayString()) &&
+                             !_candidatesForMutateors.Contains(member.ToDisplayString()) &&
                              (IsCoreBclType(member.Type) || 
                              IsPrimitive(member.Type) ||
                              member.Type is INamedTypeSymbol { TypeKind: TypeKind.Enum })))
             {
                 var memberType = member.Type.ToDisplayString();
                 var memberName = member.Name;
-                sb.AppendLine($"        public abstract void Visit{memberName}({memberType} value);");
+                sb.AppendLine($"        public abstract {memberType} Load{memberName}(TSource source, GrowableArena allocator);");
             }
 
             sb.AppendLine();
-            sb.AppendLine($"        public void Visit(ref {symbol.Name} item)");
+            sb.AppendLine($"        public {symbol.Name} Load(TSource source, GrowableArena allocator)");
             sb.AppendLine("        {");
+            sb.AppendLine($"            var item = new {symbol.Name}();");
 
             foreach (var member in symbol.GetMembers()
                          .OfType<IFieldSymbol>()
@@ -138,19 +137,22 @@ namespace MongoSpyglass.Proxy
                 if (member.Type is INamedTypeSymbol { TypeKind: TypeKind.Struct } nestedSymbol && 
                     !IsCoreBclType(member.Type))
                 {
-                    sb.AppendLine($"            Create{nestedSymbol.Name}Visitor().Visit(ref item.{memberName});");
+                    sb.AppendLine($"            var subItem = Create{nestedSymbol.Name}Loader().Load(source, allocator);");
+                    sb.AppendLine($"            item.{memberName} = subItem;");
+
                 }
                 else // For other non-primitive types, just visit the field
                 {
-                    sb.AppendLine($"            Visit{memberName}(item.{memberName});");
+                    sb.AppendLine($"            item.{memberName} = Load{memberName}(source, allocator);");
                 }
             }
-
+            sb.AppendLine("            return item;");
             sb.AppendLine("        }");
         }
 
-        private static bool IsPrimitive(ITypeSymbol type) =>
-            type.SpecialType switch
+        private static bool IsPrimitive(ITypeSymbol type)
+        {
+            return type.SpecialType switch
             {
                 SpecialType.System_Byte => true,
                 SpecialType.System_SByte => true,
@@ -166,6 +168,7 @@ namespace MongoSpyglass.Proxy
                 SpecialType.System_Boolean => true,
                 _ => false,
             };
+        }
 
         private static bool IsCoreBclType(ITypeSymbol type) => 
             NetCoreAssemblies.Contains(type.ContainingAssembly.Name);

@@ -7,21 +7,50 @@ using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.CSharp;
 using System.Linq;
 
-namespace MongoSpyglass.Proxy.SourceGenerators
+namespace MongoSpyglass.Proxy
 {
     [Generator]
     public class MessageMutatorGenerator : ISourceGenerator
     {
+        private static readonly string[] NetCoreAssemblies = { 
+            "System.Private.CoreLib", 
+            "System.Runtime", 
+            "netstandard" 
+        };
+        private readonly HashSet<string> _candidatesForMutateors = new();
+
         public void Initialize(GeneratorInitializationContext context)
         {
         }
 
         public void Execute(GeneratorExecutionContext context)
         {
-            if (!Debugger.IsAttached)
+            //if (!Debugger.IsAttached)
+            //{
+            //    Debugger.Launch();
+            //}
+
+            foreach (var syntaxTree in context.Compilation.SyntaxTrees)
             {
-                Debugger.Launch();
+                var model = context.Compilation.GetSemanticModel(syntaxTree);
+                var refStructs = syntaxTree.GetRoot()
+                    .DescendantNodes()
+                    .OfType<StructDeclarationSyntax>()
+                    .Where(s => s.Modifiers.Any(SyntaxKind.RefKeyword));
+
+                foreach (var refStruct in refStructs)
+                {
+                    var symbol = model.GetDeclaredSymbol(refStruct);
+                    if (symbol == null ||
+                        !symbol.ContainingNamespace
+                            .ToDisplayString()
+                            .StartsWith("MongoSpyglass.Proxy.WireProtocol.Raw"))
+                        continue;
+
+                    _candidatesForMutateors.Add(symbol.ToDisplayString());
+                }
             }
+
 
             foreach (var syntaxTree in context.Compilation.SyntaxTrees)
             {
@@ -49,7 +78,6 @@ namespace MongoSpyglass.Proxy.SourceGenerators
         private string GenerateMutatorCode(INamedTypeSymbol symbol)
         {
             var sb = new StringBuilder();
-            var candidatesForMutators = new Queue<INamedTypeSymbol>();
 
             sb.AppendLine("using System;");
             sb.AppendLine($"namespace {symbol.ContainingNamespace}");
@@ -57,49 +85,71 @@ namespace MongoSpyglass.Proxy.SourceGenerators
             sb.AppendLine($"    public abstract class {symbol.Name}MutatorBase");
             sb.AppendLine("    {");
 
-            // Kick off BFS
-            candidatesForMutators.Enqueue(symbol);
-            while (candidatesForMutators.Count > 0)
-            {
-                var currentSymbol = candidatesForMutators.Dequeue();
-                GenerateMutateMethod(currentSymbol, sb, candidatesForMutators);
-            }
+            GenerateMutateMethods(symbol, sb);
 
             sb.AppendLine("    }");
             sb.AppendLine("}");
             return sb.ToString();
         }
 
-        private void GenerateMutateMethod(INamedTypeSymbol symbol, StringBuilder sb, Queue<INamedTypeSymbol> candidatesForMutators)
+        private void GenerateMutateMethods(INamedTypeSymbol symbol, StringBuilder sb)
         {
-            sb.AppendLine($"        public void Mutate(ref {symbol.Name} item)");
-            sb.AppendLine("        {");
+            foreach (var member in 
+                     symbol.GetMembers()
+                           .OfType<IFieldSymbol>())
+            {
+                //var memberType = member.Type.ToDisplayString();
+                //var memberName = member.Name;
 
-            foreach (var member in symbol.GetMembers().OfType<IFieldSymbol>())
+                if (!IsPrimitive(member.Type) &&
+                    !IsCoreBclType(member.Type) &&
+                    member.Type is INamedTypeSymbol { TypeKind: TypeKind.Struct, IsRefLikeType: true } nestedSymbol)
+                {
+                    sb.AppendLine($"        protected abstract {nestedSymbol.Name}MutatorBase Create{nestedSymbol.Name}Mutator();");
+                }
+            }
+
+            foreach (var member in symbol.GetMembers()
+                         .OfType<IFieldSymbol>()
+                         .Where(member => 
+                             !_candidatesForMutateors.Contains(member.ToDisplayString()) &&
+                             (IsCoreBclType(member.Type) || 
+                             IsPrimitive(member.Type) ||
+                             member.Type is INamedTypeSymbol { TypeKind: TypeKind.Enum })))
             {
                 var memberType = member.Type.ToDisplayString();
                 var memberName = member.Name;
+                sb.AppendLine($"        public abstract {memberType} Mutate{memberName}({memberType} value);");
+            }
 
-                // If member type is another ref struct, enqueue it for BFS and call its mutator
-                if (member.Type is INamedTypeSymbol nestedSymbol && nestedSymbol.TypeKind == TypeKind.Struct)
+            sb.AppendLine();
+            sb.AppendLine($"        public void Mutate(ref {symbol.Name} item)");
+            sb.AppendLine("        {");
+
+            foreach (var member in symbol.GetMembers()
+                         .OfType<IFieldSymbol>()
+                         .Where(m => 
+                             m.Type is { IsAnonymousType: false }))
+            {
+                var memberName = member.Name;
+
+                // If member type is another ref struct, delegate to its visitor using the factory method
+                if (member.Type is INamedTypeSymbol { TypeKind: TypeKind.Struct } nestedSymbol && 
+                    !IsCoreBclType(member.Type))
                 {
+                    sb.AppendLine($"            item.{memberName} = new(); //give default value before passing it through 'ref' param");
                     sb.AppendLine($"            Create{nestedSymbol.Name}Mutator().Mutate(ref item.{memberName});");
-                    candidatesForMutators.Enqueue(nestedSymbol);
                 }
-                else if (IsPrimitiveType(member.Type)) // For primitive types
+                else // For other non-primitive types, just visit the field
                 {
-                    sb.AppendLine($"            item.{memberName} = default;");  // reset to default, or any other mutation logic
-                }
-                else // For other non-primitive types
-                {
-                    sb.AppendLine($"            // Custom mutation logic for {memberName} of type {memberType}");
+                    sb.AppendLine($"            item.{memberName} = Mutate{memberName}(item.{memberName});");
                 }
             }
 
             sb.AppendLine("        }");
         }
 
-        private bool IsPrimitiveType(ITypeSymbol type)
+        private static bool IsPrimitive(ITypeSymbol type)
         {
             return type.SpecialType switch
             {
@@ -118,5 +168,8 @@ namespace MongoSpyglass.Proxy.SourceGenerators
                 _ => false,
             };
         }
+
+        private static bool IsCoreBclType(ITypeSymbol type) => 
+            NetCoreAssemblies.Contains(type.ContainingAssembly.Name);
     }
 }

@@ -1,6 +1,5 @@
 ﻿using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-using System.Text;
 
 // ReSharper disable ComplexConditionExpression
 
@@ -8,6 +7,38 @@ namespace MongoSpyglass.Proxy.WireProtocol
 {
     public static class StreamExtensions
     {
+        public static bool TryReadEnum<TEnum, TEnumType>(this Stream stream, out TEnum enumValue) 
+            where TEnum : struct
+            where TEnumType: unmanaged
+        {
+            enumValue = default;
+
+            if(!stream.TryRead<TEnumType>(out var fetchedValue) || 
+               !Enum.TryParse<TEnum>(fetchedValue.ToString(), out var parsedEnumValue))
+            {                
+                return false;
+            }
+            
+            enumValue = parsedEnumValue;
+            return true;
+        }
+
+        public static bool TryReadEnum<TEnum>(this Stream stream, out TEnum enumValue) 
+            where TEnum : struct
+        {
+            enumValue = default;
+
+            if(!stream.TryRead<int>(out var fetchedValue) || 
+               !Enum.TryParse<TEnum>(fetchedValue.ToString(), out var parsedEnumValue))
+            {                
+                return false;
+            }
+            
+            enumValue = parsedEnumValue;
+            return true;
+        }
+
+
         public static bool TryRead<TValue>(this Stream stream, out TValue value) where TValue : unmanaged
         {
             value = default;
@@ -82,5 +113,29 @@ namespace MongoSpyglass.Proxy.WireProtocol
             return true;
         }
 
+        public static unsafe bool TryReadBson(this Stream stream, GrowableArena allocator, out Span<byte> bsonAsBytes)
+        {
+            bsonAsBytes = default;
+            
+            //read the length of the BSON document (first 4 bytes)
+            if(!stream.TryRead<int>(out var length) || length == 0)
+            {
+                return false;
+            }
+
+            bsonAsBytes = allocator.Allocate<byte>(length);            
+            var lengthBytes = length.AsBytes(allocator);
+
+            //first push the length into the document bytes
+            for (int index = 0; index < 4; index++)
+            {
+                bsonAsBytes[index] = lengthBytes[index];
+            }
+
+            //read the rest of the BSON document
+            stream.Read(bsonAsBytes[4..]);
+
+            return true;
+        }
     }
 }

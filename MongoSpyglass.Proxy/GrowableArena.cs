@@ -33,10 +33,10 @@ public class GrowableArena : IDisposable
 
     public void Dispose()
     {
-        _arenaHandles.ForEach(h =>
+        foreach(var handle in _arenaHandles)
         {
-            h.Dispose();
-        });
+            handle.Dispose();
+        };
         
         _arenas.Clear();
 
