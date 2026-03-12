@@ -133,7 +133,14 @@ namespace MongoSpyglass.Proxy.WireProtocol
             }
 
             //read the rest of the BSON document
-            stream.Read(bsonAsBytes[4..]);
+            try
+            {
+                stream.ReadExactly(bsonAsBytes[4..]);
+            }
+            catch (EndOfStreamException)
+            {
+                return false;
+            }
 
             return true;
         }

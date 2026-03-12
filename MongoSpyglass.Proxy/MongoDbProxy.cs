@@ -137,7 +137,14 @@ public class MongoDbProxy : IHostedService
 
             var buffer = memoryAllocator.Allocate<byte>(msgHeader.MessageLength - sizeof(MsgHeader));
 
-            sourceStream.Read(buffer);
+            try
+            {
+                sourceStream.ReadExactly(buffer);
+            }
+            catch (EndOfStreamException)
+            {
+                return; // EOF
+            }
 
             using var memoryStream = new UnmanagedMemoryStream((byte*)buffer.ToIntPtr(), buffer.Length);
             Span<byte> stuffToWrite = default;
@@ -171,11 +178,13 @@ public class MongoDbProxy : IHostedService
     {
         Span<byte> buffer = stackalloc byte[sizeof(MsgHeader)];
 
-        var readBytes = stream.Read(buffer);
-
-        if (readBytes != sizeof(MsgHeader))
+        try
         {
-            return false;
+            stream.ReadExactly(buffer);
+        }
+        catch (EndOfStreamException)
+        {
+            return false; // EOF
         }
 
         fixed (byte* pBuffer = &MemoryMarshal.GetReference(buffer))

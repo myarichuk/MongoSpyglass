@@ -44,7 +44,14 @@ internal class OpMsgLoader : OpMsgLoaderBase<Stream>
                     var sectionData = allocator.Allocate<byte>(size);
 
                     size.AsBytes(allocator).CopyTo(sectionData);
-                    source.Read(sectionData[4..]);
+                    try
+                    {
+                        source.ReadExactly(sectionData[4..]);
+                    }
+                    catch (EndOfStreamException)
+                    {
+                        throw new InvalidOperationException("Unexpected EOF while reading section data");
+                    }
                     
                     return sectionData;
                 default:
