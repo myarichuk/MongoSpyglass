@@ -9,6 +9,7 @@ using MongoSpyglass.Proxy.WireProtocol;
 using MongoSpyglass.Proxy.WireProtocol.Raw;
 using Simple.Arena;
 using MongoSpyglass.Proxy.WireProtocol.Raw.Loaders;
+using MongoDB.Bson;
 // ReSharper disable ComplexConditionExpression
 
 // ReSharper disable ExceptionNotDocumentedOptional
@@ -181,10 +182,12 @@ public class MongoDbProxy : IHostedService
             {
                 case OpCode.OP_QUERY:
                     var opQuery = OpQueryLoader.Instance.Load(memoryStream, memoryAllocator);
-                    _ = MongoSpyglass.Proxy.WireProtocol.Typed.OpQuery.FromRaw(opQuery);
+                    var typedOpQuery = MongoSpyglass.Proxy.WireProtocol.Typed.OpQuery.FromRaw(opQuery);
+                    LogOpQuery(tag, msgHeader.RequestId, typedOpQuery);
                     break;
                 case OpCode.OP_MSG:
-                    _ = OpMsgLoader.Instance.Load(memoryStream, memoryAllocator);
+                    var opMsg = OpMsgLoader.Instance.Load(memoryStream, memoryAllocator);
+                    LogOpMsg(tag, msgHeader.RequestId, opMsg);
                     break;
                 default:
                     _logger.LogDebug($"Unsupported opCode: {msgHeader.OpCode}, forwarding transparently.");
@@ -238,5 +241,41 @@ public class MongoDbProxy : IHostedService
         }
 
         return true;
+    }
+
+    private void LogOpQuery(string tag, int requestId, WireProtocol.Typed.OpQuery opQuery)
+    {
+        _logger.LogInformation(
+            "[{Tag}] OP_QUERY #{RequestId} {Collection} skip={NumberToSkip} return={NumberToReturn} flags={Flags} query={Query}",
+            tag,
+            requestId,
+            opQuery.FullCollectionName,
+            opQuery.NumberToSkip,
+            opQuery.NumberToReturn,
+            opQuery.Flags,
+            opQuery.Query.ToJson());
+    }
+
+    private void LogOpMsg(string tag, int requestId, OpMsg opMsg)
+    {
+        if (opMsg.Kind == 0)
+        {
+            var document = opMsg.DataSection.AsBson();
+            _logger.LogInformation(
+                "[{Tag}] OP_MSG #{RequestId} kind=0 flags={Flags} body={Body}",
+                tag,
+                requestId,
+                opMsg.Flags,
+                document.ToJson());
+            return;
+        }
+
+        _logger.LogInformation(
+            "[{Tag}] OP_MSG #{RequestId} kind={Kind} flags={Flags} payloadBytes={PayloadLength}",
+            tag,
+            requestId,
+            opMsg.Kind,
+            opMsg.Flags,
+            opMsg.DataSection.Length);
     }
 }

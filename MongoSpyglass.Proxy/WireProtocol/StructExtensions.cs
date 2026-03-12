@@ -18,8 +18,8 @@ namespace MongoSpyglass.Proxy.WireProtocol
             return outputValue;
         }
 
-        public static unsafe string AsString(this Span<char> data) =>
-            new string((char*)data.ToIntPtr().ToPointer());
+        public static string AsString(this Span<char> data) =>
+            new(data);
 
         public static unsafe BsonDocument AsBson(this Span<byte> data)
         {              
