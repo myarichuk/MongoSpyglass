@@ -8,3 +8,7 @@ The proxy currently validates/parses these MongoDB operations and then forwards 
 - `OP_QUERY` (legacy handshake/query path used by older drivers/mongos).
 
 All other opcodes are forwarded transparently without mutation. This keeps backwards compatibility while avoiding frame corruption for unimplemented messages.
+
+## Protocol reference
+
+- Detailed annotated protocol notes (including legacy paths): `docs/mongodb-wire-protocol.md`.

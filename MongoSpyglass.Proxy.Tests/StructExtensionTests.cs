@@ -58,6 +58,16 @@ public class StructExtensionsTests: IDisposable
 
     }
 
+    [Fact]
+    public void AsString_UsesSpanLength()
+    {
+        Span<char> value = stackalloc[] { 'a', 'b', 'c' };
+
+        var result = value.AsString();
+
+        Assert.Equal("abc", result);
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     private struct SampleStruct
     {
