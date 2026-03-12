@@ -65,56 +65,61 @@ public class MongoDbProxy : IHostedService
                 break;
             }
 
-            using var clientScope = client;
+            _ = Task.Run(() => ProxyConnection(client), _cts.Token);
+        }
+    }
 
-            // Accept a client connection
-            _logger.LogDebug($"Accepted connection from {client.Client.RemoteEndPoint}");
+    private void ProxyConnection(TcpClient client)
+    {
+        using var clientScope = client;
 
-            // Connect to MongoDB server
-            using var server = new TcpClient();
-            await server.ConnectAsync(_mongoDbServer.Address, _mongoDbServer.Port, _cts.Token);
-            _logger.LogDebug($"Connected to MongoDB server {_mongoDbServer}");
+        // Accept a client connection
+        _logger.LogDebug($"Accepted connection from {client.Client.RemoteEndPoint}");
 
-            // Start proxy            
-            Task.WaitAll(
-                Task.Factory.StartNew(() =>
+        // Connect to MongoDB server
+        using var server = new TcpClient();
+        server.Connect(_mongoDbServer.Address, _mongoDbServer.Port);
+        _logger.LogDebug($"Connected to MongoDB server {_mongoDbServer}");
+
+        // Start proxy
+        Task.WaitAll(
+            Task.Factory.StartNew(() =>
+            {
+                while(!_cts.IsCancellationRequested)
                 {
-                    while(!_cts.IsCancellationRequested)
+                    try
                     {
-                        try
+                        if (!ForwardTraffic(client, server, "to"))
                         {
-                            if (!ForwardTraffic(client, server, "to"))
-                            {
-                                break;
-                            }
-                        }
-                        catch (Exception e)
-                        {
-                            _logger.LogError(e, $"Error forwarding traffic from {client.Client.RemoteEndPoint} to {server.Client.RemoteEndPoint}");
-                            throw; //for now, TODO: make better error handling
-                        }
-                    }                   
-                }, _cts.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default),
-                Task.Factory.StartNew(() =>
-                {
-                    while(!_cts.IsCancellationRequested)
-                    {
-                        try
-                        {
-                            if (!ForwardTraffic(server, client, "from"))
-                            {
-                                break;
-                            }
-                        }
-                        catch (Exception e)
-                        {
-                            _logger.LogError(e, $"Error forwarding traffic from {client.Client.RemoteEndPoint} to {server.Client.RemoteEndPoint}");
-                            throw; //for now, TODO: make better error handling
+                            break;
                         }
                     }
-                }, _cts.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default)                               
-            );            
-        }
+                    catch (Exception e)
+                    {
+                        _logger.LogError(e, $"Error forwarding traffic from {client.Client.RemoteEndPoint} to {server.Client.RemoteEndPoint}");
+                        throw; //for now, TODO: make better error handling
+                    }
+                }
+            }, _cts.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default),
+            Task.Factory.StartNew(() =>
+            {
+                while(!_cts.IsCancellationRequested)
+                {
+                    try
+                    {
+                        if (!ForwardTraffic(server, client, "from"))
+                        {
+                            break;
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        _logger.LogError(e, $"Error forwarding traffic from {client.Client.RemoteEndPoint} to {server.Client.RemoteEndPoint}");
+                        throw; //for now, TODO: make better error handling
+                    }
+                }
+            }, _cts.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default)
+        );
     }
 
     public Task StopAsync(CancellationToken cancellationToken)
