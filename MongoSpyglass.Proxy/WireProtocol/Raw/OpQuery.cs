@@ -1,4 +1,5 @@
 ﻿using Simple.Arena;
+using System.Text;
 using System.Runtime.InteropServices;
 
 namespace MongoSpyglass.Proxy.WireProtocol.Raw
@@ -31,20 +32,35 @@ namespace MongoSpyglass.Proxy.WireProtocol.Raw
             };
         }
 
-        public unsafe Span<byte> ToBytes(GrowableArena allocator)
+        public Span<byte> ToBytes(GrowableArena allocator)
         {
             var opQuery = this;
-            var outputValue = allocator.Allocate<byte>((sizeof(int) * 3) + opQuery.FullCollectionName.Length + opQuery.Query.Length + opQuery.ReturnFieldsSelector.Length);
+            var collectionNameLength = Encoding.UTF8.GetByteCount(opQuery.FullCollectionName);
+            var outputValue = allocator.Allocate<byte>(
+                sizeof(int) +
+                collectionNameLength + 1 +
+                sizeof(int) +
+                sizeof(int) +
+                opQuery.Query.Length +
+                opQuery.ReturnFieldsSelector.Length);
 
-            var pOpQuery = (OpQuery*)outputValue.ToIntPtr().ToPointer();
+            var offset = 0;
+            opQuery.Flags.AsBytes(allocator).CopyTo(outputValue[offset..]);
+            offset += sizeof(int);
 
-            pOpQuery->Flags = opQuery.Flags;
-            pOpQuery->FullCollectionName = opQuery.FullCollectionName;
-            pOpQuery->NumberToSkip = opQuery.NumberToSkip;
-            pOpQuery->NumberToReturn = opQuery.NumberToReturn;
-            pOpQuery->Query = opQuery.Query;
-            pOpQuery->ReturnFieldsSelector = opQuery.ReturnFieldsSelector;
+            offset += Encoding.UTF8.GetBytes(opQuery.FullCollectionName, outputValue[offset..]);
+            outputValue[offset++] = 0;
 
+            opQuery.NumberToSkip.AsBytes(allocator).CopyTo(outputValue[offset..]);
+            offset += sizeof(int);
+
+            opQuery.NumberToReturn.AsBytes(allocator).CopyTo(outputValue[offset..]);
+            offset += sizeof(int);
+
+            opQuery.Query.CopyTo(outputValue[offset..]);
+            offset += opQuery.Query.Length;
+
+            opQuery.ReturnFieldsSelector.CopyTo(outputValue[offset..]);
             return outputValue;
         }
     }

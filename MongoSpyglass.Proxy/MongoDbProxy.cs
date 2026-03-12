@@ -27,6 +27,7 @@ public class MongoDbProxy : IHostedService
     private readonly IPEndPoint _mongoDbServer;
     private readonly int _port;
     private readonly ILogger<MongoDbProxy> _logger;
+    private TcpListener? _listener;
 
     public MongoDbProxy(IPEndPoint mongoDbServer, int incomingPort, ILogger<MongoDbProxy> logger)
     {
@@ -46,15 +47,27 @@ public class MongoDbProxy : IHostedService
 
     public async Task StartAsync(CancellationToken cancellationToken)
     {
-        var listener = new TcpListener(IPAddress.Any, _port);
+        _listener = new TcpListener(IPAddress.Any, _port);
 
-        listener.Start();
+        _listener.Start();
         _logger.LogInformation($"Started listening on incoming port {_port}");
 
         while (!_cts.IsCancellationRequested)
         {
+            TcpClient client;
+
+            try
+            {
+                client = await _listener.AcceptTcpClientAsync(_cts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+
+            using var clientScope = client;
+
             // Accept a client connection
-            using var client = await listener.AcceptTcpClientAsync(_cts.Token);
             _logger.LogDebug($"Accepted connection from {client.Client.RemoteEndPoint}");
 
             // Connect to MongoDB server
@@ -70,7 +83,10 @@ public class MongoDbProxy : IHostedService
                     {
                         try
                         {
-                            ForwardTraffic(client, server, "to");
+                            if (!ForwardTraffic(client, server, "to"))
+                            {
+                                break;
+                            }
                         }
                         catch (Exception e)
                         {
@@ -85,7 +101,10 @@ public class MongoDbProxy : IHostedService
                     {
                         try
                         {
-                            ForwardTraffic(server, client, "from");
+                            if (!ForwardTraffic(server, client, "from"))
+                            {
+                                break;
+                            }
                         }
                         catch (Exception e)
                         {
@@ -101,10 +120,11 @@ public class MongoDbProxy : IHostedService
     public Task StopAsync(CancellationToken cancellationToken)
     {
         _cts.Cancel();
+        _listener?.Stop();
         return Task.CompletedTask;
     }
 
-    private unsafe void ForwardTraffic(TcpClient source, TcpClient destination, string tag)
+    private unsafe bool ForwardTraffic(TcpClient source, TcpClient destination, string tag)
     {        
         var sourceStream = source.GetStream();
         var destStream = destination.GetStream();
@@ -132,7 +152,12 @@ public class MongoDbProxy : IHostedService
             var msgHeader = new MsgHeader();
             if (!TryReadHeaderFromStream(sourceStream, ref msgHeader))
             {
-                return;//throw new InvalidOperationException("Unable to read message header");
+                return false;
+            }
+
+            if (msgHeader.MessageLength < sizeof(MsgHeader))
+            {
+                throw new InvalidOperationException($"Invalid message length '{msgHeader.MessageLength}' for opcode '{msgHeader.OpCode}'.");
             }
 
             var buffer = memoryAllocator.Allocate<byte>(msgHeader.MessageLength - sizeof(MsgHeader));
@@ -143,43 +168,49 @@ public class MongoDbProxy : IHostedService
             }
             catch (EndOfStreamException)
             {
-                return; // EOF
+                return false; // EOF
             }
 
             using var memoryStream = new UnmanagedMemoryStream((byte*)buffer.ToIntPtr(), buffer.Length);
-            Span<byte> stuffToWrite = default;
             switch (msgHeader.OpCode)
             {
                 case OpCode.OP_QUERY:
                     var opQuery = OpQueryLoader.Instance.Load(memoryStream, memoryAllocator);
-                    var foo = MongoSpyglass.Proxy.WireProtocol.Typed.OpQuery.FromRaw(opQuery);
-                    stuffToWrite = opQuery.ToBytes(memoryAllocator);
+                    _ = MongoSpyglass.Proxy.WireProtocol.Typed.OpQuery.FromRaw(opQuery);
                     break;
                 case OpCode.OP_MSG:
-                    var opMsg = OpMsgLoader.Instance.Load(memoryStream, memoryAllocator);
-                    stuffToWrite = opMsg.ToBytes(memoryAllocator);
+                    _ = OpMsgLoader.Instance.Load(memoryStream, memoryAllocator);
                     break;
                 default:
                     _logger.LogDebug($"Unsupported opCode: {msgHeader.OpCode}, forwarding transparently.");
-                    // Reconstruct the message: header + body
-                    stuffToWrite = memoryAllocator.Allocate<byte>(sizeof(MsgHeader) + buffer.Length);
-                    fixed (byte* pStuff = &MemoryMarshal.GetReference(stuffToWrite))
-                    {
-                        var pHeader = (MsgHeader*)pStuff;
-                        *pHeader = msgHeader;
-                    }
-                    buffer.CopyTo(stuffToWrite.Slice(sizeof(MsgHeader)));
                     break;
             }
 
+            var stuffToWrite = BuildWireMessage(memoryAllocator, msgHeader, buffer);
+
             destStream.Write(stuffToWrite);
             _logger.LogDebug($"Wrote {stuffToWrite.Length} bytes to {destination.Client.RemoteEndPoint}");
+            return true;
         }
         catch (Exception e)
         {
             _logger.LogError(e, $"Error forwarding traffic from {source.Client.RemoteEndPoint} to {destination.Client.RemoteEndPoint}");
             throw; //for now, TODO: make better error handling
         }
+    }
+
+    private static unsafe Span<byte> BuildWireMessage(GrowableArena allocator, MsgHeader header, Span<byte> body)
+    {
+        var frame = allocator.Allocate<byte>(sizeof(MsgHeader) + body.Length);
+
+        fixed (byte* pFrame = &MemoryMarshal.GetReference(frame))
+        {
+            var pHeader = (MsgHeader*)pFrame;
+            *pHeader = header;
+        }
+
+        body.CopyTo(frame[sizeof(MsgHeader)..]);
+        return frame;
     }
 
     private static unsafe bool TryReadHeaderFromStream(Stream stream, ref MsgHeader header)
