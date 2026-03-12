@@ -160,8 +160,16 @@ public class MongoDbProxy : IHostedService
                     stuffToWrite = opMsg.ToBytes(memoryAllocator);
                     break;
                 default:
-                    _logger.LogWarning($"Unsupported opCode: {msgHeader.OpCode}");
-                    throw new NotSupportedException("");
+                    _logger.LogDebug($"Unsupported opCode: {msgHeader.OpCode}, forwarding transparently.");
+                    // Reconstruct the message: header + body
+                    stuffToWrite = memoryAllocator.Allocate<byte>(sizeof(MsgHeader) + buffer.Length);
+                    fixed (byte* pStuff = &MemoryMarshal.GetReference(stuffToWrite))
+                    {
+                        var pHeader = (MsgHeader*)pStuff;
+                        *pHeader = msgHeader;
+                    }
+                    buffer.CopyTo(stuffToWrite.Slice(sizeof(MsgHeader)));
+                    break;
             }
 
             destStream.Write(stuffToWrite);
