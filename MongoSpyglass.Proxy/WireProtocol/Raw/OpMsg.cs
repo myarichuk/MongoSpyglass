@@ -28,14 +28,12 @@ namespace MongoSpyglass.Proxy.WireProtocol.Raw
 
         public unsafe Span<byte> ToBytes(GrowableArena allocator)
         {
-            var opQuery = this;
-            var outputValue = allocator.Allocate<byte>(sizeof(uint) + sizeof(byte) + DataSection.Length);
+            var opMsg = this;
+            var outputValue = allocator.Allocate<byte>(sizeof(uint) + sizeof(byte) + opMsg.DataSection.Length);
 
-            var pOpMsg = (OpMsg*)outputValue.ToIntPtr().ToPointer();
-
-            pOpMsg->Flags = opQuery.Flags;
-            pOpMsg->Kind = opQuery.Kind;
-            pOpMsg->DataSection = opQuery.DataSection;
+            opMsg.Flags.AsBytes(allocator).CopyTo(outputValue);
+            outputValue[sizeof(uint)] = opMsg.Kind;
+            opMsg.DataSection.CopyTo(outputValue[(sizeof(uint) + sizeof(byte))..]);
 
             return outputValue;
         }
