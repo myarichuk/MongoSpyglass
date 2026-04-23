@@ -1,10 +1,11 @@
+using SharpArena.Allocators;
 ﻿using System.Runtime.InteropServices;
 using System.Text;
 using Microsoft.IO;
 using MongoDB.Bson;
 using MongoDB.Bson.IO;
 using MongoDB.Bson.Serialization;
-using Simple.Arena;
+using SharpArena.Allocators;
 
 namespace MongoSpyglass.Proxy;
 
@@ -27,15 +28,11 @@ internal unsafe class Utils
         return BitConverter.ToInt32(buffer);
     }
 
-    public static Span<byte> Int32AsBytes(int num)
-    {
-        var numberSpan = MemoryMarshal.CreateSpan(ref num, 1);
-        return MemoryMarshal.AsBytes(numberSpan);
-    }
+
 
     public static string PtrToStringUtf8(byte* ptr, int length) => Encoding.UTF8.GetString(ptr, length);
 
-    public static Span<byte> ReadCStringFromStream(Stream stream, Arena memoryAllocator)
+    public static Span<byte> ReadCStringFromStream(Stream stream, ArenaAllocator memoryAllocator)
     {
         using var bufferStream = RecyclableMemoryStreamManager.GetStream();
 
@@ -58,7 +55,7 @@ internal unsafe class Utils
         return stringBytes;
     }
 
-    public static Span<byte> ReadDocumentFromStream(Stream stream, Arena memoryAllocator)
+    public static Span<byte> ReadDocumentFromStream(Stream stream, ArenaAllocator memoryAllocator)
     {
         // Read the length of the BSON document (first 4 bytes)
         byte[] lengthBytes = new byte[4]; //error handling, take into account max length and such...

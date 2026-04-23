@@ -1,3 +1,4 @@
+using SharpArena.Allocators;
 ﻿using BenchmarkDotNet.Attributes;
 using MongoSpyglass.Proxy;
 using MongoSpyglass.Proxy.WireProtocol;
@@ -7,12 +8,12 @@ public class StringReadBenchmarks
 {
     private MemoryStream _testStreamA;
     private MemoryStream _testStreamB;
-    private GrowableArena _memoryAllocator;
+    private ArenaAllocator _memoryAllocator;
 
     [IterationSetup]
     public void Setup()
     {
-        _memoryAllocator = new GrowableArena();
+        _memoryAllocator = new ArenaAllocator();
         
         // Setup a test stream filled with some data
         byte[] byteArray = "This is a test string.\0"u8.ToArray();

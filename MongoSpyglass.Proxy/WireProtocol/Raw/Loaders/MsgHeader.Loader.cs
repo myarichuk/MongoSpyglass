@@ -1,10 +1,11 @@
+using SharpArena.Allocators;
 ﻿namespace MongoSpyglass.Proxy.WireProtocol.Raw.Loaders;
 
 internal class MsgHeaderLoader : MsgHeaderLoaderBase<Stream>
 {
     public static MsgHeaderLoader Instance { get; } = new();
 
-    public override int LoadMessageLength(Stream source, GrowableArena allocator)
+    public override int LoadMessageLength(Stream source, ArenaAllocator allocator)
     {
         if (!source.TryRead<int>(out var fetchedValue))
         {
@@ -14,7 +15,7 @@ internal class MsgHeaderLoader : MsgHeaderLoaderBase<Stream>
         return fetchedValue;
     }
 
-    public override OpCode LoadOpCode(Stream source, GrowableArena allocator)
+    public override OpCode LoadOpCode(Stream source, ArenaAllocator allocator)
     {
         if (!source.TryReadEnum<OpCode>(out var opCode))
         {
@@ -24,7 +25,7 @@ internal class MsgHeaderLoader : MsgHeaderLoaderBase<Stream>
         return opCode;
     }
 
-    public override int LoadRequestID(Stream source, GrowableArena allocator)
+    public override int LoadRequestID(Stream source, ArenaAllocator allocator)
     {
         if (!source.TryRead<int>(out var fetchedValue))
         {
@@ -34,7 +35,7 @@ internal class MsgHeaderLoader : MsgHeaderLoaderBase<Stream>
         return fetchedValue;
     }
 
-    public override int LoadResponseTo(Stream source, GrowableArena allocator)
+    public override int LoadResponseTo(Stream source, ArenaAllocator allocator)
     {
         if (!source.TryRead<int>(out var fetchedValue))
         {

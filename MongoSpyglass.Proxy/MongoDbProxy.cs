@@ -7,7 +7,7 @@ using Polly.Retry;
 using Polly;
 using MongoSpyglass.Proxy.WireProtocol;
 using MongoSpyglass.Proxy.WireProtocol.Raw;
-using Simple.Arena;
+using SharpArena.Allocators;
 using MongoSpyglass.Proxy.WireProtocol.Raw.Loaders;
 using MongoDB.Bson;
 // ReSharper disable ComplexConditionExpression
@@ -83,44 +83,49 @@ public class MongoDbProxy : IHostedService
         _logger.LogDebug($"Connected to MongoDB server {_mongoDbServer}");
 
         // Start proxy
-        Task.WaitAll(
-            Task.Factory.StartNew(() =>
+        var t1 = Task.Run(async () =>
+        {
+            using var allocator = new ArenaAllocator();
+            while(!_cts.IsCancellationRequested)
             {
-                while(!_cts.IsCancellationRequested)
+                try
                 {
-                    try
+                    allocator.Reset();
+                    if (!await ForwardTrafficAsync(client, server, "to", allocator))
                     {
-                        if (!ForwardTraffic(client, server, "to"))
-                        {
-                            break;
-                        }
-                    }
-                    catch (Exception e)
-                    {
-                        _logger.LogError(e, $"Error forwarding traffic from {client.Client.RemoteEndPoint} to {server.Client.RemoteEndPoint}");
-                        throw; //for now, TODO: make better error handling
+                        break;
                     }
                 }
-            }, _cts.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default),
-            Task.Factory.StartNew(() =>
-            {
-                while(!_cts.IsCancellationRequested)
+                catch (Exception e)
                 {
-                    try
+                    _logger.LogError(e, $"Error forwarding traffic from {client.Client.RemoteEndPoint} to {server.Client.RemoteEndPoint}");
+                    throw; //for now, TODO: make better error handling
+                }
+            }
+        }, _cts.Token);
+
+        var t2 = Task.Run(async () =>
+        {
+            using var allocator = new ArenaAllocator();
+            while(!_cts.IsCancellationRequested)
+            {
+                try
+                {
+                    allocator.Reset();
+                    if (!await ForwardTrafficAsync(server, client, "from", allocator))
                     {
-                        if (!ForwardTraffic(server, client, "from"))
-                        {
-                            break;
-                        }
-                    }
-                    catch (Exception e)
-                    {
-                        _logger.LogError(e, $"Error forwarding traffic from {client.Client.RemoteEndPoint} to {server.Client.RemoteEndPoint}");
-                        throw; //for now, TODO: make better error handling
+                        break;
                     }
                 }
-            }, _cts.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default)
-        );
+                catch (Exception e)
+                {
+                    _logger.LogError(e, $"Error forwarding traffic from {client.Client.RemoteEndPoint} to {server.Client.RemoteEndPoint}");
+                    throw; //for now, TODO: make better error handling
+                }
+            }
+        }, _cts.Token);
+
+        Task.WaitAll(t1, t2);
     }
 
     public Task StopAsync(CancellationToken cancellationToken)
@@ -130,75 +135,127 @@ public class MongoDbProxy : IHostedService
         return Task.CompletedTask;
     }
 
-    private unsafe bool ForwardTraffic(TcpClient source, TcpClient destination, string tag)
+
+    private async Task<bool> ForwardTrafficAsync(TcpClient source, TcpClient destination, string tag, ArenaAllocator memoryAllocator)
     {        
         var sourceStream = source.GetStream();
         var destStream = destination.GetStream();
 
-        var now = DateTime.UtcNow;
-        
-        //while(!sourceStream.DataAvailable)
-        //{
-        //    if(DateTime.UtcNow - now > TimeSpan.FromMilliseconds(250)) //TODO: make this configurable
-        //    { 
-        //        return;
-        //    }
-        //    else
-        //    {
-        //        Thread.Sleep(50);
-        //    }
-        //}
-
         try
-        {                
-            //TODO: make this configurable
-            //for now, 64 mbytes should be enough
-            using var memoryAllocator = new GrowableArena();
-
-            var msgHeader = new MsgHeader();
-            if (!TryReadHeaderFromStream(sourceStream, ref msgHeader))
-            {
-                return false;
-            }
-
-            if (msgHeader.MessageLength < sizeof(MsgHeader))
-            {
-                throw new InvalidOperationException($"Invalid message length '{msgHeader.MessageLength}' for opcode '{msgHeader.OpCode}'.");
-            }
-
-            var buffer = memoryAllocator.Allocate<byte>(msgHeader.MessageLength - sizeof(MsgHeader));
+        {
+            var headerSize = System.Runtime.CompilerServices.Unsafe.SizeOf<MsgHeader>();
+            var headerBuffer = System.Buffers.ArrayPool<byte>.Shared.Rent(headerSize);
 
             try
             {
-                sourceStream.ReadExactly(buffer);
+                try
+                {
+                    await sourceStream.ReadExactlyAsync(headerBuffer.AsMemory(0, headerSize), _cts.Token).ConfigureAwait(false);
+                }
+                catch (EndOfStreamException)
+                {
+                    return false;
+                }
+                catch (OperationCanceledException)
+                {
+                    return false;
+                }
+
+                int msgLength, msgRequestId, msgResponseTo;
+                OpCode msgOpCode;
+                unsafe
+                {
+                    fixed (byte* pHeaderBuffer = headerBuffer)
+                    {
+                        var pHeader = (MsgHeader*)pHeaderBuffer;
+                        msgLength = pHeader->MessageLength;
+                        msgRequestId = pHeader->RequestID;
+                        msgResponseTo = pHeader->ResponseTo;
+                        msgOpCode = pHeader->OpCode;
+                    }
+                }
+
+                if (msgLength < headerSize)
+                {
+                    throw new InvalidOperationException($"Invalid message length '{msgLength}' for opcode '{msgOpCode}'.");
+                }
+
+                int bodyLength = msgLength - headerSize;
+                var bodyBuffer = System.Buffers.ArrayPool<byte>.Shared.Rent(bodyLength);
+
+                try
+                {
+                    try
+                    {
+                        await sourceStream.ReadExactlyAsync(bodyBuffer.AsMemory(0, bodyLength), _cts.Token).ConfigureAwait(false);
+                    }
+                    catch (EndOfStreamException)
+                    {
+                        return false;
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        return false;
+                    }
+
+                    byte[] destBuffer = null;
+                    int stuffToWriteLength = 0;
+
+                    unsafe
+                    {
+                        var buffer = memoryAllocator.Allocate<byte>(bodyLength);
+                        bodyBuffer.AsSpan(0, bodyLength).CopyTo(buffer);
+
+                        fixed (byte* pBuffer = &System.Runtime.InteropServices.MemoryMarshal.GetReference<byte>(buffer))
+                        {
+                            using var memoryStream = new UnmanagedMemoryStream(pBuffer, buffer.Length);
+                            switch (msgOpCode)
+                            {
+                                case OpCode.OP_QUERY:
+                                    var opQuery = OpQueryLoader.Instance.Load(memoryStream, memoryAllocator);
+                                    var typedOpQuery = MongoSpyglass.Proxy.WireProtocol.Typed.OpQuery.FromRaw(opQuery);
+                                    LogOpQuery(tag, msgRequestId, typedOpQuery);
+                                    break;
+                                case OpCode.OP_MSG:
+                                    var opMsg = OpMsgLoader.Instance.Load(memoryStream, memoryAllocator);
+                                    LogOpMsg(tag, msgRequestId, opMsg);
+                                    break;
+                                default:
+                                    _logger.LogDebug($"Unsupported opCode: {msgOpCode}, forwarding transparently.");
+                                    break;
+                            }
+
+                            // We need to pass a MsgHeader to BuildWireMessage, but it's a ref struct, so create it here:
+                            var msgHeader = new MsgHeader { MessageLength = msgLength, RequestID = msgRequestId, ResponseTo = msgResponseTo, OpCode = msgOpCode };
+                            var stuffToWrite = BuildWireMessage(memoryAllocator, msgHeader, buffer);
+
+                            destBuffer = System.Buffers.ArrayPool<byte>.Shared.Rent(stuffToWrite.Length);
+                            stuffToWriteLength = stuffToWrite.Length;
+                            stuffToWrite.CopyTo(destBuffer);
+                        }
+                    }
+
+                    try
+                    {
+                        await destStream.WriteAsync(destBuffer.AsMemory(0, stuffToWriteLength), _cts.Token).ConfigureAwait(false);
+                        _logger.LogDebug($"Wrote {stuffToWriteLength} bytes to {destination.Client.RemoteEndPoint}");
+                    }
+                    finally
+                    {
+                        System.Buffers.ArrayPool<byte>.Shared.Return(destBuffer);
+                    }
+
+                    return true;
+                }
+                finally
+                {
+                    System.Buffers.ArrayPool<byte>.Shared.Return(bodyBuffer);
+                }
             }
-            catch (EndOfStreamException)
+            finally
             {
-                return false; // EOF
+                System.Buffers.ArrayPool<byte>.Shared.Return(headerBuffer);
             }
-
-            using var memoryStream = new UnmanagedMemoryStream((byte*)buffer.ToIntPtr(), buffer.Length);
-            switch (msgHeader.OpCode)
-            {
-                case OpCode.OP_QUERY:
-                    var opQuery = OpQueryLoader.Instance.Load(memoryStream, memoryAllocator);
-                    var typedOpQuery = MongoSpyglass.Proxy.WireProtocol.Typed.OpQuery.FromRaw(opQuery);
-                    LogOpQuery(tag, msgHeader.RequestId, typedOpQuery);
-                    break;
-                case OpCode.OP_MSG:
-                    var opMsg = OpMsgLoader.Instance.Load(memoryStream, memoryAllocator);
-                    LogOpMsg(tag, msgHeader.RequestId, opMsg);
-                    break;
-                default:
-                    _logger.LogDebug($"Unsupported opCode: {msgHeader.OpCode}, forwarding transparently.");
-                    break;
-            }
-
-            var stuffToWrite = BuildWireMessage(memoryAllocator, msgHeader, buffer);
-
-            destStream.Write(stuffToWrite);
-            _logger.LogDebug($"Wrote {stuffToWrite.Length} bytes to {destination.Client.RemoteEndPoint}");
-            return true;
         }
         catch (Exception e)
         {
@@ -207,41 +264,21 @@ public class MongoDbProxy : IHostedService
         }
     }
 
-    private static unsafe Span<byte> BuildWireMessage(GrowableArena allocator, MsgHeader header, Span<byte> body)
+    private static unsafe Span<byte> BuildWireMessage(ArenaAllocator allocator, MsgHeader header, Span<byte> body)
     {
-        var frame = allocator.Allocate<byte>(sizeof(MsgHeader) + body.Length);
+        int headerSize = System.Runtime.CompilerServices.Unsafe.SizeOf<MsgHeader>();
+        var frame = allocator.Allocate<byte>(headerSize + body.Length);
 
-        fixed (byte* pFrame = &MemoryMarshal.GetReference(frame))
+        fixed (byte* pFrame = &System.Runtime.InteropServices.MemoryMarshal.GetReference<byte>(frame))
         {
             var pHeader = (MsgHeader*)pFrame;
             *pHeader = header;
         }
 
-        body.CopyTo(frame[sizeof(MsgHeader)..]);
+        body.CopyTo(frame[headerSize..]);
         return frame;
     }
 
-    private static unsafe bool TryReadHeaderFromStream(Stream stream, ref MsgHeader header)
-    {
-        Span<byte> buffer = stackalloc byte[sizeof(MsgHeader)];
-
-        try
-        {
-            stream.ReadExactly(buffer);
-        }
-        catch (EndOfStreamException)
-        {
-            return false; // EOF
-        }
-
-        fixed (byte* pBuffer = &MemoryMarshal.GetReference(buffer))
-        {
-            var pHeader = (MsgHeader*)pBuffer;
-            header = *pHeader;
-        }
-
-        return true;
-    }
 
     private void LogOpQuery(string tag, int requestId, WireProtocol.Typed.OpQuery opQuery)
     {
