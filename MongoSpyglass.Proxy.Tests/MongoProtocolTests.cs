@@ -3,7 +3,7 @@ using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using Xunit;
-using Simple.Arena;
+using SharpArena.Allocators;
 using MongoSpyglass.Proxy.WireProtocol;
 using MongoSpyglass.Proxy.WireProtocol.Raw;
 
@@ -50,7 +50,7 @@ namespace MongoSpyglass.Proxy.Tests
             Span<byte> buffer = stackalloc byte[sizeof(MsgHeader)];
             var readBytes = stream.Read(buffer);
             if (readBytes != sizeof(MsgHeader)) return false;
-            fixed (byte* pBuffer = &System.Runtime.InteropServices.MemoryMarshal.GetReference(buffer))
+            fixed (byte* pBuffer = &System.Runtime.InteropServices.MemoryMarshal.GetReference<byte>(buffer))
             {
                 var pHeader = (MsgHeader*)pBuffer;
                 header = *pHeader;

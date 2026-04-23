@@ -1,10 +1,11 @@
+using SharpArena.Allocators;
 ﻿namespace MongoSpyglass.Proxy.WireProtocol.Raw.Loaders;
 
-internal class OpQueryLoader : OpQueryLoaderBase<Stream>
+public class OpQueryLoader : OpQueryLoaderBase<Stream>
 {
     public static OpQueryLoader Instance { get; } = new();
 
-    public override OperationFlags LoadFlags(Stream source, GrowableArena allocator)
+    public override OperationFlags LoadFlags(Stream source, ArenaAllocator allocator)
     {
         if (!source.TryReadEnum<OperationFlags>(out var flags))
         {
@@ -14,7 +15,7 @@ internal class OpQueryLoader : OpQueryLoaderBase<Stream>
         return flags;
     }
 
-    public override Span<char> LoadFullCollectionName(Stream source, GrowableArena allocator)
+    public override Span<char> LoadFullCollectionName(Stream source, ArenaAllocator allocator)
     {
         if (!source.TryReadNativeStringFromStream(allocator, out var collectionName))
         {
@@ -24,7 +25,7 @@ internal class OpQueryLoader : OpQueryLoaderBase<Stream>
         return collectionName;
     }
 
-    public override int LoadNumberToReturn(Stream source, GrowableArena allocator)
+    public override int LoadNumberToReturn(Stream source, ArenaAllocator allocator)
     {
         if (!source.TryRead<int>(out var fetchedValue))
         {
@@ -34,7 +35,7 @@ internal class OpQueryLoader : OpQueryLoaderBase<Stream>
         return fetchedValue;
     }
 
-    public override int LoadNumberToSkip(Stream source, GrowableArena allocator)
+    public override int LoadNumberToSkip(Stream source, ArenaAllocator allocator)
     {
         if (!source.TryRead<int>(out var fetchedValue))
         {
@@ -44,7 +45,7 @@ internal class OpQueryLoader : OpQueryLoaderBase<Stream>
         return fetchedValue;
     }
 
-    public override Span<byte> LoadQuery(Stream source, GrowableArena allocator)
+    public override Span<byte> LoadQuery(Stream source, ArenaAllocator allocator)
     {
         if (!source.TryReadBson(allocator, out var bsonAsBytes))
         {
@@ -54,7 +55,7 @@ internal class OpQueryLoader : OpQueryLoaderBase<Stream>
         return bsonAsBytes;
     }
 
-    public override Span<byte> LoadReturnFieldsSelector(Stream source, GrowableArena allocator)
+    public override Span<byte> LoadReturnFieldsSelector(Stream source, ArenaAllocator allocator)
     {
         if (!source.TryReadBson(allocator, out var bsonAsBytes))
         {

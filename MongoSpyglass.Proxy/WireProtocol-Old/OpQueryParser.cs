@@ -1,4 +1,5 @@
-﻿//using Simple.Arena;
+using SharpArena.Allocators;
+﻿//using SharpArena.Allocators;
 //// ReSharper disable ComplexConditionExpression
 
 //namespace MongoSpyglass.Proxy.WireProtocol
@@ -6,7 +7,7 @@
 //    internal class OpQueryParser: IMessageParser<OpQuery>
 //    {
 
-//        public unsafe bool TryParse(ref MsgHeader header, Stream source, Arena memoryAllocator, out OpQuery opQuery)
+//        public unsafe bool TryParse(ref MsgHeader header, Stream source, ArenaAllocator memoryAllocator, out OpQuery opQuery)
 //        {
 //            opQuery = default;
 
@@ -16,8 +17,8 @@
 //            // Read fullCollectionName (null-terminated string)
 //            var stringBytes = Utils.ReadCStringFromStream(source, memoryAllocator);
 //            opQuery.pFullCollectionName = (byte*)stringBytes
-//                                            .ToIntPtr()
-//                                            .ToPointer();
+//
+//                                            ;
 
 //            // Read numberToSkip
 //            opQuery.NumberToSkip = Utils.ReadInt32FromStream(source);
@@ -28,8 +29,8 @@
 //            // Read query (assuming it's a BSON document represented by a byte array)
 //            var queryDocument = Utils.ReadDocumentFromStream(source, memoryAllocator);
 //            opQuery.pQuery = (byte*)queryDocument
-//                                .ToIntPtr()
-//                                .ToPointer();
+//
+//                                ;
 //            opQuery.QueryLength = queryDocument.Length;
 
 //            try
@@ -37,8 +38,8 @@
 //                // Read returnFieldsSelector (assuming it's optional and is a BSON document represented by a byte array)
 //                var returnFieldsSelectorDocument = Utils.ReadDocumentFromStream(source, memoryAllocator);
 //                opQuery.pReturnFieldsSelector = (byte*)returnFieldsSelectorDocument
-//                    .ToIntPtr()
-//                    .ToPointer();
+//
+//                    ;
 
 //                opQuery.ReturnFieldsSelectorLength = returnFieldsSelectorDocument.Length;
 //            }
@@ -53,7 +54,7 @@
 //        }
 
 //        /// <exception cref="SecurityException">The user does not have the required permission.</exception>
-//        public unsafe Span<byte> GetRawBytes(OpQuery message, Arena memoryAllocator)
+//        public unsafe Span<byte> GetRawBytes(OpQuery message, ArenaAllocator memoryAllocator)
 //        {
 //            var size = message.FullCollectionNameLength +
 //                       message.ReturnFieldsSelectorLength +
