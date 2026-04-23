@@ -1,3 +1,4 @@
+using SharpArena.Allocators;
 ﻿using System;
 using System.Text;
 using MongoSpyglass.Proxy;
@@ -8,7 +9,7 @@ namespace MongoSpyglass.Proxy.Tests
 {
     public class ByteUtf16CharConverterTests : IDisposable
     {
-        private readonly GrowableArena _allocator = new();
+        private readonly ArenaAllocator _allocator = new();
 
         [Fact]
         public void TestAsciiConversion()

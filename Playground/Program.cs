@@ -1,37 +1,18 @@
-﻿using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Logging;
-using MongoSpyglass.Proxy;
-using Serilog;
-using System.Net;
+using System;
+using System.IO;
+using System.Threading.Tasks;
+using System.Net.Sockets;
 
-Log.Logger = new LoggerConfiguration()
-    .MinimumLevel.Debug()
-    .WriteTo.Console()
-    .CreateLogger();
-
-var services = ConfigureServices();
-var serviceProvider = services.BuildServiceProvider();
-var logger = serviceProvider.GetRequiredService<ILogger<MongoDbProxy>>();
-
-var mongoDbProxy = new MongoDbProxy(new IPEndPoint(IPAddress.Loopback, 27017), 27018, logger);
-
-try
+class Program
 {
-    await mongoDbProxy.StartAsync(CancellationToken.None);
+    static async Task Main()
+    {
+        // Try passing a Memory<byte> to ReadExactlyAsync
+        // Memory<byte> requires managed array backing, but Arena gives unmanaged.
+        // There is no `ReadExactlyAsync(Span<byte>)` because async methods can't take ref structs.
+        // To read directly into an unmanaged pointer, we have to either:
+        // a) use synchronous `ReadExactly(Span)` which is blocking,
+        // b) rent a managed array from ArrayPool, read async into it, then copy to unmanaged.
+        Console.WriteLine("ArrayPool strategy.");
+    }
 }
-finally
-{
-    await mongoDbProxy.StopAsync(CancellationToken.None);
-}
-
-static IServiceCollection ConfigureServices()
-{
-    IServiceCollection services = new ServiceCollection();
-
-    services.AddLogging(configure => configure.AddSerilog());
-
-    services.AddTransient<MongoDbProxy>();
-
-    return services;
-}
-

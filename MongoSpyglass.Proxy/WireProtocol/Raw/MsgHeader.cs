@@ -4,7 +4,7 @@ using MongoSpyglass.Proxy.WireProtocol.Raw.Parts;
 namespace MongoSpyglass.Proxy.WireProtocol.Raw;
 
 [StructLayout(LayoutKind.Sequential, Pack = 0)]
-public ref struct MsgHeader
+    public ref struct MsgHeader
 {
     public int MessageLength;
 

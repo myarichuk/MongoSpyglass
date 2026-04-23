@@ -1,3 +1,4 @@
+using SharpArena.Allocators;
 ﻿using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
@@ -8,33 +9,31 @@ namespace MongoSpyglass.Proxy.WireProtocol
     public static class StreamExtensions
     {
         public static bool TryReadEnum<TEnum, TEnumType>(this Stream stream, out TEnum enumValue) 
-            where TEnum : struct
+            where TEnum : unmanaged, Enum
             where TEnumType: unmanaged
         {
             enumValue = default;
 
-            if(!stream.TryRead<TEnumType>(out var fetchedValue) || 
-               !Enum.TryParse<TEnum>(fetchedValue.ToString(), out var parsedEnumValue))
+            if (!stream.TryRead<TEnumType>(out var fetchedValue))
             {                
                 return false;
             }
             
-            enumValue = parsedEnumValue;
+            enumValue = Unsafe.As<TEnumType, TEnum>(ref fetchedValue);
             return true;
         }
 
         public static bool TryReadEnum<TEnum>(this Stream stream, out TEnum enumValue) 
-            where TEnum : struct
+            where TEnum : unmanaged, Enum
         {
             enumValue = default;
 
-            if(!stream.TryRead<int>(out var fetchedValue) || 
-               !Enum.TryParse<TEnum>(fetchedValue.ToString(), out var parsedEnumValue))
+            if (!stream.TryRead<int>(out var fetchedValue))
             {                
                 return false;
             }
             
-            enumValue = parsedEnumValue;
+            enumValue = Unsafe.As<int, TEnum>(ref fetchedValue);
             return true;
         }
 
@@ -72,14 +71,14 @@ namespace MongoSpyglass.Proxy.WireProtocol
                 return false;
             }
             
-            value = Unsafe.ReadUnaligned<TValue>(ref MemoryMarshal.GetReference(buffer));
+            value = Unsafe.ReadUnaligned<TValue>(ref MemoryMarshal.GetReference<byte>(buffer));
             return true;
         }
 
         //assuming utf-8 encoding in the "native" string in the stream
         public static bool TryReadNativeStringFromStream(
             this Stream stream, 
-            GrowableArena memoryAllocator, 
+            ArenaAllocator memoryAllocator,
             out Span<char> stringValue)
         {
             stringValue = default;
@@ -113,7 +112,7 @@ namespace MongoSpyglass.Proxy.WireProtocol
             return true;
         }
 
-        public static unsafe bool TryReadBson(this Stream stream, GrowableArena allocator, out Span<byte> bsonAsBytes)
+        public static unsafe bool TryReadBson(this Stream stream, ArenaAllocator allocator, out Span<byte> bsonAsBytes)
         {
             bsonAsBytes = default;
             
