@@ -1,3 +1,4 @@
+using SharpArena.Allocators;
 ﻿using System.Runtime.InteropServices;
 using MongoSpyglass.Proxy.WireProtocol;
 
@@ -5,7 +6,7 @@ namespace MongoSpyglass.Proxy.Tests;
 
 public class StructExtensionsTests: IDisposable
 {
-    private readonly GrowableArena _allocator = new();
+    private readonly ArenaAllocator _allocator = new();
 
     [Fact]
     public void TestAsBytesForInt32()

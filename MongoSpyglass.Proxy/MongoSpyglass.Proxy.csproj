@@ -15,7 +15,7 @@
     <PackageReference Include="Microsoft.IO.RecyclableMemoryStream" Version="2.3.2" />
     <PackageReference Include="MongoDB.Bson" Version="2.19.1" />
     <PackageReference Include="Polly" Version="*" />
-    <PackageReference Include="Simple.Arena" Version="1.7.1" />
+    <PackageReference Include="SharpArena" Version="0.7.20" />
     <PackageReference Include="Stateless" Version="5.14.0" />
   </ItemGroup>
 

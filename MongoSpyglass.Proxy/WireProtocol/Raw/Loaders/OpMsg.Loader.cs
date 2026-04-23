@@ -1,3 +1,4 @@
+using SharpArena.Allocators;
 ﻿using MongoSpyglass.Proxy.WireProtocol.Raw.Parts;
 
 namespace MongoSpyglass.Proxy.WireProtocol.Raw.Loaders;
@@ -8,7 +9,7 @@ internal class OpMsgLoader : OpMsgLoaderBase<Stream>
 
         public static OpMsgLoader Instance { get; } = new();
 
-        public override FlagBits LoadFlags(Stream source, GrowableArena allocator)
+        public override FlagBits LoadFlags(Stream source, ArenaAllocator allocator)
         {
             if (!source.TryReadEnum<FlagBits>(out var flags))
             {
@@ -18,7 +19,7 @@ internal class OpMsgLoader : OpMsgLoaderBase<Stream>
             return flags;
         }
 
-        public override byte LoadKind(Stream source, GrowableArena allocator)
+        public override byte LoadKind(Stream source, ArenaAllocator allocator)
         {
             if (!source.TryRead<byte>(out var kind))
             {
@@ -29,7 +30,7 @@ internal class OpMsgLoader : OpMsgLoaderBase<Stream>
             return kind;
         }
 
-        public override Span<byte> LoadDataSection(Stream source, GrowableArena allocator)
+        public override Span<byte> LoadDataSection(Stream source, ArenaAllocator allocator)
         {
             switch(Kind.Value)
             {
@@ -63,7 +64,7 @@ internal class OpMsgLoader : OpMsgLoaderBase<Stream>
         {
             public static Kind0Loader Instance { get; } = new();
 
-            public override Span<byte> LoadBsonDocument(Stream source, GrowableArena allocator)
+            public override Span<byte> LoadBsonDocument(Stream source, ArenaAllocator allocator)
             {
                 if (!source.TryReadBson(allocator, out var bsonAsBytes))
                 {
@@ -80,7 +81,7 @@ internal class OpMsgLoader : OpMsgLoaderBase<Stream>
 
             public static Kind1Loader Instance { get; } = new();
 
-            public override int LoadSize(Stream source, GrowableArena allocator)
+            public override int LoadSize(Stream source, ArenaAllocator allocator)
             {
                 if (!source.TryRead<int>(out var fetchedValue))
                 {
@@ -91,7 +92,7 @@ internal class OpMsgLoader : OpMsgLoaderBase<Stream>
                 return fetchedValue;
             }
 
-            public override Span<char> LoadDocumentSequenceIdentifier(Stream source, GrowableArena allocator)
+            public override Span<char> LoadDocumentSequenceIdentifier(Stream source, ArenaAllocator allocator)
             {
                 if (!source.TryReadNativeStringFromStream(allocator, out var identifier))
                 {
@@ -101,7 +102,7 @@ internal class OpMsgLoader : OpMsgLoaderBase<Stream>
                 return identifier;
             }
 
-            public override Span<byte> LoadBsonDocumentArray(Stream source, GrowableArena allocator)
+            public override Span<byte> LoadBsonDocumentArray(Stream source, ArenaAllocator allocator)
             {
                 var documentCollection = allocator.Allocate<byte>(Size.Value);
                 var usedData = 0;

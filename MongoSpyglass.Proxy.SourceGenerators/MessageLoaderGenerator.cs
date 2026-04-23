@@ -79,6 +79,7 @@ namespace MongoSpyglass.Proxy
             var sb = new StringBuilder();
 
             sb.AppendLine("using System;");
+            sb.AppendLine("using SharpArena.Allocators;");
             sb.AppendLine($"namespace {symbol.ContainingNamespace}");
             sb.AppendLine("{");
             sb.AppendLine($"    public abstract class {symbol.Name}LoaderBase<TSource>");
@@ -118,11 +119,11 @@ namespace MongoSpyglass.Proxy
             {
                 var memberType = member.Type.ToDisplayString();
                 var memberName = member.Name;
-                sb.AppendLine($"        public abstract {memberType} Load{memberName}(TSource source, GrowableArena allocator);");
+                sb.AppendLine($"        public abstract {memberType} Load{memberName}(TSource source, ArenaAllocator allocator);");
             }
 
             sb.AppendLine();
-            sb.AppendLine($"        public {symbol.Name} Load(TSource source, GrowableArena allocator)");
+            sb.AppendLine($"        public {symbol.Name} Load(TSource source, ArenaAllocator allocator)");
             sb.AppendLine("        {");
             sb.AppendLine($"            var item = new {symbol.Name}();");
 

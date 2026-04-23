@@ -1,7 +1,8 @@
+using SharpArena.Allocators;
 using System;
 using System.IO;
 using Xunit;
-using Simple.Arena;
+using SharpArena.Allocators;
 using MongoSpyglass.Proxy.WireProtocol;
 
 namespace MongoSpyglass.Proxy.Tests
@@ -11,7 +12,7 @@ namespace MongoSpyglass.Proxy.Tests
         [Fact]
         public void TestTryReadBson_ReadsCorrectLength()
         {
-            using var arena = new GrowableArena();
+            using var arena = new ArenaAllocator();
             using var ms = new MemoryStream();
             using var writer = new BinaryWriter(ms);
 
@@ -37,7 +38,7 @@ namespace MongoSpyglass.Proxy.Tests
         [Fact]
         public void TestTryReadBson_WithPartialReads()
         {
-            using var arena = new GrowableArena();
+            using var arena = new ArenaAllocator();
 
             var ms = new MemoryStream();
             var writer = new BinaryWriter(ms);
