@@ -38,10 +38,14 @@ namespace MongoSpyglass.Proxy.Tests
         // Ensure Span based Read uses the overridden method
         public override int Read(Span<byte> buffer)
         {
-            byte[] temp = new byte[buffer.Length];
-            int read = Read(temp, 0, buffer.Length);
-            new Span<byte>(temp, 0, read).CopyTo(buffer);
-            return read;
+            if (_position >= _data.Length) return 0;
+
+            int toRead = Math.Min(buffer.Length, _maxReadSize);
+            toRead = Math.Min(toRead, _data.Length - _position);
+
+            new Span<byte>(_data, _position, toRead).CopyTo(buffer.Slice(0, toRead));
+            _position += toRead;
+            return toRead;
         }
 
         public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
