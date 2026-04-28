@@ -1,0 +1,156 @@
+@page "/operations"
+@namespace MongoSpyglass.Service.Pages
+
+<div class="flex-1 flex flex-col bg-surface overflow-hidden relative">
+    <!-- Real-time Stats Ribbon -->
+    <div class="flex items-center px-container-padding py-2 bg-surface-container-lowest border-b border-outline-variant gap-8 shrink-0">
+        <div class="flex flex-col">
+            <span class="font-ui-label-sm text-ui-label-sm text-on-surface-variant uppercase">Throughput</span>
+            <span class="font-display-mono text-[16px] text-on-surface font-medium mt-0.5">2,405 <span class="text-[12px] text-on-surface-variant">ops/s</span></span>
+        </div>
+        <div class="w-px h-8 bg-outline-variant/50"></div>
+        <div class="flex flex-col">
+            <span class="font-ui-label-sm text-ui-label-sm text-on-surface-variant uppercase">Avg Read Latency</span>
+            <span class="font-display-mono text-[16px] text-secondary font-medium mt-0.5">14.2 <span class="text-[12px] text-on-surface-variant">ms</span></span>
+        </div>
+        <div class="w-px h-8 bg-outline-variant/50"></div>
+        <div class="flex flex-col">
+            <span class="font-ui-label-sm text-ui-label-sm text-on-surface-variant uppercase">Active Connections</span>
+            <span class="font-display-mono text-[16px] text-primary font-medium mt-0.5">842</span>
+        </div>
+    </div>
+
+    <!-- Complex Filter Toolbar -->
+    <div class="flex items-center justify-between px-container-padding py-2 bg-surface-container-low border-b border-outline-variant shrink-0">
+        <div class="flex items-center gap-3">
+            <span class="material-symbols-outlined text-on-surface-variant text-[18px]">filter_list</span>
+
+            <!-- Namespace Filter -->
+            <div class="flex items-center bg-surface border border-outline-variant rounded h-[28px] focus-within:border-primary focus-within:ring-1 ring-primary/20 transition-all">
+                <span class="px-2 text-on-surface-variant font-display-mono text-[11px] border-r border-outline-variant bg-surface-container-highest h-full flex items-center rounded-l">ns</span>
+                <input class="bg-transparent border-none focus:ring-0 text-on-surface font-display-mono text-[12px] w-40 px-2 h-full placeholder:text-outline" placeholder="db.collection" type="text" value="production.orders"/>
+            </div>
+
+            <!-- Operation Type Filter -->
+            <div class="flex items-center bg-surface border border-outline-variant rounded h-[28px] focus-within:border-primary transition-all relative">
+                <span class="px-2 text-on-surface-variant font-display-mono text-[11px] border-r border-outline-variant bg-surface-container-highest h-full flex items-center rounded-l">op</span>
+                <select class="appearance-none bg-transparent border-none focus:ring-0 text-on-surface font-display-mono text-[12px] pl-2 pr-6 h-full cursor-pointer outline-none w-32">
+                    <option>All Types</option>
+                    <option>find</option>
+                    <option selected>aggregate</option>
+                    <option>insert</option>
+                    <option>update</option>
+                    <option>remove</option>
+                </select>
+                <span class="material-symbols-outlined absolute right-1 text-on-surface-variant text-[14px] pointer-events-none">arrow_drop_down</span>
+            </div>
+
+            <!-- Duration Filter -->
+            <div class="flex items-center bg-surface border border-outline-variant rounded h-[28px] focus-within:border-error focus-within:ring-1 ring-error/20 transition-all">
+                <span class="px-2 text-error font-display-mono text-[11px] border-r border-outline-variant bg-surface-container-highest h-full flex items-center rounded-l">&gt; ms</span>
+                <input class="bg-transparent border-none focus:ring-0 text-error font-display-mono text-[12px] w-20 px-2 h-full placeholder:text-outline" placeholder="100" type="number" value="50"/>
+            </div>
+        </div>
+
+        <div class="flex items-center gap-2">
+            <button class="h-[28px] px-3 border border-outline-variant rounded bg-surface text-on-surface font-ui-label-sm text-ui-label-sm hover:bg-surface-container-high transition-colors flex items-center gap-1">
+                <span class="material-symbols-outlined text-[14px]">close</span> Clear
+            </button>
+            <button class="h-[28px] px-4 rounded bg-primary text-on-primary font-ui-label-sm text-ui-label-sm hover:bg-primary-fixed transition-colors shadow-sm">
+                Apply Filters
+            </button>
+        </div>
+    </div>
+
+    <!-- Dense Operations Table (The Feed) -->
+    <div class="flex-1 overflow-auto bg-surface relative">
+        <table class="w-full text-left border-collapse table-fixed">
+            <colgroup>
+                <col class="w-[120px]"/> <!-- Timestamp -->
+                <col class="w-[100px]"/> <!-- Op -->
+                <col class="w-[160px]"/> <!-- Collection -->
+                <col class="w-[100px]"/> <!-- Duration -->
+                <col class="w-[120px]"/> <!-- Docs Scanned -->
+                <col class="w-auto"/> <!-- Query Details -->
+            </colgroup>
+            <thead class="sticky top-0 bg-surface-container z-10 shadow-[0_1px_0_0_rgba(135,146,154,0.5)]">
+                <tr>
+                    <th class="py-cell-padding-y px-cell-padding-x font-ui-label-sm text-ui-label-sm text-on-surface-variant uppercase whitespace-nowrap border-b border-outline-variant">Timestamp</th>
+                    <th class="py-cell-padding-y px-cell-padding-x font-ui-label-sm text-ui-label-sm text-on-surface-variant uppercase whitespace-nowrap border-b border-outline-variant">Op</th>
+                    <th class="py-cell-padding-y px-cell-padding-x font-ui-label-sm text-ui-label-sm text-on-surface-variant uppercase whitespace-nowrap border-b border-outline-variant">Namespace</th>
+                    <th class="py-cell-padding-y px-cell-padding-x font-ui-label-sm text-ui-label-sm text-on-surface-variant uppercase text-right whitespace-nowrap border-b border-outline-variant">Duration</th>
+                    <th class="py-cell-padding-y px-cell-padding-x font-ui-label-sm text-ui-label-sm text-on-surface-variant uppercase text-right whitespace-nowrap border-b border-outline-variant">Docs Scanned</th>
+                    <th class="py-cell-padding-y px-cell-padding-x font-ui-label-sm text-ui-label-sm text-on-surface-variant uppercase whitespace-nowrap border-b border-outline-variant">Query / Pipeline Details</th>
+                </tr>
+            </thead>
+            <tbody class="divide-y divide-outline-variant/30 font-code-block text-code-block bg-surface-dim/30">
+                <!-- Row 1: Very Slow Query (Error styling) -->
+                <tr class="hover:bg-surface-container-high transition-colors group cursor-pointer">
+                    <td class="py-cell-padding-y px-cell-padding-x text-on-surface-variant text-[12px] align-top">14:32:01.105</td>
+                    <td class="py-cell-padding-y px-cell-padding-x align-top">
+                        <span class="px-1.5 py-0.5 rounded-sm bg-surface-container-highest border border-outline-variant/50 text-secondary-fixed text-[11px]">aggregate</span>
+                    </td>
+                    <td class="py-cell-padding-y px-cell-padding-x text-tertiary-fixed-dim text-[12px] truncate align-top">production.orders</td>
+                    <td class="py-cell-padding-y px-cell-padding-x text-error text-right font-medium align-top">1,204ms</td>
+                    <td class="py-cell-padding-y px-cell-padding-x text-on-surface text-right align-top">150,000</td>
+                    <td class="py-cell-padding-y px-cell-padding-x text-on-surface-variant text-[12px] align-top truncate max-w-0 pr-4">
+                        <span class="text-primary-fixed">[{</span><span class="text-tertiary-fixed">"$match"</span>: {<span class="text-tertiary-fixed">"status"</span>: <span class="text-secondary-fixed">"PENDING"</span>, <span class="text-tertiary-fixed">"created_at"</span>: {<span class="text-primary-fixed">"$lt"</span>: <span class="text-secondary-fixed">ISODate("2023-10-01")</span>}}}, {<span class="text-tertiary-fixed">"$lookup"</span>: {<span class="text-tertiary-fixed">"from"</span>: <span class="text-secondary-fixed">"users"</span>...<span class="text-primary-fixed">}]</span>
+                    </td>
+                </tr>
+
+                <!-- Row 2: Moderate Query (Warning styling) -->
+                <tr class="hover:bg-surface-container-high transition-colors group cursor-pointer bg-surface/50">
+                    <td class="py-cell-padding-y px-cell-padding-x text-on-surface-variant text-[12px] align-top">14:32:01.210</td>
+                    <td class="py-cell-padding-y px-cell-padding-x align-top">
+                        <span class="px-1.5 py-0.5 rounded-sm bg-surface-container-highest border border-outline-variant/50 text-primary-fixed text-[11px]">find</span>
+                    </td>
+                    <td class="py-cell-padding-y px-cell-padding-x text-tertiary-fixed-dim text-[12px] truncate align-top">production.products</td>
+                    <td class="py-cell-padding-y px-cell-padding-x text-tertiary text-right font-medium align-top">342ms</td>
+                    <td class="py-cell-padding-y px-cell-padding-x text-on-surface text-right align-top">8,420</td>
+                    <td class="py-cell-padding-y px-cell-padding-x text-on-surface-variant text-[12px] align-top truncate max-w-0 pr-4">
+                        {<span class="text-tertiary-fixed">"category_id"</span>: <span class="text-primary-fixed">ObjectId</span>(<span class="text-secondary-fixed">"60d5ec49f1b2c3d4e5f6g7h8"</span>), <span class="text-tertiary-fixed">"stock"</span>: {<span class="text-primary-fixed">"$gt"</span>: <span class="text-secondary-fixed">0</span>}}
+                    </td>
+                </tr>
+
+                <!-- Row 3: Fast Query -->
+                <tr class="hover:bg-surface-container-high transition-colors group cursor-pointer">
+                    <td class="py-cell-padding-y px-cell-padding-x text-on-surface-variant text-[12px] align-top">14:32:01.442</td>
+                    <td class="py-cell-padding-y px-cell-padding-x align-top">
+                        <span class="px-1.5 py-0.5 rounded-sm bg-surface-container-highest border border-outline-variant/50 text-primary-fixed text-[11px]">find</span>
+                    </td>
+                    <td class="py-cell-padding-y px-cell-padding-x text-tertiary-fixed-dim text-[12px] truncate align-top">production.users</td>
+                    <td class="py-cell-padding-y px-cell-padding-x text-on-surface-variant text-right align-top">12ms</td>
+                    <td class="py-cell-padding-y px-cell-padding-x text-on-surface-variant text-right align-top">1</td>
+                    <td class="py-cell-padding-y px-cell-padding-x text-on-surface-variant text-[12px] align-top truncate max-w-0 pr-4">
+                        {<span class="text-tertiary-fixed">"_id"</span>: <span class="text-primary-fixed">ObjectId</span>(<span class="text-secondary-fixed">"60d5ec49f1b2c3d4e5f6g7h9"</span>)}
+                    </td>
+                </tr>
+
+                <!-- Row 4: Update -->
+                <tr class="hover:bg-surface-container-high transition-colors group cursor-pointer bg-surface/50">
+                    <td class="py-cell-padding-y px-cell-padding-x text-on-surface-variant text-[12px] align-top">14:32:01.890</td>
+                    <td class="py-cell-padding-y px-cell-padding-x align-top">
+                        <span class="px-1.5 py-0.5 rounded-sm bg-surface-container-highest border border-outline-variant/50 text-tertiary text-[11px]">update</span>
+                    </td>
+                    <td class="py-cell-padding-y px-cell-padding-x text-tertiary-fixed-dim text-[12px] truncate align-top">production.sessions</td>
+                    <td class="py-cell-padding-y px-cell-padding-x text-on-surface-variant text-right align-top">45ms</td>
+                    <td class="py-cell-padding-y px-cell-padding-x text-on-surface-variant text-right align-top">1</td>
+                    <td class="py-cell-padding-y px-cell-padding-x text-on-surface-variant text-[12px] align-top truncate max-w-0 pr-4">
+                        {<span class="text-tertiary-fixed">"q"</span>: {<span class="text-tertiary-fixed">"session_token"</span>: <span class="text-secondary-fixed">"xyz789..."</span>}, <span class="text-tertiary-fixed">"u"</span>: {<span class="text-primary-fixed">"$set"</span>: {<span class="text-tertiary-fixed">"last_active"</span>: <span class="text-secondary-fixed">ISODate("2023-10-26T14:32:01Z")</span>}}}
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <!-- Bottom Status Bar -->
+    <div class="h-6 bg-surface-container-lowest border-t border-outline-variant flex items-center px-4 justify-between shrink-0 font-ui-label-sm text-[10px] text-on-surface-variant uppercase tracking-wider">
+        <div class="flex items-center gap-4">
+            <span class="flex items-center gap-1.5"><span class="w-1.5 h-1.5 rounded-full bg-secondary-fixed"></span> Connected to Primary</span>
+            <span>1,405 Events Captured</span>
+        </div>
+        <div>
+            Profiling Level: 2 (All Operations)
+        </div>
+    </div>
+</div>

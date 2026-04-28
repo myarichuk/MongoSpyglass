@@ -1,9 +1,179 @@
-﻿@page "/"
+@page "/"
+@namespace MongoSpyglass.Service.Pages
 
-<PageTitle>Index</PageTitle>
+<div class="flex flex-col flex-grow min-w-0">
+    <div class="flex-grow overflow-y-auto overflow-x-hidden p-container-padding bg-background relative flex flex-col gap-gutter">
+        <div class="grid grid-cols-12 gap-gutter shrink-0">
+            <!-- Query Throughput Card -->
+            <div class="col-span-3 bg-surface-container rounded border border-outline-variant p-3 flex flex-col justify-between h-[110px] relative overflow-hidden group">
+                <div class="flex justify-between items-start w-full z-10">
+                    <span class="font-ui-label-sm text-ui-label-sm text-on-surface-variant uppercase tracking-wider">Query Throughput</span>
+                    <span class="material-symbols-outlined text-[16px] text-primary-fixed-dim">speed</span>
+                </div>
+                <div class="z-10 flex items-baseline gap-2">
+                    <span class="font-display-mono text-display-mono text-[28px] text-primary-fixed">12,482</span>
+                    <span class="font-code-block text-[11px] text-secondary-fixed flex items-center"><span class="material-symbols-outlined text-[12px] leading-none">arrow_upward</span> 4.2%</span>
+                </div>
+            </div>
 
-<h1>Hello, world!</h1>
+            <!-- Avg Execution Time Card -->
+            <div class="col-span-3 bg-surface-container rounded border border-outline-variant p-3 flex flex-col justify-between h-[110px] relative overflow-hidden">
+                <div class="flex justify-between items-start w-full z-10">
+                    <span class="font-ui-label-sm text-ui-label-sm text-on-surface-variant uppercase tracking-wider">Avg Execution Time</span>
+                    <span class="material-symbols-outlined text-[16px] text-tertiary-fixed-dim">timer</span>
+                </div>
+                <div class="z-10 flex items-baseline gap-2">
+                    <span class="font-display-mono text-display-mono text-[28px] text-on-surface">42.8</span>
+                    <span class="font-code-block text-[11px] text-on-surface-variant">ms</span>
+                </div>
+                <div class="w-full bg-surface-container-highest h-1 rounded-full mt-2 overflow-hidden z-10">
+                    <div class="bg-tertiary-fixed-dim h-full w-[15%]"></div>
+                </div>
+            </div>
 
-Welcome to your new app.
+            <!-- Memory Usage Card -->
+            <div class="col-span-3 bg-surface-container rounded border border-outline-variant p-3 flex flex-col justify-between h-[110px] relative overflow-hidden">
+                <div class="flex justify-between items-start w-full z-10">
+                    <span class="font-ui-label-sm text-ui-label-sm text-on-surface-variant uppercase tracking-wider">Memory Usage</span>
+                    <span class="material-symbols-outlined text-[16px] text-secondary-fixed">memory</span>
+                </div>
+                <div class="z-10 flex items-baseline gap-2">
+                    <span class="font-display-mono text-display-mono text-[28px] text-on-surface">48.2</span>
+                    <span class="font-code-block text-[11px] text-on-surface-variant">/ 64 GB</span>
+                </div>
+                <div class="w-full bg-surface-container-highest h-1.5 rounded-full mt-2 overflow-hidden z-10 flex">
+                    <div class="bg-secondary-fixed h-full w-[60%] border-r border-background"></div>
+                    <div class="bg-tertiary-fixed h-full w-[15%] border-r border-background"></div>
+                </div>
+            </div>
 
-<SurveyPrompt Title="How is Blazor working for you?" />
+            <!-- Active Sessions Card -->
+            <div class="col-span-3 bg-surface-container rounded border border-outline-variant p-3 flex flex-col justify-between h-[110px]">
+                <div class="flex justify-between items-start w-full">
+                    <span class="font-ui-label-sm text-ui-label-sm text-on-surface-variant uppercase tracking-wider">Active Sessions</span>
+                    <span class="material-symbols-outlined text-[16px] text-outline">group</span>
+                </div>
+                <div class="flex items-baseline gap-2">
+                    <span class="font-display-mono text-display-mono text-[28px] text-on-surface">841</span>
+                </div>
+                <div class="flex gap-4 mt-1 font-code-block text-[10px] text-on-surface-variant">
+                    <div class="flex items-center gap-1"><div class="w-1.5 h-1.5 rounded-full bg-secondary-fixed"></div> 820 Read</div>
+                    <div class="flex items-center gap-1"><div class="w-1.5 h-1.5 rounded-full bg-primary-fixed"></div> 21 Write</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="grid grid-cols-12 gap-gutter shrink-0">
+            <!-- Latency Chart -->
+            <div class="col-span-8 bg-surface-container rounded border border-outline-variant flex flex-col h-[320px]">
+                <div class="px-4 py-3 border-b border-outline-variant flex justify-between items-center bg-surface-container-low rounded-t">
+                    <h2 class="font-ui-header text-ui-header text-on-surface">Operation Latency Distribution</h2>
+                </div>
+                <div class="p-4 flex-grow relative w-full h-full flex flex-col">
+                    <RadzenChart>
+                        <RadzenLineSeries Smooth="true" Data="@LatencyData" CategoryProperty="Time" Title="Reads" LineType="LineType.Solid" ValueProperty="Reads">
+                            <RadzenMarkers MarkerType="MarkerType.None" />
+                            <RadzenSeriesDataLabels Visible="false" />
+                        </RadzenLineSeries>
+                        <RadzenLineSeries Smooth="true" Data="@LatencyData" CategoryProperty="Time" Title="Writes" LineType="LineType.Dashed" ValueProperty="Writes">
+                            <RadzenMarkers MarkerType="MarkerType.None" />
+                            <RadzenSeriesDataLabels Visible="false" />
+                        </RadzenLineSeries>
+                        <RadzenCategoryAxis Padding="20" FormatString="{0:HH:mm}" />
+                        <RadzenValueAxis>
+                            <RadzenGridLines Visible="true" />
+                            <RadzenAxisTitle Text="Latency (ms)" />
+                        </RadzenValueAxis>
+                    </RadzenChart>
+                </div>
+            </div>
+
+            <!-- Cluster Status -->
+            <div class="col-span-4 bg-surface-container rounded border border-outline-variant flex flex-col h-[320px]">
+                <div class="px-4 py-3 border-b border-outline-variant bg-surface-container-low rounded-t">
+                    <h2 class="font-ui-header text-ui-header text-on-surface">Cluster Status</h2>
+                </div>
+                <div class="p-4 flex flex-col gap-4 flex-grow overflow-y-auto font-code-block text-code-block">
+                    <div class="flex flex-col gap-1">
+                        <div class="flex justify-between text-on-surface-variant text-[11px] uppercase tracking-wide font-ui-label-sm">
+                            <span>Health</span>
+                            <span class="text-secondary-fixed">OK</span>
+                        </div>
+                        <div class="w-full bg-surface-container-highest h-[2px] rounded-full mt-1">
+                            <div class="bg-secondary-fixed h-full w-full"></div>
+                        </div>
+                    </div>
+                    <div class="h-[1px] bg-outline-variant w-full my-1"></div>
+                    <div class="flex justify-between items-center text-sm">
+                        <span class="text-on-surface-variant">Connections</span>
+                        <span class="text-on-surface font-medium">1,402 <span class="text-outline text-[11px]">/ 4096</span></span>
+                    </div>
+                    <div class="flex justify-between items-center text-sm">
+                        <span class="text-on-surface-variant">Network In</span>
+                        <span class="text-on-surface font-medium">45.2 <span class="text-outline text-[11px]">MB/s</span></span>
+                    </div>
+                    <div class="flex justify-between items-center text-sm">
+                        <span class="text-on-surface-variant">Network Out</span>
+                        <span class="text-on-surface font-medium">128.7 <span class="text-outline text-[11px]">MB/s</span></span>
+                    </div>
+                    <div class="flex justify-between items-center text-sm">
+                        <span class="text-on-surface-variant">Replication Lag</span>
+                        <span class="text-secondary-fixed font-medium">0 <span class="text-outline text-[11px]">sec</span></span>
+                    </div>
+                    <div class="flex justify-between items-center text-sm">
+                        <span class="text-on-surface-variant">Uptime</span>
+                        <span class="text-on-surface font-medium">42d 18h 12m</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Top Slow Queries -->
+        <div class="bg-surface-container rounded border border-outline-variant flex flex-col flex-grow min-h-[200px]">
+            <div class="px-4 py-3 border-b border-outline-variant bg-surface-container-low rounded-t flex justify-between items-center">
+                <h2 class="font-ui-header text-ui-header text-on-surface">Top Slow Queries</h2>
+                <button class="text-[11px] font-ui-label-sm text-primary hover:text-primary-fixed uppercase tracking-wider transition-colors">View All</button>
+            </div>
+            <div class="w-full overflow-x-auto p-2">
+                <RadzenDataGrid Data="@SlowQueries" TItem="SlowQueryModel" Density="Density.Compact" GridLines="DataGridGridLines.None" AllowPaging="false" AllowSorting="true">
+                    <Columns>
+                        <RadzenDataGridColumn TItem="SlowQueryModel" Property="Namespace" Title="Namespace" />
+                        <RadzenDataGridColumn TItem="SlowQueryModel" Property="Operation" Title="Operation" />
+                        <RadzenDataGridColumn TItem="SlowQueryModel" Property="AvgTimeMs" Title="Avg Time">
+                            <Template Context="q">
+                                @q.AvgTimeMs ms
+                            </Template>
+                        </RadzenDataGridColumn>
+                        <RadzenDataGridColumn TItem="SlowQueryModel" Property="Count" Title="Count" />
+                        <RadzenDataGridColumn TItem="SlowQueryModel" Property="Shape" Title="Shape" Width="300px" />
+                    </Columns>
+                </RadzenDataGrid>
+            </div>
+        </div>
+    </div>
+</div>
+
+@code {
+    List<LatencyDataPoint> LatencyData = new List<LatencyDataPoint>();
+    List<SlowQueryModel> SlowQueries = new List<SlowQueryModel>();
+
+    protected override void OnInitialized()
+    {
+        var now = DateTime.Now;
+        LatencyData = new List<LatencyDataPoint>
+        {
+            new LatencyDataPoint(now.AddMinutes(-60), 20, 5),
+            new LatencyDataPoint(now.AddMinutes(-45), 25, 10),
+            new LatencyDataPoint(now.AddMinutes(-30), 15, 8),
+            new LatencyDataPoint(now.AddMinutes(-15), 40, 15),
+            new LatencyDataPoint(now, 60, 20),
+        };
+
+        SlowQueries = new List<SlowQueryModel>
+        {
+            new SlowQueryModel("users.profiles", "find", 142, 4210, "{ \"status\": \"active\", \"lastLogin\": { \"$gt\": ... } }"),
+            new SlowQueryModel("orders.history", "aggregate", 410, 842, "[ { \"$match\": ... }, { \"$group\": ... } ]"),
+            new SlowQueryModel("inventory.stock", "update", 85, 12401, "{ \"sku\": \"A19-...\", \"$inc\": { \"qty\": -1 } }")
+        };
+    }
+}

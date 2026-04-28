@@ -2,18 +2,12 @@
 
 <PageTitle>MongoSpyglass.Service</PageTitle>
 
-<div class="page">
-    <div class="sidebar">
-        <NavMenu />
-    </div>
+<TopAppBar />
 
-    <main>
-        <div class="top-row px-4">
-            <a href="https://docs.microsoft.com/aspnet/" target="_blank">About</a>
-        </div>
+<div class="flex flex-1 overflow-hidden relative">
+    <SideNavBar />
 
-        <article class="content px-4">
-            @Body
-        </article>
+    <main class="flex-1 flex flex-col bg-surface overflow-hidden relative">
+        @Body
     </main>
 </div>
