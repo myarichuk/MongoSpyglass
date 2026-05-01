@@ -11,6 +11,7 @@ using MongoSpyglass.Proxy.WireProtocol.Raw;
 using SharpArena.Allocators;
 using MongoSpyglass.Proxy.WireProtocol.Raw.Loaders;
 using MongoDB.Bson;
+using MongoDB.Bson.Serialization;
 using MongoSpyglass.Proxy.Profiling;
 
 namespace MongoSpyglass.Proxy;
@@ -22,13 +23,15 @@ public class MongoDbProxy : IHostedService
     private readonly IPEndPoint _mongoDbServer;
     private readonly int _port;
     private readonly ILogger<MongoDbProxy> _logger;
+    private readonly IEnumerable<ITrafficListener> _listeners;
     private TcpListener? _listener;
 
-    public MongoDbProxy(IPEndPoint mongoDbServer, int incomingPort, ILogger<MongoDbProxy> logger)
+    public MongoDbProxy(IPEndPoint mongoDbServer, int incomingPort, ILogger<MongoDbProxy> logger, IEnumerable<ITrafficListener> listeners)
     {
         _mongoDbServer = mongoDbServer;
         _port = incomingPort;
         _logger = logger;
+        _listeners = listeners;
 
         _retryPolicy = Policy
             .Handle<SocketException>()
@@ -263,6 +266,7 @@ public class MongoDbProxy : IHostedService
 
     private void LogOpQuery(string tag, int requestId, WireProtocol.Typed.OpQuery opQuery)
     {
+        var payload = opQuery.Query.ToJson();
         _logger.LogInformation(
             "[{Tag}] OP_QUERY #{RequestId} {Collection} skip={NumberToSkip} return={NumberToReturn} query={Query}",
             tag,
@@ -270,17 +274,26 @@ public class MongoDbProxy : IHostedService
             opQuery.FullCollectionName,
             opQuery.NumberToSkip,
             opQuery.NumberToReturn,
-            opQuery.Query.ToJson());
+            payload);
+
+        foreach (var listener in _listeners)
+        {
+            listener.OnMessage(tag, requestId, "OP_QUERY", "find", opQuery.FullCollectionName, payload);
+        }
     }
 
     private void LogOpMsg(string tag, int requestId, OpMsg opMsg, ArenaAllocator allocator)
     {
+        string cmdName = "unknown";
+        string collection = "N/A";
+        string payload = "{}";
+
         if (opMsg.Kind == 0)
         {
             // Use ArenaBsonReader for zero-allocation inspection
             var reader = new ArenaBsonReader(opMsg.DataSection, allocator);
+            payload = opMsg.DataSection.Length > 0 ? new BsonDocument(BsonSerializer.Deserialize<BsonDocument>(opMsg.DataSection.ToArray())).ToJson() : "{}";
             
-            string cmdName = "unknown";
             // The first element in OP_MSG is usually the command name
             if (reader.Elements.Length > 0)
             {
@@ -288,14 +301,12 @@ public class MongoDbProxy : IHostedService
                 cmdName = reader.GetStringValue(firstElement);
             }
 
-            string collection = "N/A";
             if (reader.TryFindElement("collection", out var colElement))
             {
                 collection = reader.GetStringValue(colElement);
             }
             else if (reader.TryFindElement(cmdName, out var cmdElement) && cmdElement.Type == WireProtocol.BsonType.String)
             {
-                // Many commands have the collection name as the value of the command key itself (e.g., { find: "my_col" })
                 collection = reader.GetStringValue(cmdElement);
             }
 
@@ -306,17 +317,22 @@ public class MongoDbProxy : IHostedService
                 cmdName,
                 collection,
                 opMsg.Flags);
-            
-            return;
+        }
+        else
+        {
+            _logger.LogInformation(
+                "[{Tag}] OP_MSG #{RequestId} kind={Kind} flags={Flags} payloadBytes={PayloadLength}",
+                tag,
+                requestId,
+                opMsg.Kind,
+                opMsg.Flags,
+                opMsg.DataSection.Length);
         }
 
-        _logger.LogInformation(
-            "[{Tag}] OP_MSG #{RequestId} kind={Kind} flags={Flags} payloadBytes={PayloadLength}",
-            tag,
-            requestId,
-            opMsg.Kind,
-            opMsg.Flags,
-            opMsg.DataSection.Length);
+        foreach (var listener in _listeners)
+        {
+            listener.OnMessage(tag, requestId, "OP_MSG", cmdName, collection, payload);
+        }
     }
 
     private void LogOpReply(string tag, int requestId, int responseTo, OpReply opReply)
@@ -329,5 +345,10 @@ public class MongoDbProxy : IHostedService
             opReply.ResponseFlags,
             opReply.CursorID,
             opReply.NumberReturned);
+
+        foreach (var listener in _listeners)
+        {
+            listener.OnMessage(tag, requestId, "OP_REPLY", "reply", "N/A", $"{{ \"cursorId\": {opReply.CursorID}, \"count\": {opReply.NumberReturned} }}");
+        }
     }
 }
