@@ -1,119 +1,79 @@
 using SharpArena.Allocators;
-﻿using MongoSpyglass.Proxy.WireProtocol.Raw.Parts;
+using SharpArena.Collections;
+using MongoSpyglass.Proxy.WireProtocol.Raw.Parts;
+using System.Buffers.Binary;
 
 namespace MongoSpyglass.Proxy.WireProtocol.Raw.Loaders;
 
-internal class OpMsgLoader : OpMsgLoaderBase<Stream>
+internal class OpMsgLoader
+{
+    public static OpMsgLoader Instance { get; } = new();
+
+    public FlagBits LoadFlags(Stream source)
     {
-        private readonly static AsyncLocal<byte> Kind = new();
-
-        public static OpMsgLoader Instance { get; } = new();
-
-        public override FlagBits LoadFlags(Stream source, ArenaAllocator allocator)
+        if (!source.TryReadEnum<FlagBits, uint>(out var flags))
         {
-            if (!source.TryReadEnum<FlagBits>(out var flags))
-            {
-                throw new InvalidOperationException("Unable to read flags");
-            }
-
-            return flags;
+            throw new InvalidOperationException("Unable to read flags");
         }
 
-        public override byte LoadKind(Stream source, ArenaAllocator allocator)
+        return flags;
+    }
+
+    public OpMsg Load(Stream source, ArenaAllocator allocator)
+    {
+        var item = new OpMsg();
+        item.Flags = LoadFlags(source);
+        item.Sections = new ArenaList<byte>(allocator, 1024);
+
+        while (true)
         {
-            if (!source.TryRead<byte>(out var kind))
+            if (source.Position >= source.Length - (item.Flags.HasFlag(FlagBits.ChecksumPresent) ? 4 : 0))
             {
-                throw new InvalidOperationException("Unable to read section kind");
+                break;
             }
 
-            Kind.Value = kind;
-            return kind;
-        }
+            int kind = source.ReadByte();
+            if (kind == -1) break;
 
-        public override Span<byte> LoadDataSection(Stream source, ArenaAllocator allocator)
-        {
-            switch(Kind.Value)
-            {
-                case 0:
-                    return Kind0Loader.Instance.Load(source, allocator).BsonDocument;
-                case 1:
-                    if (!source.TryRead<int>(out var size))
-                    {
-                        throw new InvalidOperationException("Unable to read section size");
-                    }                    
+            item.Sections.Add((byte)kind);
 
-                    var sectionData = allocator.Allocate<byte>(size);
-
-                    size.AsBytes(allocator).CopyTo(sectionData);
-                    try
-                    {
-                        source.ReadExactly(sectionData[4..]);
-                    }
-                    catch (EndOfStreamException)
-                    {
-                        throw new InvalidOperationException("Unexpected EOF while reading section data");
-                    }
-                    
-                    return sectionData;
-                default:
-                    throw new InvalidOperationException($"Unknown section kind: {Kind.Value}");
-            }
-        }
-
-        internal class Kind0Loader : Kind0SectionLoaderBase<Stream>
-        {
-            public static Kind0Loader Instance { get; } = new();
-
-            public override Span<byte> LoadBsonDocument(Stream source, ArenaAllocator allocator)
+            if (kind == 0)
             {
                 if (!source.TryReadBson(allocator, out var bsonAsBytes))
                 {
-                    throw new InvalidOperationException("Unable to read query");
+                    throw new InvalidOperationException("Unable to read Kind 0 section");
                 }
+                foreach(var b in bsonAsBytes) item.Sections.Add(b);
+            }
+            else if (kind == 1)
+            {
+                if (!source.TryRead<int>(out var size))
+                {
+                    throw new InvalidOperationException("Unable to read Kind 1 section size");
+                }
+                
+                var sizeBytes = size.AsBytes(allocator);
+                foreach(var b in sizeBytes) item.Sections.Add(b);
 
-                return bsonAsBytes;            
+                var remainingSize = size - 4;
+                var buffer = allocator.Allocate<byte>(remainingSize);
+                source.ReadExactly(buffer);
+                foreach(var b in buffer) item.Sections.Add(b);
+            }
+            else
+            {
+                throw new InvalidOperationException($"Unknown section kind: {kind}");
             }
         }
 
-        internal class Kind1Loader: Kind1SectionLoaderBase<Stream>
+        if (item.Flags.HasFlag(FlagBits.ChecksumPresent))
         {
-            private readonly static AsyncLocal<int> Size = new();
-
-            public static Kind1Loader Instance { get; } = new();
-
-            public override int LoadSize(Stream source, ArenaAllocator allocator)
+            if (source.TryRead<uint>(out var checksum))
             {
-                if (!source.TryRead<int>(out var fetchedValue))
-                {
-                    throw new InvalidOperationException("Unable to read section size");
-                }
-
-                Size.Value = fetchedValue;
-                return fetchedValue;
-            }
-
-            public override Span<char> LoadDocumentSequenceIdentifier(Stream source, ArenaAllocator allocator)
-            {
-                if (!source.TryReadNativeStringFromStream(allocator, out var identifier))
-                {
-                    throw new InvalidOperationException("Unable to read document sequence identifier");
-                }
-
-                return identifier;
-            }
-
-            public override Span<byte> LoadBsonDocumentArray(Stream source, ArenaAllocator allocator)
-            {
-                var documentCollection = allocator.Allocate<byte>(Size.Value);
-                var usedData = 0;
-
-                while(source.TryReadBson(allocator, out var bsonAsBytes))
-                {
-                    bsonAsBytes.CopyTo(documentCollection[usedData..]);
-                    usedData += bsonAsBytes.Length;
-                }
-
-                return documentCollection;
+                item.Checksum = checksum;
             }
         }
+
+        return item;
     }
+}

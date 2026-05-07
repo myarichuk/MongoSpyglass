@@ -38,6 +38,8 @@ namespace MongoSpyglass.Proxy.WireProtocol
     {
         public BsonType Type;
         public uint NameHash;
+        public int NameOffset;
+        public int NameLength;
         public int ValueOffset;
         public int ValueLength;
     }
@@ -83,7 +85,8 @@ namespace MongoSpyglass.Proxy.WireProtocol
 
                 if (offset >= _bsonData.Length) break;
 
-                ReadOnlySpan<byte> nameSpan = _bsonData.Slice(nameOffset, offset - nameOffset);
+                int nameLength = offset - nameOffset;
+                ReadOnlySpan<byte> nameSpan = _bsonData.Slice(nameOffset, nameLength);
                 uint nameHash = ComputeHash(nameSpan);
                 offset++; // Skip null terminator
 
@@ -100,6 +103,8 @@ namespace MongoSpyglass.Proxy.WireProtocol
                 {
                     Type = type,
                     NameHash = nameHash,
+                    NameOffset = nameOffset,
+                    NameLength = nameLength,
                     ValueOffset = valueOffset,
                     ValueLength = valueLength
                 };
@@ -201,6 +206,16 @@ namespace MongoSpyglass.Proxy.WireProtocol
         public ReadOnlySpan<byte> GetValueSpan(BsonElementDescriptor element)
         {
             return _bsonData.Slice(element.ValueOffset, element.ValueLength);
+        }
+
+        public ReadOnlySpan<byte> GetElementNameSpan(BsonElementDescriptor element)
+        {
+            return _bsonData.Slice(element.NameOffset, element.NameLength);
+        }
+
+        public string GetElementName(BsonElementDescriptor element)
+        {
+            return Encoding.UTF8.GetString(GetElementNameSpan(element));
         }
 
         public string GetStringValue(BsonElementDescriptor element)

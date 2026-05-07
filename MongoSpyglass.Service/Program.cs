@@ -3,6 +3,7 @@ using Autofac.Extensions.DependencyInjection;
 using Autofac;
 using MongoSpyglass.Proxy;
 using MongoSpyglass.Service.Data;
+using Radzen;
 using Serilog;
 
 Log.Logger = new LoggerConfiguration()
@@ -14,7 +15,7 @@ var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddRazorPages();
 builder.Services.AddServerSideBlazor();
-builder.Services.AddSingleton<WeatherForecastService>();
+builder.Services.AddRadzenComponents();
 
 builder.Services.AddSingleton<TrafficMonitorService>();
 builder.Services.AddSingleton<ITrafficListener>(sp => sp.GetRequiredService<TrafficMonitorService>());

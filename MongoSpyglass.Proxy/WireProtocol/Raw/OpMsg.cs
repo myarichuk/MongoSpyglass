@@ -1,8 +1,6 @@
-using SharpArena.Allocators;
-﻿// Ignore Spelling: Mongo
-
-using SharpArena.Allocators;
 using System.Runtime.InteropServices;
+using MongoSpyglass.Proxy.WireProtocol.Raw.Parts;
+using SharpArena.Collections;
 
 namespace MongoSpyglass.Proxy.WireProtocol.Raw
 {
@@ -10,11 +8,7 @@ namespace MongoSpyglass.Proxy.WireProtocol.Raw
     public unsafe ref partial struct OpMsg
     {
         public FlagBits Flags;
-
-        public byte Kind;
-
-        public Span<byte> DataSection;
-
-
+        public ArenaList<byte> Sections; // Byte array representing section data
+        public uint? Checksum;
     }
 }

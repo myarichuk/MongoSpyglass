@@ -4,6 +4,7 @@
     <TargetFramework>net10.0</TargetFramework>
   </PropertyGroup>
   <ItemGroup>
+    <PackageReference Include="MongoDB.Bson" Version="3.8.0" />
     <PackageReference Include="SharpArena" Version="0.7.20" />
   </ItemGroup>
 </Project>
