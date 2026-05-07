@@ -104,7 +104,8 @@ namespace MongoSpyglass.Proxy
                 // if member type is another ref struct, generate an abstract factory method for its visitor
                 if (!IsPrimitive(member.Type) &&
                     !IsCoreBclType(member.Type) &&
-                    member.Type is INamedTypeSymbol { TypeKind: TypeKind.Struct, IsRefLikeType: true } nestedSymbol)
+                    member.Type is INamedTypeSymbol { TypeKind: TypeKind.Struct, IsRefLikeType: true } nestedSymbol &&
+                    _candidatesForVisitors.Contains(nestedSymbol.ToDisplayString()))
                 {
                     sb.AppendLine($"        protected abstract {nestedSymbol.Name}VisitorBase Create{nestedSymbol.Name}Visitor();");
                 }
@@ -113,10 +114,7 @@ namespace MongoSpyglass.Proxy
             foreach (var member in symbol.GetMembers()
                          .OfType<IFieldSymbol>()
                          .Where(member => 
-                             !_candidatesForVisitors.Contains(member.ToDisplayString()) &&
-                             (IsCoreBclType(member.Type) || 
-                             IsPrimitive(member.Type) ||
-                             member.Type is INamedTypeSymbol { TypeKind: TypeKind.Enum })))
+                             !_candidatesForVisitors.Contains(member.Type.ToDisplayString())))
             {
                 var memberType = member.Type.ToDisplayString();
                 var memberName = member.Name;
@@ -136,7 +134,8 @@ namespace MongoSpyglass.Proxy
 
                 // If member type is another ref struct, delegate to its visitor using the factory method
                 if (member.Type is INamedTypeSymbol { TypeKind: TypeKind.Struct } nestedSymbol && 
-                    !IsCoreBclType(member.Type))
+                    !IsCoreBclType(member.Type) &&
+                    _candidatesForVisitors.Contains(nestedSymbol.ToDisplayString()))
                 {
                     sb.AppendLine($"            Create{nestedSymbol.Name}Visitor().Visit(ref item.{memberName});");
                 }

@@ -1,5 +1,8 @@
 @page "/analysis"
+@using MongoSpyglass.Service.Data
 @namespace MongoSpyglass.Service.Pages
+@inject TrafficMonitorService TrafficMonitor
+@implements IDisposable
 
 <main class="flex-1 overflow-auto p-container-padding flex flex-col gap-gutter">
     <div class="flex justify-between items-end mb-unit">
@@ -42,57 +45,26 @@
                         </tr>
                     </thead>
                     <tbody class="divide-y divide-outline-variant/50">
-                        <tr class="hover:bg-surface-variant/30 group">
-                            <td class="py-cell-padding-y px-cell-padding-x">
-                                <span class="font-code-block text-code-block text-secondary">payments.transactions</span>
-                            </td>
-                            <td class="py-cell-padding-y px-cell-padding-x w-full max-w-0 truncate">
-                                <code class="font-code-block text-code-block bg-surface-container-highest px-1.5 py-0.5 rounded text-on-surface border border-outline-variant/30">{"find": "transactions", "filter": {"status": "pending", "amount": {"$gt": 1000}}}</code>
-                            </td>
-                            <td class="py-cell-padding-y px-cell-padding-x text-right">
-                                <span class="font-display-mono text-display-mono text-error">4,251ms</span>
-                            </td>
-                            <td class="py-cell-padding-y px-cell-padding-x text-right">
-                                <span class="font-display-mono text-display-mono text-tertiary">1,820ms</span>
-                            </td>
-                            <td class="py-cell-padding-y px-cell-padding-x text-right">
-                                <span class="font-display-mono text-display-mono text-on-surface-variant">1,402</span>
-                            </td>
-                        </tr>
-                        <tr class="hover:bg-surface-variant/30 group">
-                            <td class="py-cell-padding-y px-cell-padding-x">
-                                <span class="font-code-block text-code-block text-secondary">users.profiles</span>
-                            </td>
-                            <td class="py-cell-padding-y px-cell-padding-x w-full max-w-0 truncate">
-                                <code class="font-code-block text-code-block bg-surface-container-highest px-1.5 py-0.5 rounded text-on-surface border border-outline-variant/30">{"aggregate": "profiles", "pipeline": [{"$match": {"last_login": {"$lt": ISODate(...)}}}, ...]}</code>
-                            </td>
-                            <td class="py-cell-padding-y px-cell-padding-x text-right">
-                                <span class="font-display-mono text-display-mono text-error">3,104ms</span>
-                            </td>
-                            <td class="py-cell-padding-y px-cell-padding-x text-right">
-                                <span class="font-display-mono text-display-mono text-on-surface">840ms</span>
-                            </td>
-                            <td class="py-cell-padding-y px-cell-padding-x text-right">
-                                <span class="font-display-mono text-display-mono text-on-surface-variant">52</span>
-                            </td>
-                        </tr>
-                        <tr class="hover:bg-surface-variant/30 group">
-                            <td class="py-cell-padding-y px-cell-padding-x">
-                                <span class="font-code-block text-code-block text-secondary">logs.system_events</span>
-                            </td>
-                            <td class="py-cell-padding-y px-cell-padding-x w-full max-w-0 truncate">
-                                <code class="font-code-block text-code-block bg-surface-container-highest px-1.5 py-0.5 rounded text-emerald-400 border border-outline-variant/30">{"find": "system_events", "filter": {"severity": "CRITICAL"}, "sort": {"timestamp": -1}}</code>
-                            </td>
-                            <td class="py-cell-padding-y px-cell-padding-x text-right">
-                                <span class="font-display-mono text-display-mono text-tertiary">1,940ms</span>
-                            </td>
-                            <td class="py-cell-padding-y px-cell-padding-x text-right">
-                                <span class="font-display-mono text-display-mono text-on-surface">450ms</span>
-                            </td>
-                            <td class="py-cell-padding-y px-cell-padding-x text-right">
-                                <span class="font-display-mono text-display-mono text-on-surface-variant">8,912</span>
-                            </td>
-                        </tr>
+                        @foreach (var slow in _slowestGroups)
+                        {
+                            <tr class="hover:bg-surface-variant/30 group">
+                                <td class="py-cell-padding-y px-cell-padding-x">
+                                    <span class="font-code-block text-code-block text-secondary">@slow.Namespace</span>
+                                </td>
+                                <td class="py-cell-padding-y px-cell-padding-x w-full max-w-0 truncate">
+                                    <code class="font-code-block text-code-block bg-surface-container-highest px-1.5 py-0.5 rounded text-on-surface border border-outline-variant/30">@slow.Payload</code>
+                                </td>
+                                <td class="py-cell-padding-y px-cell-padding-x text-right">
+                                    <span class="font-display-mono text-display-mono text-error">@slow.MaxTime.ToString("F0")ms</span>
+                                </td>
+                                <td class="py-cell-padding-y px-cell-padding-x text-right">
+                                    <span class="font-display-mono text-display-mono text-tertiary">@slow.AvgTime.ToString("F0")ms</span>
+                                </td>
+                                <td class="py-cell-padding-y px-cell-padding-x text-right">
+                                    <span class="font-display-mono text-display-mono text-on-surface-variant">@slow.Count</span>
+                                </td>
+                            </tr>
+                        }
                     </tbody>
                 </table>
             </div>
@@ -106,26 +78,32 @@
                         <span class="material-symbols-outlined text-[16px] text-secondary">add_circle</span>
                         Index Suggestions
                     </h3>
-                    <span class="px-1.5 py-0.5 bg-secondary/10 text-secondary rounded text-[10px] font-bold">3 New</span>
+                    <span class="px-1.5 py-0.5 bg-secondary/10 text-secondary rounded text-[10px] font-bold">@(_slowestGroups.Count(g => g.AvgTime > 100)) New</span>
                 </div>
                 <div class="flex-1 overflow-auto p-2 space-y-2">
-                    <!-- Suggestion Card -->
-                    <div class="bg-surface-container-highest border border-outline-variant/50 rounded p-3 flex flex-col gap-2 relative overflow-hidden group hover:border-secondary/50 transition-colors">
-                        <div class="absolute top-0 right-0 w-1 bg-secondary h-full"></div>
-                        <div class="flex justify-between items-start">
-                            <div class="font-code-block text-code-block text-xs font-bold text-on-surface">payments.transactions</div>
-                            <div class="flex items-center gap-1 text-[10px] text-tertiary bg-tertiary/10 px-1.5 py-0.5 rounded">
-                                <span class="material-symbols-outlined text-[12px]">speed</span> High Impact
+                    @if (!_slowestGroups.Any(g => g.AvgTime > 100))
+                    {
+                        <div class="text-center text-on-surface-variant text-xs py-8">No high-impact suggestions yet.</div>
+                    }
+                    else
+                    {
+                        @foreach (var g in _slowestGroups.Where(g => g.AvgTime > 100).Take(3))
+                        {
+                            <div class="bg-surface-container-highest border border-outline-variant/50 rounded p-3 flex flex-col gap-2 relative overflow-hidden group hover:border-secondary/50 transition-colors">
+                                <div class="absolute top-0 right-0 w-1 bg-secondary h-full"></div>
+                                <div class="flex justify-between items-start">
+                                    <div class="font-code-block text-code-block text-xs font-bold text-on-surface">@g.Namespace</div>
+                                    <div class="flex items-center gap-1 text-[10px] text-tertiary bg-tertiary/10 px-1.5 py-0.5 rounded">
+                                        <span class="material-symbols-outlined text-[12px]">speed</span> High Impact
+                                    </div>
+                                </div>
+                                <div class="text-[11px] text-on-surface-variant leading-tight">Frequent slow @g.Command operations detected. Consider indexing filtered fields.</div>
+                                <div class="mt-1 flex justify-end">
+                                    <button class="px-3 py-1 bg-secondary/10 hover:bg-secondary/20 text-secondary border border-secondary/30 rounded font-ui-label-sm text-[10px] transition-colors">Build Index</button>
+                                </div>
                             </div>
-                        </div>
-                        <div class="text-[11px] text-on-surface-variant leading-tight">Queries filtering by <code class="text-primary bg-background px-1 rounded">status</code> and <code class="text-primary bg-background px-1 rounded">amount</code> are performing full collection scans.</div>
-                        <div class="bg-background p-1.5 rounded border border-outline-variant/30 mt-1">
-                            <code class="font-code-block text-code-block text-[10px] text-secondary">{ "status": 1, "amount": -1 }</code>
-                        </div>
-                        <div class="mt-1 flex justify-end">
-                            <button class="px-3 py-1 bg-secondary/10 hover:bg-secondary/20 text-secondary border border-secondary/30 rounded font-ui-label-sm text-[10px] transition-colors">Build Index</button>
-                        </div>
-                    </div>
+                        }
+                    }
                 </div>
             </div>
         </div>
@@ -137,47 +115,69 @@
                     <span class="material-symbols-outlined text-[16px] text-primary">bar_chart</span>
                     Most Frequent Query Patterns
                 </h3>
-                <div class="flex gap-4">
-                    <div class="flex items-center gap-1.5"><div class="w-2 h-2 rounded-full bg-primary"></div><span class="text-[10px] text-on-surface-variant font-display-mono uppercase">Read Ops</span></div>
-                    <div class="flex items-center gap-1.5"><div class="w-2 h-2 rounded-full bg-tertiary"></div><span class="text-[10px] text-on-surface-variant font-display-mono uppercase">Write Ops</span></div>
-                </div>
             </div>
             <div class="flex-1 p-4 flex flex-col gap-3 overflow-y-auto">
-                <!-- Chart Bar Row -->
-                <div class="flex items-center gap-4 group">
-                    <div class="w-32 shrink-0 font-code-block text-code-block text-xs text-on-surface truncate text-right" title="find: sessions">find: sessions</div>
-                    <div class="flex-1 h-3 bg-surface-container-highest rounded overflow-hidden flex relative border border-outline-variant/20">
-                        <!-- Pattern Gradient Bar (Read) -->
-                        <div class="h-full bg-gradient-to-r from-primary/20 to-primary/60 border-r-[1.5px] border-primary" style="width: 85%;"></div>
-                        <span class="absolute right-2 top-1/2 -translate-y-1/2 text-[9px] font-display-mono text-on-surface opacity-0 group-hover:opacity-100 transition-opacity">124.5k/s</span>
+                @foreach (var pattern in _frequentPatterns)
+                {
+                    <div class="flex items-center gap-4 group">
+                        <div class="w-32 shrink-0 font-code-block text-code-block text-xs text-on-surface truncate text-right" title="@pattern.Key">@pattern.Key</div>
+                        <div class="flex-1 h-3 bg-surface-container-highest rounded overflow-hidden flex relative border border-outline-variant/20">
+                            <div class="h-full bg-gradient-to-r from-primary/20 to-primary/60 border-r-[1.5px] border-primary" style="width: @(pattern.Value * 100 / Math.Max(1, _totalOps))%;"></div>
+                            <span class="absolute right-2 top-1/2 -translate-y-1/2 text-[9px] font-display-mono text-on-surface opacity-0 group-hover:opacity-100 transition-opacity">@pattern.Value ops</span>
+                        </div>
                     </div>
-                </div>
-                <!-- Chart Bar Row -->
-                <div class="flex items-center gap-4 group">
-                    <div class="w-32 shrink-0 font-code-block text-code-block text-xs text-on-surface truncate text-right" title="update: user_cache">update: user_cache</div>
-                    <div class="flex-1 h-3 bg-surface-container-highest rounded overflow-hidden flex relative border border-outline-variant/20">
-                        <!-- Pattern Gradient Bar (Write) -->
-                        <div class="h-full bg-gradient-to-r from-tertiary/20 to-tertiary/60 border-r-[1.5px] border-tertiary" style="width: 62%;"></div>
-                        <span class="absolute right-2 top-1/2 -translate-y-1/2 text-[9px] font-display-mono text-on-surface opacity-0 group-hover:opacity-100 transition-opacity">89.2k/s</span>
-                    </div>
-                </div>
-                <!-- Chart Bar Row -->
-                <div class="flex items-center gap-4 group">
-                    <div class="w-32 shrink-0 font-code-block text-code-block text-xs text-on-surface truncate text-right" title="aggregate: metrics">aggregate: metrics</div>
-                    <div class="flex-1 h-3 bg-surface-container-highest rounded overflow-hidden flex relative border border-outline-variant/20">
-                        <div class="h-full bg-gradient-to-r from-primary/20 to-primary/60 border-r-[1.5px] border-primary" style="width: 45%;"></div>
-                        <span class="absolute right-2 top-1/2 -translate-y-1/2 text-[9px] font-display-mono text-on-surface opacity-0 group-hover:opacity-100 transition-opacity">45.1k/s</span>
-                    </div>
-                </div>
-                <!-- Chart Bar Row -->
-                <div class="flex items-center gap-4 group">
-                    <div class="w-32 shrink-0 font-code-block text-code-block text-xs text-on-surface truncate text-right" title="find: inventory">find: inventory</div>
-                    <div class="flex-1 h-3 bg-surface-container-highest rounded overflow-hidden flex relative border border-outline-variant/20">
-                        <div class="h-full bg-gradient-to-r from-primary/20 to-primary/60 border-r-[1.5px] border-primary" style="width: 25%;"></div>
-                        <span class="absolute right-2 top-1/2 -translate-y-1/2 text-[9px] font-display-mono text-on-surface opacity-0 group-hover:opacity-100 transition-opacity">18.9k/s</span>
-                    </div>
-                </div>
+                }
             </div>
         </div>
     </div>
 </main>
+
+@code {
+    private int _totalOps => TrafficMonitor.Traffic.Count();
+
+    private class AggregatedQuery
+    {
+        public string Namespace { get; set; } = "";
+        public string Command { get; set; } = "";
+        public string Payload { get; set; } = "";
+        public double MaxTime { get; set; }
+        public double AvgTime { get; set; }
+        public int Count { get; set; }
+    }
+
+    private IEnumerable<AggregatedQuery> _slowestGroups => TrafficMonitor.Traffic
+        .Where(t => t.DurationMs.HasValue)
+        .GroupBy(t => new { t.Collection, t.Command })
+        .Select(g => new AggregatedQuery
+        {
+            Namespace = g.Key.Collection,
+            Command = g.Key.Command,
+            Payload = g.First().PayloadJson,
+            MaxTime = g.Max(t => t.DurationMs!.Value),
+            AvgTime = g.Average(t => t.DurationMs!.Value),
+            Count = g.Count()
+        })
+        .OrderByDescending(g => g.MaxTime)
+        .Take(10);
+
+    private IEnumerable<KeyValuePair<string, int>> _frequentPatterns => TrafficMonitor.Traffic
+        .GroupBy(t => $"{t.Command}: {t.Collection}")
+        .Select(g => new KeyValuePair<string, int>(g.Key, g.Count()))
+        .OrderByDescending(kv => kv.Value)
+        .Take(5);
+
+    protected override void OnInitialized()
+    {
+        TrafficMonitor.OnTrafficReceived += HandleTrafficReceived;
+    }
+
+    private async void HandleTrafficReceived()
+    {
+        await InvokeAsync(StateHasChanged);
+    }
+
+    public void Dispose()
+    {
+        TrafficMonitor.OnTrafficReceived -= HandleTrafficReceived;
+    }
+}

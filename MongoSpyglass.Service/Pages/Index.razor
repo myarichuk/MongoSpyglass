@@ -1,18 +1,20 @@
 @page "/"
+@using MongoSpyglass.Service.Data
 @namespace MongoSpyglass.Service.Pages
+@inject TrafficMonitorService TrafficMonitor
+@implements IDisposable
 
 <div class="flex flex-col flex-grow min-w-0">
     <div class="flex-grow overflow-y-auto overflow-x-hidden p-container-padding bg-background relative flex flex-col gap-gutter">
         <div class="grid grid-cols-12 gap-gutter shrink-0">
-            <!-- Query Throughput Card -->
+            <!-- Total Operations Card -->
             <div class="col-span-3 bg-surface-container rounded border border-outline-variant p-3 flex flex-col justify-between h-[110px] relative overflow-hidden group">
                 <div class="flex justify-between items-start w-full z-10">
-                    <span class="font-ui-label-sm text-ui-label-sm text-on-surface-variant uppercase tracking-wider">Query Throughput</span>
+                    <span class="font-ui-label-sm text-ui-label-sm text-on-surface-variant uppercase tracking-wider">Total Operations</span>
                     <span class="material-symbols-outlined text-[16px] text-primary-fixed-dim">speed</span>
                 </div>
                 <div class="z-10 flex items-baseline gap-2">
-                    <span class="font-display-mono text-display-mono text-[28px] text-primary-fixed">12,482</span>
-                    <span class="font-code-block text-[11px] text-secondary-fixed flex items-center"><span class="material-symbols-outlined text-[12px] leading-none">arrow_upward</span> 4.2%</span>
+                    <span class="font-display-mono text-display-mono text-[28px] text-primary-fixed">@_totalOps</span>
                 </div>
             </div>
 
@@ -23,42 +25,34 @@
                     <span class="material-symbols-outlined text-[16px] text-tertiary-fixed-dim">timer</span>
                 </div>
                 <div class="z-10 flex items-baseline gap-2">
-                    <span class="font-display-mono text-display-mono text-[28px] text-on-surface">42.8</span>
+                    <span class="font-display-mono text-display-mono text-[28px] text-on-surface">@(_avgLatency?.ToString("F1") ?? "-")</span>
                     <span class="font-code-block text-[11px] text-on-surface-variant">ms</span>
                 </div>
                 <div class="w-full bg-surface-container-highest h-1 rounded-full mt-2 overflow-hidden z-10">
-                    <div class="bg-tertiary-fixed-dim h-full w-[15%]"></div>
+                    <div class="bg-tertiary-fixed-dim h-full" style="width: @(Math.Min((_avgLatency ?? 0) / 200 * 100, 100))%"></div>
                 </div>
             </div>
 
-            <!-- Memory Usage Card -->
+            <!-- Max Latency Card -->
             <div class="col-span-3 bg-surface-container rounded border border-outline-variant p-3 flex flex-col justify-between h-[110px] relative overflow-hidden">
                 <div class="flex justify-between items-start w-full z-10">
-                    <span class="font-ui-label-sm text-ui-label-sm text-on-surface-variant uppercase tracking-wider">Memory Usage</span>
-                    <span class="material-symbols-outlined text-[16px] text-secondary-fixed">memory</span>
+                    <span class="font-ui-label-sm text-ui-label-sm text-on-surface-variant uppercase tracking-wider">Max Latency</span>
+                    <span class="material-symbols-outlined text-[16px] text-secondary-fixed">bolt</span>
                 </div>
                 <div class="z-10 flex items-baseline gap-2">
-                    <span class="font-display-mono text-display-mono text-[28px] text-on-surface">48.2</span>
-                    <span class="font-code-block text-[11px] text-on-surface-variant">/ 64 GB</span>
-                </div>
-                <div class="w-full bg-surface-container-highest h-1.5 rounded-full mt-2 overflow-hidden z-10 flex">
-                    <div class="bg-secondary-fixed h-full w-[60%] border-r border-background"></div>
-                    <div class="bg-tertiary-fixed h-full w-[15%] border-r border-background"></div>
+                    <span class="font-display-mono text-display-mono text-[28px] text-on-surface">@(_maxLatency?.ToString("F1") ?? "-")</span>
+                    <span class="font-code-block text-[11px] text-on-surface-variant">ms</span>
                 </div>
             </div>
 
-            <!-- Active Sessions Card -->
+            <!-- Events Captured Card -->
             <div class="col-span-3 bg-surface-container rounded border border-outline-variant p-3 flex flex-col justify-between h-[110px]">
                 <div class="flex justify-between items-start w-full">
-                    <span class="font-ui-label-sm text-ui-label-sm text-on-surface-variant uppercase tracking-wider">Active Sessions</span>
-                    <span class="material-symbols-outlined text-[16px] text-outline">group</span>
+                    <span class="font-ui-label-sm text-ui-label-sm text-on-surface-variant uppercase tracking-wider">Captured Events</span>
+                    <span class="material-symbols-outlined text-[16px] text-outline">history</span>
                 </div>
                 <div class="flex items-baseline gap-2">
-                    <span class="font-display-mono text-display-mono text-[28px] text-on-surface">841</span>
-                </div>
-                <div class="flex gap-4 mt-1 font-code-block text-[10px] text-on-surface-variant">
-                    <div class="flex items-center gap-1"><div class="w-1.5 h-1.5 rounded-full bg-secondary-fixed"></div> 820 Read</div>
-                    <div class="flex items-center gap-1"><div class="w-1.5 h-1.5 rounded-full bg-primary-fixed"></div> 21 Write</div>
+                    <span class="font-display-mono text-display-mono text-[28px] text-on-surface">@_totalOps</span>
                 </div>
             </div>
         </div>
@@ -71,15 +65,11 @@
                 </div>
                 <div class="p-4 flex-grow relative w-full h-full flex flex-col">
                     <RadzenChart>
-                        <RadzenLineSeries Smooth="true" Data="@LatencyData" CategoryProperty="Time" Title="Reads" LineType="LineType.Solid" ValueProperty="Reads">
+                        <RadzenLineSeries Smooth="true" Data="@_latencyHistory" CategoryProperty="Timestamp" Title="Latency" LineType="LineType.Solid" ValueProperty="Latency">
                             <RadzenMarkers MarkerType="MarkerType.None" />
                             <RadzenSeriesDataLabels Visible="false" />
                         </RadzenLineSeries>
-                        <RadzenLineSeries Smooth="true" Data="@LatencyData" CategoryProperty="Time" Title="Writes" LineType="LineType.Dashed" ValueProperty="Writes">
-                            <RadzenMarkers MarkerType="MarkerType.None" />
-                            <RadzenSeriesDataLabels Visible="false" />
-                        </RadzenLineSeries>
-                        <RadzenCategoryAxis Padding="20" FormatString="{0:HH:mm}" />
+                        <RadzenCategoryAxis Padding="20" FormatString="{0:HH:mm:ss}" />
                         <RadzenValueAxis>
                             <RadzenGridLines Visible="true" />
                             <RadzenAxisTitle Text="Latency (ms)" />
@@ -88,64 +78,45 @@
                 </div>
             </div>
 
-            <!-- Cluster Status -->
+            <!-- Top Commands -->
             <div class="col-span-4 bg-surface-container rounded border border-outline-variant flex flex-col h-[320px]">
                 <div class="px-4 py-3 border-b border-outline-variant bg-surface-container-low rounded-t">
-                    <h2 class="font-ui-header text-ui-header text-on-surface">Cluster Status</h2>
+                    <h2 class="font-ui-header text-ui-header text-on-surface">Top Commands</h2>
                 </div>
                 <div class="p-4 flex flex-col gap-4 flex-grow overflow-y-auto font-code-block text-code-block">
-                    <div class="flex flex-col gap-1">
-                        <div class="flex justify-between text-on-surface-variant text-[11px] uppercase tracking-wide font-ui-label-sm">
-                            <span>Health</span>
-                            <span class="text-secondary-fixed">OK</span>
+                    @foreach (var cmd in _topCommands)
+                    {
+                        <div class="flex flex-col gap-1">
+                            <div class="flex justify-between text-on-surface-variant text-[11px] uppercase tracking-wide font-ui-label-sm">
+                                <span>@cmd.Key</span>
+                                <span class="text-secondary-fixed">@cmd.Value</span>
+                            </div>
+                            <div class="w-full bg-surface-container-highest h-[2px] rounded-full mt-1">
+                                <div class="bg-secondary-fixed h-full" style="width: @(cmd.Value * 100 / Math.Max(1, _totalOps))%"></div>
+                            </div>
                         </div>
-                        <div class="w-full bg-surface-container-highest h-[2px] rounded-full mt-1">
-                            <div class="bg-secondary-fixed h-full w-full"></div>
-                        </div>
-                    </div>
-                    <div class="h-[1px] bg-outline-variant w-full my-1"></div>
-                    <div class="flex justify-between items-center text-sm">
-                        <span class="text-on-surface-variant">Connections</span>
-                        <span class="text-on-surface font-medium">1,402 <span class="text-outline text-[11px]">/ 4096</span></span>
-                    </div>
-                    <div class="flex justify-between items-center text-sm">
-                        <span class="text-on-surface-variant">Network In</span>
-                        <span class="text-on-surface font-medium">45.2 <span class="text-outline text-[11px]">MB/s</span></span>
-                    </div>
-                    <div class="flex justify-between items-center text-sm">
-                        <span class="text-on-surface-variant">Network Out</span>
-                        <span class="text-on-surface font-medium">128.7 <span class="text-outline text-[11px]">MB/s</span></span>
-                    </div>
-                    <div class="flex justify-between items-center text-sm">
-                        <span class="text-on-surface-variant">Replication Lag</span>
-                        <span class="text-secondary-fixed font-medium">0 <span class="text-outline text-[11px]">sec</span></span>
-                    </div>
-                    <div class="flex justify-between items-center text-sm">
-                        <span class="text-on-surface-variant">Uptime</span>
-                        <span class="text-on-surface font-medium">42d 18h 12m</span>
-                    </div>
+                    }
                 </div>
             </div>
         </div>
 
-        <!-- Top Slow Queries -->
+        <!-- Recent Slow Queries -->
         <div class="bg-surface-container rounded border border-outline-variant flex flex-col flex-grow min-h-[200px]">
             <div class="px-4 py-3 border-b border-outline-variant bg-surface-container-low rounded-t flex justify-between items-center">
-                <h2 class="font-ui-header text-ui-header text-on-surface">Top Slow Queries</h2>
-                <button class="text-[11px] font-ui-label-sm text-primary hover:text-primary-fixed uppercase tracking-wider transition-colors">View All</button>
+                <h2 class="font-ui-header text-ui-header text-on-surface">Recent Slow Queries (>100ms)</h2>
             </div>
             <div class="w-full overflow-x-auto p-2">
-                <RadzenDataGrid Data="@SlowQueries" TItem="SlowQueryModel" Density="Density.Compact" GridLines="DataGridGridLines.None" AllowPaging="false" AllowSorting="true">
+                <RadzenDataGrid Data="@_slowQueries" TItem="DecryptedTraffic" Density="Density.Compact" GridLines="DataGridGridLines.None" AllowPaging="false" AllowSorting="true">
                     <Columns>
-                        <RadzenDataGridColumn TItem="SlowQueryModel" Property="Namespace" Title="Namespace" />
-                        <RadzenDataGridColumn TItem="SlowQueryModel" Property="Operation" Title="Operation" />
-                        <RadzenDataGridColumn TItem="SlowQueryModel" Property="AvgTimeMs" Title="Avg Time">
+                        <RadzenDataGridColumn TItem="DecryptedTraffic" Property="Timestamp" Title="Time" FormatString="{0:HH:mm:ss}" />
+                        <RadzenDataGridColumn TItem="DecryptedTraffic" Property="Collection" Title="Namespace" />
+                        <RadzenDataGridColumn TItem="DecryptedTraffic" Property="Command" Title="Operation" />
+                        <RadzenDataGridColumn TItem="DecryptedTraffic" Property="DurationMs" Title="Time">
                             <Template Context="q">
-                                @q.AvgTimeMs ms
+                                @q.DurationMs?.ToString("F1") ms
                             </Template>
                         </RadzenDataGridColumn>
-                        <RadzenDataGridColumn TItem="SlowQueryModel" Property="Count" Title="Count" />
-                        <RadzenDataGridColumn TItem="SlowQueryModel" Property="Shape" Title="Shape" Width="300px" />
+                        <RadzenDataGridColumn TItem="DecryptedTraffic" Property="PayloadJson" Title="Payload" Width="300px" />
                     </Columns>
                 </RadzenDataGrid>
             </div>
@@ -154,26 +125,52 @@
 </div>
 
 @code {
-    List<LatencyDataPoint> LatencyData = new List<LatencyDataPoint>();
-    List<SlowQueryModel> SlowQueries = new List<SlowQueryModel>();
+    private int _totalOps => TrafficMonitor.Traffic.Count();
+    private double? _avgLatency => TrafficMonitor.Traffic.Any(t => t.DurationMs.HasValue) ? TrafficMonitor.Traffic.Where(t => t.DurationMs.HasValue).Average(t => t.DurationMs) : null;
+    private double? _maxLatency => TrafficMonitor.Traffic.Any(t => t.DurationMs.HasValue) ? TrafficMonitor.Traffic.Where(t => t.DurationMs.HasValue).Max(t => t.DurationMs) : null;
+
+    private IEnumerable<KeyValuePair<string, int>> _topCommands => TrafficMonitor.Traffic
+        .GroupBy(t => t.Command)
+        .Select(g => new KeyValuePair<string, int>(g.Key, g.Count()))
+        .OrderByDescending(kv => kv.Value)
+        .Take(5);
+
+    private IEnumerable<DecryptedTraffic> _slowQueries => TrafficMonitor.Traffic
+        .Where(t => t.DurationMs > 100)
+        .Take(10);
+
+    private List<LatencyPoint> _latencyHistory = new();
 
     protected override void OnInitialized()
     {
-        var now = DateTime.Now;
-        LatencyData = new List<LatencyDataPoint>
-        {
-            new LatencyDataPoint(now.AddMinutes(-60), 20, 5),
-            new LatencyDataPoint(now.AddMinutes(-45), 25, 10),
-            new LatencyDataPoint(now.AddMinutes(-30), 15, 8),
-            new LatencyDataPoint(now.AddMinutes(-15), 40, 15),
-            new LatencyDataPoint(now, 60, 20),
-        };
+        TrafficMonitor.OnTrafficReceived += HandleTrafficReceived;
+        UpdateHistory();
+    }
 
-        SlowQueries = new List<SlowQueryModel>
-        {
-            new SlowQueryModel("users.profiles", "find", 142, 4210, "{ \"status\": \"active\", \"lastLogin\": { \"$gt\": ... } }"),
-            new SlowQueryModel("orders.history", "aggregate", 410, 842, "[ { \"$match\": ... }, { \"$group\": ... } ]"),
-            new SlowQueryModel("inventory.stock", "update", 85, 12401, "{ \"sku\": \"A19-...\", \"$inc\": { \"qty\": -1 } }")
-        };
+    private async void HandleTrafficReceived()
+    {
+        UpdateHistory();
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private void UpdateHistory()
+    {
+        _latencyHistory = TrafficMonitor.Traffic
+            .Where(t => t.DurationMs.HasValue)
+            .Take(20)
+            .Reverse()
+            .Select(t => new LatencyPoint { Timestamp = t.Timestamp, Latency = t.DurationMs!.Value })
+            .ToList();
+    }
+
+    public void Dispose()
+    {
+        TrafficMonitor.OnTrafficReceived -= HandleTrafficReceived;
+    }
+
+    public class LatencyPoint
+    {
+        public DateTime Timestamp { get; set; }
+        public double Latency { get; set; }
     }
 }

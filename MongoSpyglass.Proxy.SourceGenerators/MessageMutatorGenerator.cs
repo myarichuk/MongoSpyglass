@@ -103,7 +103,8 @@ namespace MongoSpyglass.Proxy
 
                 if (!IsPrimitive(member.Type) &&
                     !IsCoreBclType(member.Type) &&
-                    member.Type is INamedTypeSymbol { TypeKind: TypeKind.Struct, IsRefLikeType: true } nestedSymbol)
+                    member.Type is INamedTypeSymbol { TypeKind: TypeKind.Struct, IsRefLikeType: true } nestedSymbol &&
+                    _candidatesForMutateors.Contains(nestedSymbol.ToDisplayString()))
                 {
                     sb.AppendLine($"        protected abstract {nestedSymbol.Name}MutatorBase Create{nestedSymbol.Name}Mutator();");
                 }
@@ -112,10 +113,7 @@ namespace MongoSpyglass.Proxy
             foreach (var member in symbol.GetMembers()
                          .OfType<IFieldSymbol>()
                          .Where(member => 
-                             !_candidatesForMutateors.Contains(member.ToDisplayString()) &&
-                             (IsCoreBclType(member.Type) || 
-                             IsPrimitive(member.Type) ||
-                             member.Type is INamedTypeSymbol { TypeKind: TypeKind.Enum })))
+                             !_candidatesForMutateors.Contains(member.Type.ToDisplayString())))
             {
                 var memberType = member.Type.ToDisplayString();
                 var memberName = member.Name;
@@ -135,7 +133,8 @@ namespace MongoSpyglass.Proxy
 
                 // If member type is another ref struct, delegate to its visitor using the factory method
                 if (member.Type is INamedTypeSymbol { TypeKind: TypeKind.Struct } nestedSymbol && 
-                    !IsCoreBclType(member.Type))
+                    !IsCoreBclType(member.Type) &&
+                    _candidatesForMutateors.Contains(nestedSymbol.ToDisplayString()))
                 {
                     sb.AppendLine($"            item.{memberName} = new(); //give default value before passing it through 'ref' param");
                     sb.AppendLine($"            Create{nestedSymbol.Name}Mutator().Mutate(ref item.{memberName});");
