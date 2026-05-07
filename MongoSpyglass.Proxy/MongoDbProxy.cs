@@ -14,8 +14,21 @@ using MongoDB.Bson;
 using MongoDB.Bson.Serialization;
 using MongoSpyglass.Proxy.Profiling;
 using System.Buffers.Binary;
+using System.Threading.Channels;
 
 namespace MongoSpyglass.Proxy;
+
+/// <summary>
+/// Event published to the internal bounded channel.
+/// </summary>
+public record TrafficEvent(
+    string Tag,
+    int RequestId,
+    string OpCode,
+    string Command,
+    string Collection,
+    string PayloadJson,
+    double? DurationMs = null);
 
 public class MongoDbProxy : IHostedService
 {
@@ -25,6 +38,7 @@ public class MongoDbProxy : IHostedService
     private readonly int _port;
     private readonly ILogger<MongoDbProxy> _logger;
     private readonly IEnumerable<ITrafficListener> _listeners;
+    private readonly Channel<TrafficEvent> _eventChannel;
     private TcpListener? _listener;
 
     public MongoDbProxy(IPEndPoint mongoDbServer, int incomingPort, ILogger<MongoDbProxy> logger, IEnumerable<ITrafficListener> listeners)
@@ -33,6 +47,14 @@ public class MongoDbProxy : IHostedService
         _port = incomingPort;
         _logger = logger;
         _listeners = listeners;
+
+        var channelOptions = new BoundedChannelOptions(1024)
+        {
+            FullMode = BoundedChannelFullMode.DropOldest,
+            SingleReader = true,
+            AllowSynchronousContinuations = false
+        };
+        _eventChannel = Channel.CreateBounded<TrafficEvent>(channelOptions);
 
         _retryPolicy = Policy
             .Handle<SocketException>()
@@ -51,6 +73,7 @@ public class MongoDbProxy : IHostedService
         _logger.LogInformation($"Started listening on incoming port {_port}");
 
         _ = Task.Run(AcceptConnectionsAsync, _cts.Token);
+        _ = Task.Run(ConsumeTrafficEventsAsync, _cts.Token);
 
         return Task.CompletedTask;
     }
@@ -303,10 +326,8 @@ public class MongoDbProxy : IHostedService
             opQuery.NumberToReturn,
             payload);
 
-        foreach (var listener in _listeners)
-        {
-            listener.OnMessage(tag, requestId, "OP_QUERY", "find", opQuery.FullCollectionName, payload);
-        }
+        var evt = new TrafficEvent(tag, requestId, "OP_QUERY", "find", opQuery.FullCollectionName, payload);
+        _eventChannel.Writer.TryWrite(evt);
     }
 
     private void LogOpMsg(string tag, int requestId, OpMsg opMsg, ArenaAllocator allocator, double? durationMs = null)
@@ -376,10 +397,8 @@ public class MongoDbProxy : IHostedService
             opMsg.Flags,
             durationMs?.ToString("F2") ?? "-");
 
-        foreach (var listener in _listeners)
-        {
-            listener.OnMessage(tag, requestId, "OP_MSG", cmdName, collection, payload, durationMs);
-        }
+        var evt = new TrafficEvent(tag, requestId, "OP_MSG", cmdName, collection, payload, durationMs);
+        _eventChannel.Writer.TryWrite(evt);
     }
 
     private void LogOpReply(string tag, int requestId, int responseTo, OpReply opReply, double? durationMs = null)
@@ -394,9 +413,33 @@ public class MongoDbProxy : IHostedService
             opReply.NumberReturned,
             durationMs?.ToString("F2") ?? "-");
 
-        foreach (var listener in _listeners)
+        var payload = $"{{ \"cursorId\": {opReply.CursorID}, \"count\": {opReply.NumberReturned} }}";
+        var evt = new TrafficEvent(tag, requestId, "OP_REPLY", "reply", "N/A", payload, durationMs);
+        _eventChannel.Writer.TryWrite(evt);
+    }
+
+    private async Task ConsumeTrafficEventsAsync()
+    {
+        try
         {
-            listener.OnMessage(tag, requestId, "OP_REPLY", "reply", "N/A", $"{{ \"cursorId\": {opReply.CursorID}, \"count\": {opReply.NumberReturned} }}", durationMs);
+            await foreach (var evt in _eventChannel.Reader.ReadAllAsync(_cts.Token))
+            {
+                foreach (var listener in _listeners)
+                {
+                    try
+                    {
+                        listener.OnMessage(evt.Tag, evt.RequestId, evt.OpCode, evt.Command, evt.Collection, evt.PayloadJson, evt.DurationMs);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Error dispatching to traffic listener");
+                    }
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // normal on shutdown
         }
     }
 }
