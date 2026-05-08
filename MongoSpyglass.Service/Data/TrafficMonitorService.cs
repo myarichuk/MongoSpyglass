@@ -12,12 +12,12 @@ namespace MongoSpyglass.Service.Data;
 public record DecryptedTraffic
 {
     public DateTime Timestamp { get; init; } = DateTime.Now;
-    public string Tag { get; init; } = string.Empty; // "to" or "from"
+    public string Tag { get; init; } = string.Empty;
     public int RequestId { get; init; }
     public string OpCode { get; init; } = string.Empty;
     public string Command { get; init; } = string.Empty;
     public string Collection { get; init; } = string.Empty;
-    public string PayloadJson { get; init; } = string.Empty;
+    public byte[]? RawBson { get; init; } // REPLACED: PayloadJson
     public double? DurationMs { get; init; }
     public int SizeBytes { get; init; }
     public int DocumentCount { get; init; }
@@ -30,20 +30,23 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
     private int _head = 0;
     private int _count = 0;
     private readonly ReaderWriterLockSlim _lock = new();
+    private readonly ConcurrentDictionary<int, (DateTime Start, int Size)> _pendingRequests = new();
     
     private readonly Channel<ObservedMessage> _incomingChannel;
     private readonly CancellationTokenSource _cts = new();
     private readonly System.Timers.Timer _throughputTimer;
     private readonly RavenStorageService _ravenService;
+    private readonly NotificationHubService _notificationHub;
 
     public event Action? OnTrafficReceived;
 
     public bool ShowHello { get; set; } = false;
     public int ThroughputOpsPerSec { get; private set; }
 
-    public TrafficMonitorService(RavenStorageService ravenService)
+    public TrafficMonitorService(RavenStorageService ravenService, NotificationHubService notificationHub)
     {
         _ravenService = ravenService;
+        _notificationHub = notificationHub;
         _incomingChannel = Channel.CreateBounded<ObservedMessage>(new BoundedChannelOptions(2048)
         {
             FullMode = BoundedChannelFullMode.DropWrite,
@@ -128,35 +131,40 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
                 {
                     if (msg.Tag == "from")
                     {
-                        // Correlation: Find the request and update duration/size
-                        _lock.EnterWriteLock();
-                        try
+                        if (_pendingRequests.TryRemove(msg.ResponseTo, out var req))
                         {
-                            for (int i = 0; i < _count; i++)
+                            var duration = (DateTime.Now - req.Start).TotalMilliseconds;
+                            _lock.EnterWriteLock();
+                            try
                             {
-                                int index = (_head - 1 - i + MaxItems) % MaxItems;
-                                if (_circularBuffer[index].RequestId == msg.ResponseTo)
+                                // Find in circular buffer to update duration/size
+                                for (int i = 0; i < _count; i++)
                                 {
-                                    _circularBuffer[index] = _circularBuffer[index] with 
-                                    { 
-                                        DurationMs = msg.DurationMs,
-                                        SizeBytes = _circularBuffer[index].SizeBytes + msg.MessageSizeBytes
-                                    };
-                                    break;
+                                    int index = (_head - 1 - i + MaxItems) % MaxItems;
+                                    if (_circularBuffer[index].RequestId == msg.ResponseTo)
+                                    {
+                                        _circularBuffer[index] = _circularBuffer[index] with 
+                                        { 
+                                            DurationMs = duration,
+                                            SizeBytes = _circularBuffer[index].SizeBytes + msg.MessageSizeBytes
+                                        };
+                                        break;
+                                    }
                                 }
                             }
-                        }
-                        finally
-                        {
-                            _lock.ExitWriteLock();
+                            finally
+                            {
+                                _lock.ExitWriteLock();
+                            }
                         }
                         OnTrafficReceived?.Invoke();
                         continue;
                     }
 
+                    _pendingRequests[msg.RequestId] = (DateTime.Now, msg.MessageSizeBytes);
+
                     string cmdName = "unknown";
                     string collection = "N/A";
-                    string payload = "{}";
 
                     if (!msg.Document.IsDefault)
                     {
@@ -198,13 +206,6 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
                         {
                             continue;
                         }
-
-                        try
-                        {
-                            var bsonDoc = BsonSerializer.Deserialize<BsonDocument>(msg.Document.AsReadOnlySpan().ToArray());
-                            payload = bsonDoc.ToJson(new JsonWriterSettings { Indent = false });
-                        }
-                        catch { }
                     }
 
                     var entry = new DecryptedTraffic
@@ -214,7 +215,7 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
                         OpCode = msg.OpCode.ToString(),
                         Command = cmdName,
                         Collection = collection,
-                        PayloadJson = payload,
+                        RawBson = msg.Document.AsReadOnlySpan().ToArray(),
                         DurationMs = msg.DurationMs,
                         SizeBytes = msg.MessageSizeBytes,
                         DocumentCount = msg.DocumentCount
@@ -230,20 +231,24 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
                         SizeBytes = msg.MessageSizeBytes,
                         DocumentCount = msg.DocumentCount,
                         Timestamp = entry.Timestamp
-                    }, msg.Document.AsReadOnlySpan().ToArray());
+                    }, entry.RawBson);
 
                     _lock.EnterWriteLock();
                     try
                     {
                         _circularBuffer[_head] = entry;
                         _head = (_head + 1) % MaxItems;
-                        if (_count < MaxItems) _count++;
+                        if (_count < MaxItems)
+                        {
+                            _count++;
+                        }
                     }
                     finally
                     {
                         _lock.ExitWriteLock();
                     }
 
+                    _notificationHub.Refresh();
                     OnTrafficReceived?.Invoke();
                 }
                 finally
