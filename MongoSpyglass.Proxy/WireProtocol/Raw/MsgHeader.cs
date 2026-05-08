@@ -1,5 +1,4 @@
 ﻿using System.Runtime.InteropServices;
-using MongoSpyglass.Proxy.WireProtocol.Raw.Parts;
 
 namespace MongoSpyglass.Proxy.WireProtocol.Raw;
 

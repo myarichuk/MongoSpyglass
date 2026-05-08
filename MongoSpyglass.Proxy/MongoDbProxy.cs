@@ -10,7 +10,6 @@ using MongoSpyglass.Proxy.WireProtocol;
 using MongoSpyglass.Proxy.WireProtocol.Raw;
 using SharpArena.Allocators;
 using SharpArena.Collections;
-using MongoSpyglass.Proxy.WireProtocol.Raw.Loaders;
 using MongoDB.Bson;
 using MongoDB.Bson.Serialization;
 using MongoSpyglass.Proxy.Profiling;
