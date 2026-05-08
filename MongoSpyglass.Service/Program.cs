@@ -3,6 +3,7 @@ using Autofac.Extensions.DependencyInjection;
 using Autofac;
 using MongoSpyglass.Proxy;
 using MongoSpyglass.Service.Data;
+using MongoSpyglass.Service.Analyzers;
 using Radzen;
 using Serilog;
 
@@ -19,6 +20,16 @@ builder.Services.AddRadzenComponents();
 
 builder.Services.AddSingleton<TrafficMonitorService>();
 builder.Services.AddSingleton<ITrafficListener>(sp => sp.GetRequiredService<TrafficMonitorService>());
+
+builder.Services.AddSingleton<RavenStorageService>();
+
+builder.Services.AddSingleton<SlowQueryAnalyzer>();
+builder.Services.AddSingleton<ITrafficListener>(sp => sp.GetRequiredService<SlowQueryAnalyzer>());
+builder.Services.AddSingleton<IAnalyzerPlugin>(sp => sp.GetRequiredService<SlowQueryAnalyzer>());
+
+builder.Services.AddSingleton<CursorAnalyzer>();
+builder.Services.AddSingleton<ITrafficListener>(sp => sp.GetRequiredService<CursorAnalyzer>());
+builder.Services.AddSingleton<IAnalyzerPlugin>(sp => sp.GetRequiredService<CursorAnalyzer>());
 
 builder.Services.AddHostedService(sp =>
 {
@@ -44,6 +55,10 @@ builder.Host
     .UseServiceProviderFactory(new AutofacServiceProviderFactory());
 
 var app = builder.Build();
+
+// Initialize RavenDB
+var ravenService = app.Services.GetRequiredService<RavenStorageService>();
+ravenService.Initialize();
 
 if (!app.Environment.IsDevelopment())
 {

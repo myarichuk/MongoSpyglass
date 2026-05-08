@@ -405,7 +405,7 @@ public readonly unsafe struct BlittableBsonDocument
         while (*ptr != 0) ptr++; 
         var dataPtr = ptr + 1;
         int dataPos = (int)(dataPtr - _bsonBytes);
-        int endPos = ArenaBsonReader.SkipElement(_bsonBytes, dataPos, type);
+        int endPos = ArenaBsonReader.SkipElement(_bsonBytes, dataPos, type, _length);
         length = endPos - dataPos;
         return dataPtr;
     }

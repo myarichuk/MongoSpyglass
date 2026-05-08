@@ -1,7 +1,9 @@
 @page "/analysis"
 @using MongoSpyglass.Service.Data
+@using MongoSpyglass.Service.Analyzers
 @namespace MongoSpyglass.Service.Pages
 @inject TrafficMonitorService TrafficMonitor
+@inject IEnumerable<IAnalyzerPlugin> Analyzers
 @implements IDisposable
 
 <main class="flex-1 overflow-auto p-container-padding flex flex-col gap-gutter">
@@ -11,11 +13,11 @@
             <p class="text-on-surface-variant mt-1 text-xs">Aggregated view of high-latency operations and indexing opportunities over the last 24 hours.</p>
         </div>
         <div class="flex gap-2">
-            <button class="flex items-center gap-1.5 px-3 py-1.5 bg-surface-container-high border border-outline-variant rounded hover:bg-surface-variant transition-colors text-on-surface font-ui-label-sm text-ui-label-sm">
+            <button class="flex items-center gap-1.5 px-3 py-1.5 bg-surface-container-high border border-outline-variant rounded opacity-50 cursor-not-allowed pointer-events-none text-on-surface font-ui-label-sm text-ui-label-sm">
                 <span class="material-symbols-outlined text-[16px]">calendar_today</span>
                 Last 24h
             </button>
-            <button class="flex items-center gap-1.5 px-3 py-1.5 bg-primary/10 border border-primary/30 text-primary rounded hover:bg-primary/20 transition-colors font-ui-label-sm text-ui-label-sm">
+            <button class="flex items-center gap-1.5 px-3 py-1.5 bg-primary/10 border border-primary/30 text-primary rounded opacity-50 cursor-not-allowed pointer-events-none font-ui-label-sm text-ui-label-sm">
                 <span class="material-symbols-outlined text-[16px]">download</span>
                 Export Report
             </button>
@@ -41,6 +43,7 @@
                             <th class="py-cell-padding-y px-cell-padding-x font-ui-label-sm text-ui-label-sm text-on-surface-variant font-semibold">Operation (Snippet)</th>
                             <th class="py-cell-padding-y px-cell-padding-x font-ui-label-sm text-ui-label-sm text-on-surface-variant font-semibold text-right">Max Time</th>
                             <th class="py-cell-padding-y px-cell-padding-x font-ui-label-sm text-ui-label-sm text-on-surface-variant font-semibold text-right">Avg Time</th>
+                            <th class="py-cell-padding-y px-cell-padding-x font-ui-label-sm text-ui-label-sm text-on-surface-variant font-semibold text-right">Avg Size</th>
                             <th class="py-cell-padding-y px-cell-padding-x font-ui-label-sm text-ui-label-sm text-on-surface-variant font-semibold text-right">Count</th>
                         </tr>
                     </thead>
@@ -61,6 +64,9 @@
                                     <span class="font-display-mono text-display-mono text-tertiary">@slow.AvgTime.ToString("F0")ms</span>
                                 </td>
                                 <td class="py-cell-padding-y px-cell-padding-x text-right">
+                                    <span class="font-display-mono text-display-mono text-on-surface-variant text-[11px]">@(slow.AvgSize < 1024 ? $"{slow.AvgSize:F0} B" : $"{slow.AvgSize / 1024.0:F1} KB")</span>
+                                </td>
+                                <td class="py-cell-padding-y px-cell-padding-x text-right">
                                     <span class="font-display-mono text-display-mono text-on-surface-variant">@slow.Count</span>
                                 </td>
                             </tr>
@@ -70,36 +76,43 @@
             </div>
         </div>
 
-        <!-- Index Suggestions (Span 4) -->
+        <!-- Analyzer Insights (Span 4) -->
         <div class="col-span-12 xl:col-span-4 flex flex-col gap-gutter h-[400px]">
             <div class="flex-1 bg-surface-container border border-outline-variant rounded flex flex-col overflow-hidden">
                 <div class="px-4 py-2 border-b border-outline-variant bg-surface-container-low flex justify-between items-center shrink-0">
                     <h3 class="font-ui-label-sm text-ui-label-sm text-on-surface flex items-center gap-2">
-                        <span class="material-symbols-outlined text-[16px] text-secondary">add_circle</span>
-                        Index Suggestions
+                        <span class="material-symbols-outlined text-[16px] text-secondary">analytics</span>
+                        Analyzer Insights
                     </h3>
-                    <span class="px-1.5 py-0.5 bg-secondary/10 text-secondary rounded text-[10px] font-bold">@(_slowestGroups.Count(g => g.AvgTime > 100)) New</span>
+                    <span class="px-1.5 py-0.5 bg-secondary/10 text-secondary rounded text-[10px] font-bold">@_insights.Count() New</span>
                 </div>
                 <div class="flex-1 overflow-auto p-2 space-y-2">
-                    @if (!_slowestGroups.Any(g => g.AvgTime > 100))
+                    @if (!_insights.Any())
                     {
-                        <div class="text-center text-on-surface-variant text-xs py-8">No high-impact suggestions yet.</div>
+                        <div class="text-center text-on-surface-variant text-xs py-8">No analyzer insights yet.</div>
                     }
                     else
                     {
-                        @foreach (var g in _slowestGroups.Where(g => g.AvgTime > 100).Take(3))
+                        @foreach (var insight in _insights.Take(10))
                         {
                             <div class="bg-surface-container-highest border border-outline-variant/50 rounded p-3 flex flex-col gap-2 relative overflow-hidden group hover:border-secondary/50 transition-colors">
-                                <div class="absolute top-0 right-0 w-1 bg-secondary h-full"></div>
+                                <div class="absolute top-0 right-0 w-1 @(GetInsightColorClass(insight.Level)) h-full"></div>
                                 <div class="flex justify-between items-start">
-                                    <div class="font-code-block text-code-block text-xs font-bold text-on-surface">@g.Namespace</div>
-                                    <div class="flex items-center gap-1 text-[10px] text-tertiary bg-tertiary/10 px-1.5 py-0.5 rounded">
-                                        <span class="material-symbols-outlined text-[12px]">speed</span> High Impact
+                                    <div class="font-ui-label-sm text-ui-label-sm font-bold text-on-surface">@insight.Title</div>
+                                    <div class="flex items-center gap-1 text-[10px] @(GetInsightTextClass(insight.Level)) bg-surface-container-low px-1.5 py-0.5 rounded border border-outline-variant/30">
+                                        <span class="material-symbols-outlined text-[12px]">@(GetInsightIcon(insight.Level))</span> @insight.Level
                                     </div>
                                 </div>
-                                <div class="text-[11px] text-on-surface-variant leading-tight">Frequent slow @g.Command operations detected. Consider indexing filtered fields.</div>
+                                <div class="text-[11px] text-on-surface-variant leading-tight">@insight.Description</div>
+                                @if (!string.IsNullOrEmpty(insight.Details))
+                                {
+                                    <details class="mt-2 text-[10px] text-on-surface-variant bg-surface-container-low p-2 rounded border border-outline-variant/30">
+                                        <summary class="cursor-pointer hover:text-secondary font-bold uppercase tracking-wider">Technical Details</summary>
+                                        <pre class="mt-2 whitespace-pre-wrap font-display-mono overflow-x-auto">@insight.Details</pre>
+                                    </details>
+                                }
                                 <div class="mt-1 flex justify-end">
-                                    <button class="px-3 py-1 bg-secondary/10 hover:bg-secondary/20 text-secondary border border-secondary/30 rounded font-ui-label-sm text-[10px] transition-colors">Build Index</button>
+                                    <button class="px-3 py-1 bg-secondary/10 opacity-50 cursor-not-allowed pointer-events-none text-secondary border border-secondary/30 rounded font-ui-label-sm text-[10px]">Action</button>
                                 </div>
                             </div>
                         }
@@ -134,6 +147,7 @@
 
 @code {
     private int _totalOps => TrafficMonitor.Traffic.Count();
+    private IEnumerable<Insight> _insights => Analyzers.SelectMany(a => a.GetInsights()).Reverse();
 
     private class AggregatedQuery
     {
@@ -142,6 +156,7 @@
         public string Payload { get; set; } = "";
         public double MaxTime { get; set; }
         public double AvgTime { get; set; }
+        public double AvgSize { get; set; }
         public int Count { get; set; }
     }
 
@@ -155,6 +170,7 @@
             Payload = g.First().PayloadJson,
             MaxTime = g.Max(t => t.DurationMs!.Value),
             AvgTime = g.Average(t => t.DurationMs!.Value),
+            AvgSize = g.Average(t => t.SizeBytes),
             Count = g.Count()
         })
         .OrderByDescending(g => g.MaxTime)
@@ -180,4 +196,25 @@
     {
         TrafficMonitor.OnTrafficReceived -= HandleTrafficReceived;
     }
+
+    private string GetInsightColorClass(InsightLevel level) => level switch
+    {
+        InsightLevel.Critical => "bg-error",
+        InsightLevel.Warning => "bg-secondary",
+        _ => "bg-primary"
+    };
+
+    private string GetInsightTextClass(InsightLevel level) => level switch
+    {
+        InsightLevel.Critical => "text-error",
+        InsightLevel.Warning => "text-secondary",
+        _ => "text-primary"
+    };
+
+    private string GetInsightIcon(InsightLevel level) => level switch
+    {
+        InsightLevel.Critical => "error",
+        InsightLevel.Warning => "warning",
+        _ => "info"
+    };
 }

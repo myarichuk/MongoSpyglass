@@ -1,16 +1,36 @@
 using MongoSpyglass.Proxy.Bson;
 using MongoSpyglass.Proxy.WireProtocol;
-using SharpArena.Allocators;
+using MongoSpyglass.Proxy.Memory;
 
 namespace MongoSpyglass.Proxy;
 
-public record ObservedMessage(
-    string Tag,
-    int RequestId,
-    OpCode OpCode,
-    BlittableBsonDocument Document,
-    ArenaAllocator Arena,
-    double? DurationMs = null) : IDisposable
+public readonly struct ObservedMessage
 {
-    public void Dispose() => Memory.ArenaPool.Shared.Return(Arena);
+    public readonly string Tag;
+    public readonly string ConnectionId;
+    public readonly int RequestId;
+    public readonly int ResponseTo;
+    public readonly OpCode OpCode;
+    public readonly BlittableBsonDocument Document;
+    public readonly ArenaTracker Tracker;
+    public readonly double? DurationMs;
+    public readonly int MessageSizeBytes;
+    public readonly int DocumentCount;
+
+    public ObservedMessage(string tag, string connectionId, int requestId, int responseTo, OpCode opCode, BlittableBsonDocument document, ArenaTracker tracker, double? durationMs, int messageSizeBytes, int documentCount = 0)
+    {
+        Tag = tag;
+        ConnectionId = connectionId;
+        RequestId = requestId;
+        ResponseTo = responseTo;
+        OpCode = opCode;
+        Document = document;
+        Tracker = tracker;
+        DurationMs = durationMs;
+        MessageSizeBytes = messageSizeBytes;
+        DocumentCount = documentCount;
+    }
+    
+    public void AddRef() => Tracker.AddRef();
+    public void Release() => Tracker.Release();
 }
