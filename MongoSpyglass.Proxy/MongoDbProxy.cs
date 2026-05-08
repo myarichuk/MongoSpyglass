@@ -287,6 +287,13 @@ public class MongoDbProxy : IHostedService
                     {
                         collection = msg.Document.GetString(dbOff);
                     }
+                    else if (msg.Document.ContainsKey(cmdName))
+                    {
+                         // Many commands (find, insert, etc.) have the collection name as the value of the first element
+                         try {
+                            collection = msg.Document.GetString(cmdName.AsSpan());
+                         } catch { /* not a string, e.g. hello */ }
+                    }
                 }
                 break;
         }
