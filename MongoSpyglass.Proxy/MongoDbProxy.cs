@@ -10,11 +10,8 @@ using MongoSpyglass.Proxy.WireProtocol;
 using MongoSpyglass.Proxy.WireProtocol.Raw;
 using SharpArena.Allocators;
 using SharpArena.Collections;
-using MongoDB.Bson;
-using MongoDB.Bson.Serialization;
 using MongoSpyglass.Proxy.Profiling;
 using System.Buffers.Binary;
-using System.Threading.Channels;
 using System.IO.Pipelines;
 using System.Buffers;
 using MongoSpyglass.Proxy.Bson;
@@ -30,7 +27,6 @@ public class MongoDbProxy : IHostedService
     private readonly int _port;
     private readonly ILogger<MongoDbProxy> _logger;
     private readonly IEnumerable<ITrafficListener> _listeners;
-    private readonly Channel<ObservedMessage> _observedChannel;
     private TcpListener? _listener;
 
     public MongoDbProxy(IPEndPoint mongoDbServer, int incomingPort, ILogger<MongoDbProxy> logger, IEnumerable<ITrafficListener> listeners)
@@ -39,14 +35,6 @@ public class MongoDbProxy : IHostedService
         _port = incomingPort;
         _logger = logger;
         _listeners = listeners;
-
-        var channelOptions = new BoundedChannelOptions(1024)
-        {
-            FullMode = BoundedChannelFullMode.DropOldest,
-            SingleReader = true,
-            AllowSynchronousContinuations = false
-        };
-        _observedChannel = Channel.CreateBounded<ObservedMessage>(channelOptions);
 
         _retryPolicy = Policy
             .Handle<SocketException>()
@@ -65,7 +53,6 @@ public class MongoDbProxy : IHostedService
         _logger.LogInformation($"Started listening on incoming port {_port}");
 
         _ = Task.Run(AcceptConnectionsAsync, _cts.Token);
-        _ = Task.Run(ConsumeObservedMessagesAsync, _cts.Token);
 
         return Task.CompletedTask;
     }
@@ -96,13 +83,15 @@ public class MongoDbProxy : IHostedService
     private async Task ProxyConnection(TcpClient client)
     {
         using var clientScope = client;
-        _logger.LogDebug($"Accepted connection from {client.Client.RemoteEndPoint}");
+        var connectionId = Guid.NewGuid().ToString("N");
+        _logger.LogDebug($"Accepted connection {connectionId} from {client.Client.RemoteEndPoint}");
 
         using var server = new TcpClient();
         await server.ConnectAsync(_mongoDbServer.Address, _mongoDbServer.Port);
         _logger.LogDebug($"Connected to MongoDB server {_mongoDbServer}");
 
         using var correlationBuffer = new CorrelationRingBuffer();
+        using var connectionCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
 
         var clientStream = client.GetStream();
         var serverStream = server.GetStream();
@@ -112,10 +101,27 @@ public class MongoDbProxy : IHostedService
         var serverReader = PipeReader.Create(serverStream);
         var serverWriter = PipeWriter.Create(serverStream);
 
-        var t1 = ProcessPipeAsync(clientReader, serverWriter, "to", correlationBuffer);
-        var t2 = ProcessPipeAsync(serverReader, clientWriter, "from", correlationBuffer);
+        var t1 = ProcessPipeAsync(clientReader, serverWriter, "to", connectionId, correlationBuffer, connectionCts.Token);
+        var t2 = ProcessPipeAsync(serverReader, clientWriter, "from", connectionId, correlationBuffer, connectionCts.Token);
 
-        await Task.WhenAll(t1, t2);
+        await Task.WhenAny(t1, t2);
+        connectionCts.Cancel();
+        try
+        {
+            await Task.WhenAll(t1, t2);
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception e)
+        {
+            _logger.LogTrace(e, "Error waiting for proxy pipelines to complete");
+        }
+        finally
+        {
+            foreach (var listener in _listeners)
+            {
+                listener.OnConnectionClosed(connectionId);
+            }
+        }
     }
 
     public Task StopAsync(CancellationToken cancellationToken)
@@ -125,13 +131,13 @@ public class MongoDbProxy : IHostedService
         return Task.CompletedTask;
     }
 
-    private async Task ProcessPipeAsync(PipeReader reader, PipeWriter writer, string tag, CorrelationRingBuffer correlationBuffer)
+    private async Task ProcessPipeAsync(PipeReader reader, PipeWriter writer, string tag, string connectionId, CorrelationRingBuffer correlationBuffer, CancellationToken ct)
     {
         try
         {
-            while (!_cts.IsCancellationRequested)
+            while (!ct.IsCancellationRequested)
             {
-                ReadResult result = await reader.ReadAsync(_cts.Token);
+                ReadResult result = await reader.ReadAsync(ct);
                 ReadOnlySequence<byte> buffer = result.Buffer;
 
                 while (TryReadMessage(ref buffer, out var message))
@@ -139,18 +145,26 @@ public class MongoDbProxy : IHostedService
                     // 1. Immediate Forward
                     foreach (var segment in message)
                     {
-                        await writer.WriteAsync(segment, _cts.Token);
+                        await writer.WriteAsync(segment, ct);
                     }
-                    await writer.FlushAsync(_cts.Token);
+                    await writer.FlushAsync(ct);
 
                     // 2. Async Observability
-                    ObserveMessage(tag, message, correlationBuffer);
+                    ObserveMessage(tag, connectionId, message, correlationBuffer);
                 }
 
                 reader.AdvanceTo(buffer.Start, buffer.End);
 
                 if (result.IsCompleted) break;
             }
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogTrace($"Pipeline {tag} cancelled");
+        }
+        catch (IOException e) when (e.InnerException is SocketException { SocketErrorCode: SocketError.OperationAborted } or SocketException { SocketErrorCode: SocketError.ConnectionReset })
+        {
+            _logger.LogTrace($"Pipeline {tag} closed: {e.Message}");
         }
         catch (Exception e)
         {
@@ -186,9 +200,10 @@ public class MongoDbProxy : IHostedService
         return true;
     }
 
-    private unsafe void ObserveMessage(string tag, ReadOnlySequence<byte> message, CorrelationRingBuffer correlationBuffer)
+    private unsafe void ObserveMessage(string tag, string connectionId, ReadOnlySequence<byte> message, CorrelationRingBuffer correlationBuffer)
     {
-        var arena = ArenaPool.Shared.Rent();
+        var tracker = ArenaPool.Shared.Rent();
+        var arena = tracker.Arena;
         try
         {
             var bytes = (byte*)arena.Alloc((nuint)message.Length);
@@ -203,104 +218,82 @@ public class MongoDbProxy : IHostedService
             var bodyPtr = bytes + headerSize;
             int bodyLength = (int)message.Length - headerSize;
 
+            int docCount = 0;
             double? durationMs = null;
-            if (opCode == OpCode.OP_MSG || opCode == OpCode.OP_QUERY)
-            {
-                correlationBuffer.RecordRequest(requestId, new OperationMetrics { TimestampStart = System.Diagnostics.Stopwatch.GetTimestamp(), OpCode = opCode, RequestId = requestId });
-            }
-            else if (responseTo != 0 && correlationBuffer.TryGetRequest(responseTo, out var reqMetrics))
+            if (tag == "from" && responseTo != 0 && correlationBuffer.TryGetRequest(responseTo, out var reqMetrics))
             {
                 durationMs = (double)(System.Diagnostics.Stopwatch.GetTimestamp() - reqMetrics.TimestampStart) / System.Diagnostics.Stopwatch.Frequency * 1000;
             }
 
-            // Simple scan for profiling
-            var doc = Bson.ArenaBsonReader.ReadInPlace(bodyPtr, bodyLength, arena);
-            var observed = new ObservedMessage(tag, requestId, opCode, doc, arena, durationMs);
-
-            if (!_observedChannel.Writer.TryWrite(observed))
+            if (tag == "to")
             {
-                observed.Dispose(); // Drop if full
+                correlationBuffer.RecordRequest(requestId, new OperationMetrics { TimestampStart = System.Diagnostics.Stopwatch.GetTimestamp(), OpCode = opCode, RequestId = requestId });
             }
+
+            // Adjust bodyPtr for BSON document extraction based on OpCode
+            if (opCode == OpCode.OP_MSG)
+            {
+                // OP_MSG: flagBits (4) + kind (1) + document
+                bodyPtr += 5;
+                bodyLength -= 5;
+            }
+            else if (opCode == OpCode.OP_QUERY)
+            {
+                // OP_QUERY: flags (4) + fullCollectionName (CString) + numberToSkip (4) + numberToReturn (4) + query (BSON)
+                byte* p = bodyPtr + 4; // skip flags
+                while (*p != 0) p++; // skip CString
+                p++; // skip null terminator
+                p += 8; // skip skip/return
+                bodyLength -= (int)(p - bodyPtr);
+                bodyPtr = p;
+            }
+            else if (opCode == OpCode.OP_REPLY)
+            {
+                // OP_REPLY: flags (4) + cursorId (8) + startingFrom (4) + numberReturned (4)
+                if (bodyLength >= 20)
+                {
+                    docCount = BinaryPrimitives.ReadInt32LittleEndian(new ReadOnlySpan<byte>(bodyPtr + 16, 4));
+                    bodyPtr += 20;
+                    bodyLength -= 20;
+                }
+            }
+
+            var doc = bodyLength >= 5 ? Bson.ArenaBsonReader.ReadInPlace(bodyPtr, bodyLength, arena) : default;
+            
+            if (opCode == OpCode.OP_MSG && !doc.IsDefault)
+            {
+                // Extract doc count from cursor batches
+                if (doc.TryGetElementOffset("cursor", out var cursorOff))
+                {
+                    var cursorDoc = doc.GetDocument(cursorOff, arena);
+                    if (cursorDoc.TryGetElementOffset("firstBatch", out var fbOff))
+                    {
+                        docCount = cursorDoc.GetArray(fbOff, arena).Count;
+                    }
+                    else if (cursorDoc.TryGetElementOffset("nextBatch", out var nbOff))
+                    {
+                        docCount = cursorDoc.GetArray(nbOff, arena).Count;
+                    }
+                }
+            }
+
+            var observed = new ObservedMessage(tag, connectionId, requestId, responseTo, opCode, doc, tracker, durationMs, (int)message.Length, docCount);
+
+            foreach (var listener in _listeners)
+            {
+                observed.AddRef();
+                listener.OnMessage(in observed);
+            }
+            
+            observed.Release(); // Release the initial reference from Rent()
         }
         catch (Exception e)
         {
-            _logger.LogError(e, "Error observing message");
-            ArenaPool.Shared.Return(arena);
-        }
-    }
-
-    private async Task ConsumeObservedMessagesAsync()
-    {
-        try
-        {
-            await foreach (var msg in _observedChannel.Reader.ReadAllAsync(_cts.Token))
+            if (_logger.IsEnabled(LogLevel.Trace))
             {
-                using (msg)
-                {
-                    try
-                    {
-                        ProcessObservedMessage(msg);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(ex, "Error processing observed message");
-                    }
-                }
+                _logger.LogTrace(e, "Error observing message");
             }
-        }
-        catch (OperationCanceledException) { }
-    }
-
-    private void ProcessObservedMessage(ObservedMessage msg)
-    {
-        string cmdName = "unknown";
-        string collection = "N/A";
-        string payload = "{}";
-
-        switch (msg.OpCode)
-        {
-            case OpCode.OP_QUERY:
-                if (msg.Document.TryGetElementOffset("query", out var queryOffset))
-                {
-                    // For now just show "BSON" or similar to avoid heavy JSON conversion in this task
-                    payload = "{ \"query\": \"...\" }"; 
-                }
-                if (msg.Document.TryGetElementOffset("collection", out var colOffset))
-                {
-                    collection = msg.Document.GetString(colOffset);
-                }
-                cmdName = "find";
-                break;
-            case OpCode.OP_MSG:
-                // Scan for command name and collection
-                // In OP_MSG, the first element of the first section is usually the command name
-                if (msg.Document.KeysEnumerable.Any())
-                {
-                    var firstKey = msg.Document.KeysEnumerable.First();
-                    cmdName = firstKey.ToString();
-                    
-                    if (msg.Document.TryGetElementOffset("collection", out var collOff))
-                    {
-                        collection = msg.Document.GetString(collOff);
-                    }
-                    else if (msg.Document.TryGetElementOffset("$db", out var dbOff))
-                    {
-                        collection = msg.Document.GetString(dbOff);
-                    }
-                    else if (msg.Document.ContainsKey(cmdName))
-                    {
-                         // Many commands (find, insert, etc.) have the collection name as the value of the first element
-                         try {
-                            collection = msg.Document.GetString(cmdName.AsSpan());
-                         } catch { /* not a string, e.g. hello */ }
-                    }
-                }
-                break;
-        }
-
-        foreach (var listener in _listeners)
-        {
-            listener.OnMessage(msg.Tag, msg.RequestId, msg.OpCode.ToString(), cmdName, collection, payload, msg.DurationMs);
+            tracker.Release();
         }
     }
 }

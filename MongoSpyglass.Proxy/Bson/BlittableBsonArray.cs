@@ -36,7 +36,7 @@ public readonly unsafe struct BlittableBsonArray : IReadOnlyList<BlittableBsonAr
 
             var dataPtr = bsonBytes + nameEnd + 1;
             int dataPos = (int)(dataPtr - bsonBytes);
-            pos = ArenaBsonReader.SkipElement(bsonBytes, dataPos, type);
+            pos = ArenaBsonReader.SkipElement(bsonBytes, dataPos, type, length);
         }
     }
 
@@ -55,7 +55,7 @@ public readonly unsafe struct BlittableBsonArray : IReadOnlyList<BlittableBsonAr
 
             var dataPtr = _bsonBytes + nameEnd + 1;
             int dataPos = (int)(dataPtr - _bsonBytes);
-            int endPos = ArenaBsonReader.SkipElement(_bsonBytes, dataPos, type);
+            int endPos = ArenaBsonReader.SkipElement(_bsonBytes, dataPos, type, _length);
 
             return new Element(dataPtr, type, endPos - dataPos, _arena);
         }

@@ -1,7 +1,10 @@
 @page "/operations"
 @using MongoSpyglass.Service.Data
+@using MongoSpyglass.Service.Analyzers
 @namespace MongoSpyglass.Service.Pages
 @inject TrafficMonitorService TrafficMonitor
+@inject CursorAnalyzer CursorTracker
+@inject DialogService DialogService
 @implements IDisposable
 
 <div class="flex-1 flex flex-col bg-surface overflow-hidden relative">
@@ -9,12 +12,22 @@
     <div class="flex items-center px-container-padding py-2 bg-surface-container-lowest border-b border-outline-variant gap-8 shrink-0">
         <div class="flex flex-col">
             <span class="font-ui-label-sm text-ui-label-sm text-on-surface-variant uppercase">Throughput</span>
-            <span class="font-display-mono text-[16px] text-on-surface font-medium mt-0.5">@_opsCount <span class="text-[12px] text-on-surface-variant">ops total</span></span>
+            <span class="font-display-mono text-[16px] text-on-surface font-medium mt-0.5">@TrafficMonitor.ThroughputOpsPerSec <span class="text-[12px] text-on-surface-variant">ops/sec</span></span>
         </div>
         <div class="w-px h-8 bg-outline-variant/50"></div>
         <div class="flex flex-col">
             <span class="font-ui-label-sm text-ui-label-sm text-on-surface-variant uppercase">Avg Read Latency</span>
             <span class="font-display-mono text-[16px] text-secondary font-medium mt-0.5">@(_avgLatency?.ToString("F1") ?? "N/A") <span class="text-[12px] text-on-surface-variant">ms</span></span>
+        </div>
+        <div class="w-px h-8 bg-outline-variant/50"></div>
+        <div class="flex flex-col">
+            <span class="font-ui-label-sm text-ui-label-sm text-on-surface-variant uppercase">Active Cursors</span>
+            <span class="font-display-mono text-[16px] text-tertiary font-medium mt-0.5">@CursorTracker.ActiveCursorsCount</span>
+        </div>
+        <div class="flex-1"></div>
+        <div class="flex items-center gap-2">
+            <RadzenCheckBox @bind-Value=@TrafficMonitor.ShowHello Name="ShowHello" TValue="bool" />
+            <RadzenLabel Text="Show Hello/isMaster" Component="ShowHello" Style="font-size: 12px; color: var(--on-surface-variant);" />
         </div>
     </div>
 
@@ -23,9 +36,11 @@
         <table class="w-full text-left border-collapse table-fixed">
             <colgroup>
                 <col class="w-[120px]"/> <!-- Timestamp -->
-                <col class="w-[100px]"/> <!-- Op -->
+                <col class="w-[120px]"/> <!-- Op -->
                 <col class="w-[160px]"/> <!-- Collection -->
                 <col class="w-[100px]"/> <!-- Duration -->
+                <col class="w-[80px]"/>  <!-- Size -->
+                <col class="w-[60px]"/>  <!-- Docs -->
                 <col class="w-auto"/> <!-- Query Details -->
             </colgroup>
             <thead class="sticky top-0 bg-surface-container z-10 shadow-[0_1px_0_0_rgba(135,146,154,0.5)]">
@@ -34,20 +49,32 @@
                     <th class="py-cell-padding-y px-cell-padding-x font-ui-label-sm text-ui-label-sm text-on-surface-variant uppercase whitespace-nowrap border-b border-outline-variant">Op</th>
                     <th class="py-cell-padding-y px-cell-padding-x font-ui-label-sm text-ui-label-sm text-on-surface-variant uppercase whitespace-nowrap border-b border-outline-variant">Namespace</th>
                     <th class="py-cell-padding-y px-cell-padding-x font-ui-label-sm text-ui-label-sm text-on-surface-variant uppercase text-right whitespace-nowrap border-b border-outline-variant">Duration</th>
+                    <th class="py-cell-padding-y px-cell-padding-x font-ui-label-sm text-ui-label-sm text-on-surface-variant uppercase text-right whitespace-nowrap border-b border-outline-variant">Size</th>
+                    <th class="py-cell-padding-y px-cell-padding-x font-ui-label-sm text-ui-label-sm text-on-surface-variant uppercase text-right whitespace-nowrap border-b border-outline-variant">Docs</th>
                     <th class="py-cell-padding-y px-cell-padding-x font-ui-label-sm text-ui-label-sm text-on-surface-variant uppercase whitespace-nowrap border-b border-outline-variant">Payload</th>
                 </tr>
             </thead>
             <tbody class="divide-y divide-outline-variant/30 font-code-block text-code-block bg-surface-dim/30">
                 @foreach (var entry in TrafficMonitor.Traffic)
                 {
-                    <tr class="hover:bg-surface-container-high transition-colors group cursor-pointer">
+                    <tr class="hover:bg-surface-container-high transition-colors group cursor-pointer" @onclick="@(() => ShowDetails(entry))">
                         <td class="py-cell-padding-y px-cell-padding-x text-on-surface-variant text-[12px] align-top">@entry.Timestamp.ToString("HH:mm:ss.fff")</td>
-                        <td class="py-cell-padding-y px-cell-padding-x align-top">
-                            <span class="px-1.5 py-0.5 rounded-sm bg-surface-container-highest border border-outline-variant/50 text-secondary-fixed text-[11px]">@entry.Command</span>
+                        <td class="py-cell-padding-y px-cell-padding-x align-top flex flex-col gap-1">
+                            <span class="px-1.5 py-0.5 rounded-sm bg-surface-container-highest border border-outline-variant/50 text-secondary-fixed text-[11px] w-fit">@entry.Command</span>
+                            @if (entry.Command == "getMore" || entry.PayloadJson.Contains("\"cursor\"") || entry.PayloadJson.Contains("\"cursorId\""))
+                            {
+                                <span class="px-1 py-0.5 rounded-sm bg-tertiary/10 text-tertiary text-[9px] font-bold border border-tertiary/20 w-fit">CURSOR</span>
+                            }
                         </td>
                         <td class="py-cell-padding-y px-cell-padding-x text-tertiary-fixed-dim text-[12px] truncate align-top">@entry.Collection</td>
                         <td class="py-cell-padding-y px-cell-padding-x text-right font-medium align-top @(entry.DurationMs > 100 ? "text-error" : "text-on-surface-variant")">
                             @(entry.DurationMs.HasValue ? $"{entry.DurationMs:F1}ms" : "-")
+                        </td>
+                        <td class="py-cell-padding-y px-cell-padding-x text-right text-on-surface-variant text-[11px] align-top">
+                            @(entry.SizeBytes < 1024 ? $"{entry.SizeBytes} B" : $"{entry.SizeBytes / 1024.0:F1} KB")
+                        </td>
+                        <td class="py-cell-padding-y px-cell-padding-x text-right text-on-surface-variant text-[11px] align-top">
+                            @(entry.DocumentCount > 0 ? entry.DocumentCount.ToString() : "-")
                         </td>
                         <td class="py-cell-padding-y px-cell-padding-x text-on-surface-variant text-[12px] align-top truncate max-w-0 pr-4">
                             @entry.PayloadJson
@@ -82,6 +109,13 @@
     private async void HandleTrafficReceived()
     {
         await InvokeAsync(StateHasChanged);
+    }
+
+    private async Task ShowDetails(DecryptedTraffic entry)
+    {
+        await DialogService.OpenAsync<OperationDetail>("Operation Details", 
+            new Dictionary<string, object> { { "Entry", entry } },
+            new DialogOptions { Width = "900px", Height = "700px", Resizable = true, Draggable = true });
     }
 
     public void Dispose()

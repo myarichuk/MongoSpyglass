@@ -1,0 +1,74 @@
+@page "/sessions"
+@using MongoSpyglass.Service.Data
+@inject RavenStorageService RavenService
+@inject NotificationService NotificationService
+
+<RadzenContent Container="main">
+    <ChildContent>
+        <RadzenText Text="Session Management" TextStyle="TextStyle.H4" />
+        
+        <RadzenCard class="rz-my-4">
+            <RadzenStack Orientation="Orientation.Horizontal" AlignItems="AlignItems.Center" Gap="1rem">
+                <RadzenTextBox Placeholder="Session Name..." @bind-Value="@_newSessionName" Style="width: 300px;" />
+                <RadzenButton Text="Start New Session" Icon="add_circle" Click="@StartSession" ButtonStyle="ButtonStyle.Primary" />
+            </RadzenStack>
+        </RadzenCard>
+
+        <RadzenDataGrid Data="@_sessions" TItem="MongoSession" AllowPaging="true" PageSize="10" AllowSorting="true" class="rz-shadow-2">
+            <Columns>
+                <RadzenDataGridColumn TItem="MongoSession" Property="Name" Title="Name" />
+                <RadzenDataGridColumn TItem="MongoSession" Property="StartTime" Title="Started" FormatString="{0:g}" />
+                <RadzenDataGridColumn TItem="MongoSession" Property="IsActive" Title="Status">
+                    <Template Context="session">
+                        @if (session.IsActive)
+                        {
+                            <RadzenBadge BadgeStyle="BadgeStyle.Success" Text="Active" />
+                        }
+                        else
+                        {
+                            <RadzenBadge BadgeStyle="BadgeStyle.Info" Text="Archived" />
+                        }
+                    </Template>
+                </RadzenDataGridColumn>
+                <RadzenDataGridColumn TItem="MongoSession" Width="200px" TextAlign="TextAlign.Center">
+                    <Template Context="session">
+                        <RadzenButton Icon="delete" ButtonStyle="ButtonStyle.Danger" Size="ButtonSize.Small" Click="@(() => DeleteSession(session.Id))" />
+                    </Template>
+                </RadzenDataGridColumn>
+            </Columns>
+        </RadzenDataGrid>
+    </ChildContent>
+</RadzenContent>
+
+@code {
+    private List<MongoSession> _sessions = new();
+    private string _newSessionName = $"Session {DateTime.Now:yyyy-MM-dd HH:mm}";
+
+    protected override async Task OnInitializedAsync()
+    {
+        await LoadSessions();
+    }
+
+    private async Task LoadSessions()
+    {
+        _sessions = await RavenService.GetSessionsAsync();
+    }
+
+    private async Task StartSession()
+    {
+        if (string.IsNullOrWhiteSpace(_newSessionName)) return;
+
+        await RavenService.StartNewSessionAsync(_newSessionName);
+        _newSessionName = $"Session {DateTime.Now:yyyy-MM-dd HH:mm}";
+        await LoadSessions();
+        
+        NotificationService.Notify(new NotificationMessage { Severity = NotificationSeverity.Success, Summary = "Session Started", Detail = "New session is now active." });
+    }
+
+    private async Task DeleteSession(string id)
+    {
+        await RavenService.DeleteSessionAsync(id);
+        await LoadSessions();
+        NotificationService.Notify(new NotificationMessage { Severity = NotificationSeverity.Info, Summary = "Session Deleted" });
+    }
+}

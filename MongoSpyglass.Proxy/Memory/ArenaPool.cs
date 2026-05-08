@@ -1,22 +1,26 @@
-using SharpArena.Allocators;
 using System.Collections.Concurrent;
 
 namespace MongoSpyglass.Proxy.Memory;
 
 public class ArenaPool
 {
-    private readonly ConcurrentStack<ArenaAllocator> _pool = new();
+    private readonly ConcurrentStack<ArenaTracker> _pool = new();
     public static ArenaPool Shared { get; } = new();
 
-    public ArenaAllocator Rent()
+    public ArenaTracker Rent()
     {
-        if (_pool.TryPop(out var arena)) return arena;
-        return new ArenaAllocator();
+        if (_pool.TryPop(out var tracker)) 
+        {
+            tracker.AddRef(); // Initial ref for the creator
+            return tracker;
+        }
+        var newTracker = new ArenaTracker();
+        newTracker.AddRef();
+        return newTracker;
     }
 
-    public void Return(ArenaAllocator arena)
+    public void Return(ArenaTracker tracker)
     {
-        arena.Reset();
-        _pool.Push(arena);
+        _pool.Push(tracker);
     }
 }
