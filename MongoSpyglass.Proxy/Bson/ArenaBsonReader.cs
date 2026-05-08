@@ -4,7 +4,7 @@ using SharpArena.Collections;
 
 namespace MongoSpyglass.Proxy.Bson;
 
-public static class ArenaBsonReader
+public static unsafe class ArenaBsonReader
 {
     public static BlittableBsonDocument Read(byte[] bytes, ArenaAllocator arena) => 
         Read(new ReadOnlySpan<byte>(bytes), arena);

@@ -9,26 +9,19 @@ using Polly;
 using MongoSpyglass.Proxy.WireProtocol;
 using MongoSpyglass.Proxy.WireProtocol.Raw;
 using SharpArena.Allocators;
+using SharpArena.Collections;
 using MongoSpyglass.Proxy.WireProtocol.Raw.Loaders;
 using MongoDB.Bson;
 using MongoDB.Bson.Serialization;
 using MongoSpyglass.Proxy.Profiling;
 using System.Buffers.Binary;
 using System.Threading.Channels;
+using System.IO.Pipelines;
+using System.Buffers;
+using MongoSpyglass.Proxy.Bson;
+using MongoSpyglass.Proxy.Memory;
 
 namespace MongoSpyglass.Proxy;
-
-/// <summary>
-/// Event published to the internal bounded channel.
-/// </summary>
-public record TrafficEvent(
-    string Tag,
-    int RequestId,
-    string OpCode,
-    string Command,
-    string Collection,
-    string PayloadJson,
-    double? DurationMs = null);
 
 public class MongoDbProxy : IHostedService
 {
@@ -38,7 +31,7 @@ public class MongoDbProxy : IHostedService
     private readonly int _port;
     private readonly ILogger<MongoDbProxy> _logger;
     private readonly IEnumerable<ITrafficListener> _listeners;
-    private readonly Channel<TrafficEvent> _eventChannel;
+    private readonly Channel<ObservedMessage> _observedChannel;
     private TcpListener? _listener;
 
     public MongoDbProxy(IPEndPoint mongoDbServer, int incomingPort, ILogger<MongoDbProxy> logger, IEnumerable<ITrafficListener> listeners)
@@ -54,7 +47,7 @@ public class MongoDbProxy : IHostedService
             SingleReader = true,
             AllowSynchronousContinuations = false
         };
-        _eventChannel = Channel.CreateBounded<TrafficEvent>(channelOptions);
+        _observedChannel = Channel.CreateBounded<ObservedMessage>(channelOptions);
 
         _retryPolicy = Policy
             .Handle<SocketException>()
@@ -73,7 +66,7 @@ public class MongoDbProxy : IHostedService
         _logger.LogInformation($"Started listening on incoming port {_port}");
 
         _ = Task.Run(AcceptConnectionsAsync, _cts.Token);
-        _ = Task.Run(ConsumeTrafficEventsAsync, _cts.Token);
+        _ = Task.Run(ConsumeObservedMessagesAsync, _cts.Token);
 
         return Task.CompletedTask;
     }
@@ -112,43 +105,16 @@ public class MongoDbProxy : IHostedService
 
         using var correlationBuffer = new CorrelationRingBuffer();
 
-        var t1 = Task.Run(async () =>
-        {
-            using var allocator = new ArenaAllocator();
-            while(!_cts.IsCancellationRequested)
-            {
-                try
-                {
-                    allocator.Reset();
-                    if (!await ForwardTrafficAsync(client, server, "to", allocator, correlationBuffer))
-                        break;
-                }
-                catch (Exception e)
-                {
-                    _logger.LogError(e, $"Error forwarding traffic to server");
-                    throw;
-                }
-            }
-        }, _cts.Token);
+        var clientStream = client.GetStream();
+        var serverStream = server.GetStream();
 
-        var t2 = Task.Run(async () =>
-        {
-            using var allocator = new ArenaAllocator();
-            while(!_cts.IsCancellationRequested)
-            {
-                try
-                {
-                    allocator.Reset();
-                    if (!await ForwardTrafficAsync(server, client, "from", allocator, correlationBuffer))
-                        break;
-                }
-                catch (Exception e)
-                {
-                    _logger.LogError(e, $"Error forwarding traffic from server");
-                    throw;
-                }
-            }
-        }, _cts.Token);
+        var clientReader = PipeReader.Create(clientStream);
+        var clientWriter = PipeWriter.Create(clientStream);
+        var serverReader = PipeReader.Create(serverStream);
+        var serverWriter = PipeWriter.Create(serverStream);
+
+        var t1 = ProcessPipeAsync(clientReader, serverWriter, "to", correlationBuffer);
+        var t2 = ProcessPipeAsync(serverReader, clientWriter, "from", correlationBuffer);
 
         await Task.WhenAll(t1, t2);
     }
@@ -160,286 +126,175 @@ public class MongoDbProxy : IHostedService
         return Task.CompletedTask;
     }
 
-    private async Task<bool> ForwardTrafficAsync(TcpClient source, TcpClient destination, string tag, ArenaAllocator memoryAllocator, CorrelationRingBuffer correlationBuffer)
-    {        
-        var sourceStream = source.GetStream();
-        var destStream = destination.GetStream();
-
+    private async Task ProcessPipeAsync(PipeReader reader, PipeWriter writer, string tag, CorrelationRingBuffer correlationBuffer)
+    {
         try
         {
-            var headerSize = Unsafe.SizeOf<MsgHeader>();
-            var headerBuffer = System.Buffers.ArrayPool<byte>.Shared.Rent(headerSize);
-
-            try
+            while (!_cts.IsCancellationRequested)
             {
-                try
-                {
-                    await sourceStream.ReadExactlyAsync(headerBuffer.AsMemory(0, headerSize), _cts.Token).ConfigureAwait(false);
-                }
-                catch (EndOfStreamException) { return false; }
-                catch (OperationCanceledException) { return false; }
+                ReadResult result = await reader.ReadAsync(_cts.Token);
+                ReadOnlySequence<byte> buffer = result.Buffer;
 
-                int msgLength, msgRequestId, msgResponseTo;
-                OpCode msgOpCode;
-                unsafe
+                while (TryReadMessage(ref buffer, out var message))
                 {
-                    fixed (byte* pHeaderBuffer = headerBuffer)
+                    // 1. Immediate Forward
+                    foreach (var segment in message)
                     {
-                        var pHeader = (MsgHeader*)pHeaderBuffer;
-                        msgLength = pHeader->MessageLength;
-                        msgRequestId = pHeader->RequestID;
-                        msgResponseTo = pHeader->ResponseTo;
-                        msgOpCode = pHeader->OpCode;
+                        await writer.WriteAsync(segment, _cts.Token);
                     }
+                    await writer.FlushAsync(_cts.Token);
+
+                    // 2. Async Observability
+                    ObserveMessage(tag, message, correlationBuffer);
                 }
 
-                if (msgLength < headerSize)
-                {
-                    throw new InvalidOperationException($"Invalid message length '{msgLength}' for opcode '{msgOpCode}'.");
-                }
+                reader.AdvanceTo(buffer.Start, buffer.End);
 
-                int bodyLength = msgLength - headerSize;
-                var bodyBuffer = System.Buffers.ArrayPool<byte>.Shared.Rent(bodyLength);
-
-                try
-                {
-                    try
-                    {
-                        await sourceStream.ReadExactlyAsync(bodyBuffer.AsMemory(0, bodyLength), _cts.Token).ConfigureAwait(false);
-                    }
-                    catch (EndOfStreamException) { return false; }
-                    catch (OperationCanceledException) { return false; }
-
-                    byte[]? destBuffer = null;
-                    int stuffToWriteLength = 0;
-
-                    unsafe
-                    {
-                        var buffer = memoryAllocator.Allocate<byte>(bodyLength);
-                        bodyBuffer.AsSpan(0, bodyLength).CopyTo(buffer);
-
-                        fixed (byte* pBuffer = &MemoryMarshal.GetReference<byte>(buffer))
-                        {
-                            using var memoryStream = new UnmanagedMemoryStream(pBuffer, buffer.Length);
-                            switch (msgOpCode)
-                            {
-                                case OpCode.OP_QUERY:
-                                    correlationBuffer.RecordRequest(msgRequestId, new OperationMetrics { TimestampStart = System.Diagnostics.Stopwatch.GetTimestamp(), OpCode = msgOpCode, RequestId = msgRequestId });
-                                    var opQuery = OpQueryLoader.Instance.Load(memoryStream, memoryAllocator);
-                                    var typedOpQuery = MongoSpyglass.Proxy.WireProtocol.Typed.OpQuery.FromRaw(opQuery);
-                                    LogOpQuery(tag, msgRequestId, typedOpQuery);
-                                    break;
-                                case OpCode.OP_MSG:
-                                    correlationBuffer.RecordRequest(msgRequestId, new OperationMetrics { TimestampStart = System.Diagnostics.Stopwatch.GetTimestamp(), OpCode = msgOpCode, RequestId = msgRequestId });
-                                    var opMsg = OpMsgLoader.Instance.Load(memoryStream, memoryAllocator);
-                                    
-                                    double? msgDuration = null;
-                                    if (msgResponseTo != 0 && correlationBuffer.TryGetRequest(msgResponseTo, out var reqMetrics))
-                                    {
-                                        msgDuration = (double)(System.Diagnostics.Stopwatch.GetTimestamp() - reqMetrics.TimestampStart) / System.Diagnostics.Stopwatch.Frequency * 1000;
-                                    }
-                                    
-                                    LogOpMsg(tag, msgRequestId, opMsg, memoryAllocator, msgDuration);
-                                    break;
-                                case OpCode.OP_REPLY:
-                                    var opReply = OpReplyLoader.Instance.Load(memoryStream, memoryAllocator);
-                                    double? replyDuration = null;
-                                    if (correlationBuffer.TryGetRequest(msgResponseTo, out var requestMetrics))
-                                    {
-                                        replyDuration = (double)(System.Diagnostics.Stopwatch.GetTimestamp() - requestMetrics.TimestampStart) / System.Diagnostics.Stopwatch.Frequency * 1000;
-                                        _logger.LogInformation($"[{tag}] Correlated OP_REPLY with request {msgResponseTo}. Latency: {replyDuration:F2}ms");
-                                    }
-                                    LogOpReply(tag, msgRequestId, msgResponseTo, opReply, replyDuration);
-                                    break;
-                                default:
-                                    _logger.LogDebug($"Unsupported opCode: {msgOpCode}, forwarding transparently.");
-                                    break;
-                            }
-
-                            var msgHeader = new MsgHeader { MessageLength = msgLength, RequestID = msgRequestId, ResponseTo = msgResponseTo, OpCode = msgOpCode };
-                            var stuffToWrite = BuildWireMessage(memoryAllocator, msgHeader, buffer);
-
-                            destBuffer = System.Buffers.ArrayPool<byte>.Shared.Rent(stuffToWrite.Length);
-                            stuffToWriteLength = stuffToWrite.Length;
-                            stuffToWrite.CopyTo(destBuffer);
-                        }
-                    }
-
-                    try
-                    {
-                        if (destBuffer != null)
-                        {
-                            await destStream.WriteAsync(destBuffer.AsMemory(0, stuffToWriteLength), _cts.Token).ConfigureAwait(false);
-                        }
-                    }
-                    finally
-                    {
-                        if (destBuffer != null)
-                        {
-                            System.Buffers.ArrayPool<byte>.Shared.Return(destBuffer);
-                        }
-                    }
-
-                    return true;
-                }
-                finally
-                {
-                    System.Buffers.ArrayPool<byte>.Shared.Return(bodyBuffer);
-                }
-            }
-            finally
-            {
-                System.Buffers.ArrayPool<byte>.Shared.Return(headerBuffer);
+                if (result.IsCompleted) break;
             }
         }
         catch (Exception e)
         {
-            _logger.LogError(e, $"Error forwarding traffic from {source.Client.RemoteEndPoint} to {destination.Client.RemoteEndPoint}");
-            throw;
+            _logger.LogError(e, $"Error processing pipeline for {tag}");
         }
-    }
-
-    private static unsafe Span<byte> BuildWireMessage(ArenaAllocator allocator, MsgHeader header, Span<byte> body)
-    {
-        int headerSize = Unsafe.SizeOf<MsgHeader>();
-        var frame = allocator.Allocate<byte>(headerSize + body.Length);
-
-        fixed (byte* pFrame = &MemoryMarshal.GetReference<byte>(frame))
+        finally
         {
-            var pHeader = (MsgHeader*)pFrame;
-            *pHeader = header;
+            await reader.CompleteAsync();
+            await writer.CompleteAsync();
+        }
+    }
+
+    private bool TryReadMessage(ref ReadOnlySequence<byte> buffer, out ReadOnlySequence<byte> message)
+    {
+        if (buffer.Length < 4)
+        {
+            message = default;
+            return false;
         }
 
-        body.CopyTo(frame[headerSize..]);
-        return frame;
+        Span<byte> lengthBytes = stackalloc byte[4];
+        buffer.Slice(0, 4).CopyTo(lengthBytes);
+        int length = BinaryPrimitives.ReadInt32LittleEndian(lengthBytes);
+
+        if (buffer.Length < length)
+        {
+            message = default;
+            return false;
+        }
+
+        message = buffer.Slice(0, length);
+        buffer = buffer.Slice(length);
+        return true;
     }
 
-    private void LogOpQuery(string tag, int requestId, WireProtocol.Typed.OpQuery opQuery)
+    private unsafe void ObserveMessage(string tag, ReadOnlySequence<byte> message, CorrelationRingBuffer correlationBuffer)
     {
-        var payload = opQuery.Query.ToJson();
-        _logger.LogInformation(
-            "[{Tag}] OP_QUERY #{RequestId} {Collection} skip={NumberToSkip} return={NumberToReturn} query={Query}",
-            tag,
-            requestId,
-            opQuery.FullCollectionName,
-            opQuery.NumberToSkip,
-            opQuery.NumberToReturn,
-            payload);
+        var arena = ArenaPool.Shared.Rent();
+        try
+        {
+            var bytes = (byte*)arena.Alloc((nuint)message.Length);
+            message.CopyTo(new Span<byte>(bytes, (int)message.Length));
 
-        var evt = new TrafficEvent(tag, requestId, "OP_QUERY", "find", opQuery.FullCollectionName, payload);
-        _eventChannel.Writer.TryWrite(evt);
+            var header = (MsgHeader*)bytes;
+            int requestId = header->RequestID;
+            int responseTo = header->ResponseTo;
+            OpCode opCode = header->OpCode;
+
+            int headerSize = Unsafe.SizeOf<MsgHeader>();
+            var bodyPtr = bytes + headerSize;
+            int bodyLength = (int)message.Length - headerSize;
+
+            double? durationMs = null;
+            if (opCode == OpCode.OP_MSG || opCode == OpCode.OP_QUERY)
+            {
+                correlationBuffer.RecordRequest(requestId, new OperationMetrics { TimestampStart = System.Diagnostics.Stopwatch.GetTimestamp(), OpCode = opCode, RequestId = requestId });
+            }
+            else if (responseTo != 0 && correlationBuffer.TryGetRequest(responseTo, out var reqMetrics))
+            {
+                durationMs = (double)(System.Diagnostics.Stopwatch.GetTimestamp() - reqMetrics.TimestampStart) / System.Diagnostics.Stopwatch.Frequency * 1000;
+            }
+
+            // Simple scan for profiling
+            var doc = Bson.ArenaBsonReader.ReadInPlace(bodyPtr, bodyLength, arena);
+            var observed = new ObservedMessage(tag, requestId, opCode, doc, arena, durationMs);
+
+            if (!_observedChannel.Writer.TryWrite(observed))
+            {
+                observed.Dispose(); // Drop if full
+            }
+        }
+        catch (Exception e)
+        {
+            _logger.LogError(e, "Error observing message");
+            ArenaPool.Shared.Return(arena);
+        }
     }
 
-    private void LogOpMsg(string tag, int requestId, OpMsg opMsg, ArenaAllocator allocator, double? durationMs = null)
+    private async Task ConsumeObservedMessagesAsync()
+    {
+        try
+        {
+            await foreach (var msg in _observedChannel.Reader.ReadAllAsync(_cts.Token))
+            {
+                using (msg)
+                {
+                    try
+                    {
+                        ProcessObservedMessage(msg);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Error processing observed message");
+                    }
+                }
+            }
+        }
+        catch (OperationCanceledException) { }
+    }
+
+    private void ProcessObservedMessage(ObservedMessage msg)
     {
         string cmdName = "unknown";
         string collection = "N/A";
         string payload = "{}";
 
-        var sections = opMsg.Sections.AsSpan();
-        int offset = 0;
-
-        while (offset < sections.Length)
+        switch (msg.OpCode)
         {
-            byte kind = sections[offset++];
-            if (kind == 0)
-            {
-                var bsonData = sections[offset..];
-                var reader = new ArenaBsonReader(bsonData, allocator);
-                
-                // Only take the first section's payload for logging/UI for now
-                if (payload == "{}")
+            case OpCode.OP_QUERY:
+                if (msg.Document.TryGetElementOffset("query", out var queryOffset))
                 {
-                    payload = bsonData.Length > 0 ? new BsonDocument(BsonSerializer.Deserialize<BsonDocument>(bsonData.ToArray())).ToJson() : "{}";
+                    // For now just show "BSON" or similar to avoid heavy JSON conversion in this task
+                    payload = "{ \"query\": \"...\" }"; 
                 }
-
-                if (reader.Elements.Length > 0)
+                if (msg.Document.TryGetElementOffset("collection", out var colOffset))
                 {
-                    var firstElement = reader.Elements[0];
-                    if (cmdName == "unknown")
+                    collection = msg.Document.GetString(colOffset);
+                }
+                cmdName = "find";
+                break;
+            case OpCode.OP_MSG:
+                // Scan for command name and collection
+                // In OP_MSG, the first element of the first section is usually the command name
+                if (msg.Document.KeysEnumerable.Any())
+                {
+                    var firstKey = msg.Document.KeysEnumerable.First();
+                    cmdName = firstKey.ToString();
+                    
+                    if (msg.Document.TryGetElementOffset("collection", out var collOff))
                     {
-                        cmdName = reader.GetElementName(firstElement);
+                        collection = msg.Document.GetString(collOff);
                     }
-
-                    if (collection == "N/A")
+                    else if (msg.Document.TryGetElementOffset("$db", out var dbOff))
                     {
-                        if (firstElement.Type == WireProtocol.BsonType.String)
-                        {
-                            collection = reader.GetStringValue(firstElement);
-                        }
-                        else if (reader.TryFindElement("collection", out var colElement) && colElement.Type == WireProtocol.BsonType.String)
-                        {
-                            collection = reader.GetStringValue(colElement);
-                        }
+                        collection = msg.Document.GetString(dbOff);
                     }
                 }
-                
-                // Advance offset by BSON length
-                offset += BinaryPrimitives.ReadInt32LittleEndian(bsonData.Slice(0, 4));
-            }
-            else if (kind == 1)
-            {
-                int size = BinaryPrimitives.ReadInt32LittleEndian(sections.Slice(offset, 4));
-                offset += size;
-            }
-            else
-            {
-                break; // Unknown kind or corrupted
-            }
+                break;
         }
 
-        _logger.LogInformation(
-            "[{Tag}] OP_MSG #{RequestId} command={Command} collection={Collection} flags={Flags} duration={Duration}ms",
-            tag,
-            requestId,
-            cmdName,
-            collection,
-            opMsg.Flags,
-            durationMs?.ToString("F2") ?? "-");
-
-        var evt = new TrafficEvent(tag, requestId, "OP_MSG", cmdName, collection, payload, durationMs);
-        _eventChannel.Writer.TryWrite(evt);
-    }
-
-    private void LogOpReply(string tag, int requestId, int responseTo, OpReply opReply, double? durationMs = null)
-    {
-        _logger.LogInformation(
-            "[{Tag}] OP_REPLY #{RequestId} responseTo={ResponseTo} flags={Flags} cursor={CursorId} count={NumberReturned} duration={Duration}ms",
-            tag,
-            requestId,
-            responseTo,
-            opReply.ResponseFlags,
-            opReply.CursorID,
-            opReply.NumberReturned,
-            durationMs?.ToString("F2") ?? "-");
-
-        var payload = $"{{ \"cursorId\": {opReply.CursorID}, \"count\": {opReply.NumberReturned} }}";
-        var evt = new TrafficEvent(tag, requestId, "OP_REPLY", "reply", "N/A", payload, durationMs);
-        _eventChannel.Writer.TryWrite(evt);
-    }
-
-    private async Task ConsumeTrafficEventsAsync()
-    {
-        try
+        foreach (var listener in _listeners)
         {
-            await foreach (var evt in _eventChannel.Reader.ReadAllAsync(_cts.Token))
-            {
-                foreach (var listener in _listeners)
-                {
-                    try
-                    {
-                        listener.OnMessage(evt.Tag, evt.RequestId, evt.OpCode, evt.Command, evt.Collection, evt.PayloadJson, evt.DurationMs);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(ex, "Error dispatching to traffic listener");
-                    }
-                }
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            // normal on shutdown
+            listener.OnMessage(msg.Tag, msg.RequestId, msg.OpCode.ToString(), cmdName, collection, payload, msg.DurationMs);
         }
     }
 }
