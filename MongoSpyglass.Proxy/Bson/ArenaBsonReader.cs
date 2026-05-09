@@ -19,22 +19,34 @@ public static unsafe class ArenaBsonReader
 
     public static BlittableBsonDocument ReadInPlace(byte* pBuffer, int len, ArenaAllocator arena)
     {
-        if (len < 5) return default;
+        if (len < 5)
+        {
+            return default;
+        }
 
         try
         {
+            int docLen = *(int*)pBuffer;
+            if (docLen < 5 || docLen > len)
+            {
+                return default;
+            }
+
             var index = new ArenaDictionary<ArenaUtf8String, int>(arena);
             var keyCache = new ArenaDictionary<ArenaUtf8String, ArenaUtf8String>(arena);
 
             int pos = 4; // length header
-            while (pos < len - 1)
+            while (pos < docLen - 1)
             {
                 var type = (BlittableBsonConstants.BsonType)pBuffer[pos];
                 int nameStart = pos + 1;
                 int nameEnd = nameStart;
-                while (nameEnd < len && pBuffer[nameEnd] != 0) nameEnd++;
+                while (nameEnd < docLen && pBuffer[nameEnd] != 0) nameEnd++;
                 
-                if (nameEnd >= len) return default; // Malformed
+                if (nameEnd >= docLen)
+                {
+                    return default; // Malformed
+                }
 
                 var nameSpan = new ReadOnlySpan<byte>(pBuffer + nameStart, nameEnd - nameStart);
                 var clonedNameSpan = ArenaUtf8String.Clone(nameSpan, arena);
@@ -46,12 +58,15 @@ public static unsafe class ArenaBsonReader
                 }
 
                 index.Add(name, pos); // offset of the element (including type)
-                pos = SkipElement(pBuffer, nameEnd + 1, type, len);
+                pos = SkipElement(pBuffer, nameEnd + 1, type, docLen);
                 
-                if (pos > len || pos < 0) return default; // Out of bounds
+                if (pos > docLen || pos < 0)
+                {
+                    return default; // Out of bounds
+                }
             }
 
-            return new BlittableBsonDocument(pBuffer, len, index);
+            return new BlittableBsonDocument(pBuffer, docLen, index);
         }
         catch
         {
@@ -66,7 +81,10 @@ public static unsafe class ArenaBsonReader
 
     public static int SkipElement(byte* ptr, int dataPos, BlittableBsonConstants.BsonType type, int totalLen)
     {
-        if (dataPos >= totalLen) return -1;
+        if (dataPos >= totalLen)
+        {
+            return -1;
+        }
 
         return type switch
         {

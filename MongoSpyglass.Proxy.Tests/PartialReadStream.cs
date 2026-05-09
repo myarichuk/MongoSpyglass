@@ -25,7 +25,10 @@ namespace MongoSpyglass.Proxy.Tests
 
         public override int Read(byte[] buffer, int offset, int count)
         {
-            if (_position >= _data.Length) return 0;
+            if (_position >= _data.Length)
+            {
+                return 0;
+            }
 
             int toRead = Math.Min(count, _maxReadSize);
             toRead = Math.Min(toRead, _data.Length - _position);
@@ -38,7 +41,10 @@ namespace MongoSpyglass.Proxy.Tests
         // Ensure Span based Read uses the overridden method
         public override int Read(Span<byte> buffer)
         {
-            if (_position >= _data.Length) return 0;
+            if (_position >= _data.Length)
+            {
+                return 0;
+            }
 
             int toRead = Math.Min(buffer.Length, _maxReadSize);
             toRead = Math.Min(toRead, _data.Length - _position);

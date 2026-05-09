@@ -49,7 +49,11 @@ namespace MongoSpyglass.Proxy.Tests
         {
             Span<byte> buffer = stackalloc byte[sizeof(MsgHeader)];
             var readBytes = stream.Read(buffer);
-            if (readBytes != sizeof(MsgHeader)) return false;
+            if (readBytes != sizeof(MsgHeader))
+            {
+                return false;
+            }
+
             fixed (byte* pBuffer = &System.Runtime.InteropServices.MemoryMarshal.GetReference<byte>(buffer))
             {
                 var pHeader = (MsgHeader*)pBuffer;

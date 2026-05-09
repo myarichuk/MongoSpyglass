@@ -14,9 +14,9 @@ public class MongoSession
     public bool IsActive { get; set; } = true;
 }
 
-public class MongoOperation
+public record MongoOperation
 {
-    public string Id { get; set; } = string.Empty;
+    public string? Id { get; set; }
     public string SessionId { get; set; } = string.Empty;
     public int RequestId { get; set; }
     public string Collection { get; set; } = string.Empty;
@@ -24,6 +24,17 @@ public class MongoOperation
     public double? DurationMs { get; set; }
     public int SizeBytes { get; set; }
     public int DocumentCount { get; set; }
+    public DateTime Timestamp { get; set; } = DateTime.Now;
+}
+
+public class MongoInsight
+{
+    public string? Id { get; set; }
+    public string Title { get; set; } = string.Empty;
+    public string Description { get; set; } = string.Empty;
+    public string Level { get; set; } = "Info";
+    public string Category { get; set; } = string.Empty;
+    public string Details { get; set; } = string.Empty;
     public DateTime Timestamp { get; set; } = DateTime.Now;
 }
 
@@ -53,6 +64,20 @@ public class RavenStorageService(ILogger<RavenStorageService> logger) : IDisposa
             }.Initialize();
         }
 
+        // Resume last active session if available
+        using (var session = _store.OpenSession())
+        {
+            var lastSession = session.Query<MongoSession>()
+                .OrderByDescending(x => x.StartTime)
+                .FirstOrDefault();
+
+            if (lastSession != null)
+            {
+                _activeSessionId = lastSession.Id;
+                logger.LogInformation($"Resumed session: {lastSession.Name} ({lastSession.Id})");
+            }
+        }
+
         _bulkWorkerTask = Task.Run(() => ProcessBulkInsertsAsync(_bulkCts.Token));
     }
 
@@ -80,6 +105,29 @@ public class RavenStorageService(ILogger<RavenStorageService> logger) : IDisposa
         return newSession;
     }
 
+    public async Task<List<MongoInsight>> GetInsightsAsync()
+    {
+        if (_store == null) return new();
+        using var session = _store.OpenAsyncSession();
+        return await session.Query<MongoInsight>().OrderByDescending(x => x.Timestamp).ToListAsync();
+    }
+
+    public async Task StoreInsightAsync(MongoInsight insight)
+    {
+        if (_store == null) return;
+        using var session = _store.OpenAsyncSession();
+        await session.StoreAsync(insight);
+        await session.SaveChangesAsync();
+    }
+
+    public async Task DeleteInsightAsync(string? id)
+    {
+        if (_store == null || id == null) return;
+        using var session = _store.OpenAsyncSession();
+        session.Delete(id);
+        await session.SaveChangesAsync();
+    }
+
     public async Task<List<MongoSession>> GetSessionsAsync()
     {
         if (_store == null)
@@ -89,6 +137,36 @@ public class RavenStorageService(ILogger<RavenStorageService> logger) : IDisposa
 
         using var session = _store.OpenAsyncSession();
         return await session.Query<MongoSession>().OrderByDescending(x => x.StartTime).ToListAsync();
+    }
+
+    public async Task<List<(MongoOperation Op, byte[]? Bson)>> GetLatestOperationsAsync(string sessionId, int limit = 1000)
+    {
+        if (_store == null) return new();
+        using var session = _store.OpenAsyncSession();
+        var ops = await session.Query<MongoOperation>()
+            .Where(x => x.SessionId == sessionId)
+            .OrderByDescending(x => x.Timestamp)
+            .Take(limit)
+            .ToListAsync();
+
+        var result = new List<(MongoOperation Op, byte[]? Bson)>();
+        foreach (var op in ops)
+        {
+            byte[]? bson = null;
+            try
+            {
+                using var attachment = await session.Advanced.Attachments.GetAsync(op.Id, "raw.bson");
+                if (attachment != null)
+                {
+                    using var ms = new MemoryStream();
+                    await attachment.Stream.CopyToAsync(ms);
+                    bson = ms.ToArray();
+                }
+            }
+            catch { }
+            result.Add((op, bson));
+        }
+        return result;
     }
 
     public async Task StoreOperationAsync(MongoOperation op, byte[]? rawBson = null)
@@ -102,7 +180,6 @@ public class RavenStorageService(ILogger<RavenStorageService> logger) : IDisposa
         {
             try
             {
-                // Wait for data if empty
                 if (!await _bulkChannel.Reader.WaitToReadAsync(ct)) break;
 
                 if (_store == null)
@@ -111,20 +188,46 @@ public class RavenStorageService(ILogger<RavenStorageService> logger) : IDisposa
                     continue;
                 }
 
-                using var bulk = _store.BulkInsert();
-                // Process in batches of 512
+                // Batch items for bulk insert
+                var items = new List<(MongoOperation Op, byte[]? Bson)>();
                 for (int i = 0; i < 512 && _bulkChannel.Reader.TryRead(out var item); i++)
                 {
-                    item.Op.SessionId = _activeSessionId ?? "default";
-                    // Note: Standard BulkInsert doesn't support attachments easily.
-                    // For this perf task, we prioritize the Op storage.
-                    await bulk.StoreAsync(item.Op);
+                    items.Add(item);
                 }
+
+                if (items.Count == 0) continue;
+
+                using (var bulk = _store.BulkInsert())
+                {
+                    foreach (var item in items)
+                    {
+                        item.Op.SessionId = _activeSessionId ?? "default";
+                        await bulk.StoreAsync(item.Op);
+                    }
+                }
+
+                // Attachments MUST be stored via standard session as BulkInsert doesn't support them
+                // We do this in parallel to not block the next bulk batch
+                _ = Task.Run(async () => {
+                    try {
+                        using var session = _store.OpenAsyncSession();
+                        foreach (var item in items)
+                        {
+                            if (item.Bson != null && item.Bson.Length > 0 && item.Op.Id != null)
+                            {
+                                using var ms = new MemoryStream(item.Bson);
+                                session.Advanced.Attachments.Store(item.Op.Id, "raw.bson", ms);
+                            }
+                        }
+                        await session.SaveChangesAsync();
+                    } catch (Exception ex) {
+                        logger.LogError(ex, "Error storing attachments");
+                    }
+                }, CancellationToken.None);
             }
             catch (OperationCanceledException) { break; }
             catch (Exception ex)
             {
-                // Log error but keep worker alive
                 logger.LogError(ex, $"Bulk insert error: {ex.Message}");
                 await Task.Delay(1000, ct);
             }

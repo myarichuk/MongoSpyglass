@@ -1,0 +1,40 @@
+@using MongoSpyglass.Service.Data
+@namespace MongoSpyglass.Service.Shared
+
+<div class="p-4 bg-surface flex flex-col gap-4">
+    <div class="flex justify-between items-center">
+        <div class="flex flex-col">
+            <span class="font-ui-label-sm text-on-surface-variant uppercase tracking-widest text-[10px]">@Insight.Category • @Insight.Timestamp.ToString("G")</span>
+            <h2 class="font-ui-header text-on-surface text-xl">@Insight.Title</h2>
+        </div>
+        <RadzenBadge BadgeStyle="@GetBadgeStyle(Insight.Level)" Text="@Insight.Level" class="rz-px-4 rz-py-1" />
+    </div>
+
+    <div class="p-4 bg-surface-container rounded border border-outline-variant">
+        <p class="font-ui-body text-on-surface">@Insight.Description</p>
+    </div>
+
+    @if (!string.IsNullOrEmpty(Insight.Details))
+    {
+        <div class="flex flex-col gap-2">
+            <span class="font-ui-label-sm text-on-surface-variant uppercase tracking-wider text-[11px]">Technical Details</span>
+            <pre class="p-4 bg-[#0F1420] text-on-surface rounded font-code-block text-[12px] overflow-auto max-h-[300px] border border-outline-variant">@Insight.Details</pre>
+        </div>
+    }
+
+    <div class="flex justify-end mt-4">
+        <RadzenButton Text="Close" Click="@(() => ((Radzen.DialogService)DialogService).Close())" ButtonStyle="ButtonStyle.Light" />
+    </div>
+</div>
+
+@code {
+    [Parameter] public MongoInsight Insight { get; set; } = null!;
+    [Inject] public DialogService DialogService { get; set; } = null!;
+
+    private Radzen.BadgeStyle GetBadgeStyle(string level) => level switch
+    {
+        "Critical" => Radzen.BadgeStyle.Danger,
+        "Warning" => Radzen.BadgeStyle.Warning,
+        _ => Radzen.BadgeStyle.Info
+    };
+}

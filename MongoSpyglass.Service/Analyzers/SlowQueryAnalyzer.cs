@@ -9,7 +9,7 @@ namespace MongoSpyglass.Service.Analyzers;
 
 public class SlowQueryAnalyzer : IAnalyzerPlugin
 {
-    private record RequestInfo(DateTime Timestamp, string Command, string Collection, string Payload);
+    private record RequestInfo(DateTime Timestamp, string Command, string Collection, byte[]? RawBson);
     private readonly ConcurrentQueue<Insight> _insights = new();
     private readonly ConcurrentDictionary<int, RequestInfo> _pendingRequests = new();
 
@@ -23,14 +23,11 @@ public class SlowQueryAnalyzer : IAnalyzerPlugin
             {
                 string command = "unknown";
                 string collection = "unknown";
-                string payload = "{}";
+                byte[]? rawBson = null;
 
                 if (!msg.Document.IsDefault)
                 {
-                    try {
-                        var bsonDoc = BsonSerializer.Deserialize<BsonDocument>(msg.Document.AsReadOnlySpan().ToArray());
-                        payload = bsonDoc.ToJson(new JsonWriterSettings { Indent = true });
-                    } catch { }
+                    rawBson = msg.Document.AsReadOnlySpan().ToArray();
 
                     if (msg.Document.KeysEnumerable.Any())
                     {
@@ -55,17 +52,27 @@ public class SlowQueryAnalyzer : IAnalyzerPlugin
                         catch { }
                     }
                 }
-                _pendingRequests[msg.RequestId] = new RequestInfo(DateTime.Now, command, collection, payload);
+                _pendingRequests[msg.RequestId] = new RequestInfo(DateTime.Now, command, collection, rawBson);
             }
             else if (msg.Tag == "from" && msg.DurationMs > 100)
             {
                 if (_pendingRequests.TryRemove(msg.ResponseTo, out var req))
                 {
+                    string payloadJson = "{}";
+                    if (req.RawBson != null)
+                    {
+                        try {
+                            var bsonDoc = BsonSerializer.Deserialize<BsonDocument>(req.RawBson);
+                            payloadJson = bsonDoc.ToJson(new JsonWriterSettings { Indent = true });
+                        } catch { }
+                    }
+
                     _insights.Enqueue(new Insight(
                         "Slow Query Detected",
                         $"Slow {req.Command} on {req.Collection} detected: {msg.DurationMs:F2}ms ({msg.MessageSizeBytes / 1024.0:F1} KB)",
                         InsightLevel.Warning,
-                        $"Total Latency: {msg.DurationMs:F2}ms\nRequest Size: {msg.MessageSizeBytes} bytes\nRequest ID: {msg.ResponseTo}\n\nPayload:\n{req.Payload}"
+                        $"Total Latency: {msg.DurationMs:F2}ms\nRequest Size: {msg.MessageSizeBytes} bytes\nRequest ID: {msg.ResponseTo}\n\nPayload:\n{payloadJson}",
+                        Category: "Performance"
                     ));
                 }
                 else
@@ -74,7 +81,8 @@ public class SlowQueryAnalyzer : IAnalyzerPlugin
                         "Slow Query Detected",
                         $"Slow operation detected: {msg.DurationMs:F2}ms (Request details timed out or missing)",
                         InsightLevel.Info,
-                        $"Total Latency: {msg.DurationMs:F2}ms\nResponse ID: {msg.RequestId}\nCorrelation ID (ResponseTo): {msg.ResponseTo}"
+                        $"Total Latency: {msg.DurationMs:F2}ms\nResponse ID: {msg.RequestId}\nCorrelation ID (ResponseTo): {msg.ResponseTo}",
+                        Category: "Performance"
                     ));
                 }
 
