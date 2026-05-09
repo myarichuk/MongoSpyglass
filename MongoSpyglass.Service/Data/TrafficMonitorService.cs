@@ -158,7 +158,11 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
                 for (int i = 0; i < _count; i++)
                 {
                     int index = (_head - 1 - i + MaxItems) % MaxItems;
-                    result.Add(_circularBuffer[index]);
+                    var item = _circularBuffer[index];
+                    if (item != null)
+                    {
+                        result.Add(item);
+                    }
                 }
                 return result;
             }
