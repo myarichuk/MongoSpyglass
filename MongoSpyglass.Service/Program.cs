@@ -47,7 +47,8 @@ var app = builder.Build();
 
 // Initialize Services
 var ravenService = app.Services.GetRequiredService<RavenStorageService>();
-ravenService.Initialize();
+var config = app.Services.GetRequiredService<IConfiguration>();
+ravenService.Initialize(dataDir: config["RavenDB:DataDir"]);
 
 var settingsService = app.Services.GetRequiredService<SettingsService>();
 await settingsService.InitializeAsync();

@@ -51,12 +51,19 @@ public class RavenStorageService(ILogger<RavenStorageService> logger) : IDisposa
 
     public event Action<string>? OnSessionChanged;
 
-    public void Initialize(bool isEmbedded = true, string? remoteUrl = null, string database = "MongoSpyglass")
+    public void Initialize(bool isEmbedded = true, string? remoteUrl = null, string database = "MongoSpyglass", string? dataDir = null)
     {
         if (isEmbedded)
         {
             logger.LogInformation("Starting Embedded RavenDB server...");
-            EmbeddedServer.Instance.StartServer();
+            if (!string.IsNullOrEmpty(dataDir))
+            {
+                EmbeddedServer.Instance.StartServer(new ServerOptions { DataDirectory = dataDir });
+            }
+            else
+            {
+                EmbeddedServer.Instance.StartServer();
+            }
             _store = EmbeddedServer.Instance.GetDocumentStore(database);
         }
         else
