@@ -1,11 +1,9 @@
 using SharpArena.Allocators;
-﻿using System.Runtime.InteropServices;
 using System.Text;
 using Microsoft.IO;
 using MongoDB.Bson;
 using MongoDB.Bson.IO;
 using MongoDB.Bson.Serialization;
-using SharpArena.Allocators;
 
 namespace MongoSpyglass.Proxy;
 
@@ -23,7 +21,7 @@ internal unsafe class Utils
     public static int ReadInt32FromStream(Stream stream)
     {
         Span<byte> buffer = stackalloc byte[4];
-        stream.Read(buffer);
+        stream.ReadExactly(buffer);
 
         return BitConverter.ToInt32(buffer);
     }
@@ -59,7 +57,7 @@ internal unsafe class Utils
     {
         // Read the length of the BSON document (first 4 bytes)
         byte[] lengthBytes = new byte[4]; //error handling, take into account max length and such...
-        stream.Read(lengthBytes, 0, 4);
+        stream.ReadExactly(lengthBytes, 0, 4);
 
         // Convert the 4-byte length field to an int
         int length = BitConverter.ToInt32(lengthBytes, 0);
@@ -73,7 +71,7 @@ internal unsafe class Utils
 
 
         // Read the rest of the BSON document
-        stream.Read(documentBytes.Slice(4));
+        stream.ReadExactly(documentBytes[4..]);
 
         return documentBytes;
     }

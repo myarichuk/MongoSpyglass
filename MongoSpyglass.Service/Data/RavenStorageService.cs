@@ -20,6 +20,7 @@ public record MongoOperation
     public string? Id { get; set; }
     public string SessionId { get; set; } = string.Empty;
     public int RequestId { get; set; }
+    public string OpCode { get; set; } = string.Empty;
     public string Collection { get; set; } = string.Empty;
     public string Command { get; set; } = string.Empty;
     public double? DurationMs { get; set; }

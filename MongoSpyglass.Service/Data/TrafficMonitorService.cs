@@ -78,7 +78,7 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
                             Timestamp = item.Op.Timestamp,
                             Tag = "to", // Assumption for preloaded request view
                             RequestId = item.Op.RequestId,
-                            OpCode = item.Op.Command == "find" ? "OP_QUERY" : "OP_MSG",
+                            OpCode = item.Op.OpCode,
                             Command = item.Op.Command,
                             Collection = item.Op.Collection,
                             RawBson = item.Bson,
@@ -302,7 +302,9 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
 
                     var op = new MongoOperation
                     {
+                        Id = "MongoOperations/" + Guid.NewGuid().ToString(),
                         RequestId = msg.RequestId,
+                        OpCode = msg.OpCode.ToString(),
                         Collection = collection,
                         Command = cmdName,
                         DurationMs = msg.DurationMs,
