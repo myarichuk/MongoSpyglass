@@ -221,8 +221,6 @@ public class MongoDbProxy : IHostedService
             var bodyPtr = bytes + headerSize;
             int bodyLength = (int)message.Length - headerSize;
 
-            var fullBodySpan = new ReadOnlySpan<byte>(bodyPtr, bodyLength);
-
             int docCount = 0;
             double? durationMs = null;
             if (tag == "from" && responseTo != 0 && correlationBuffer.TryGetRequest(responseTo, out var reqMetrics))
@@ -235,96 +233,81 @@ public class MongoDbProxy : IHostedService
                 correlationBuffer.RecordRequest(requestId, new OperationMetrics { TimestampStart = System.Diagnostics.Stopwatch.GetTimestamp(), OpCode = opCode, RequestId = requestId });
             }
 
+            // Determine if parsing is needed
+            bool needsParse = _listeners.Any(l => l.NeedsFullDocument) && ShouldParseBody(opCode, bodyLength);
+            
             // Pointer for metadata extraction
             byte* metadataPtr = bodyPtr;
             int metadataLen = bodyLength;
+            BlittableBsonDocument doc = default;
 
-            // Adjust metadataPtr for BSON document extraction based on OpCode
-            if (opCode == OpCode.OP_MSG)
+            if (needsParse)
             {
-                // OP_MSG: flagBits (4) + sections + [optional checksum (4)]
-                int flagBits = BinaryPrimitives.ReadInt32LittleEndian(new ReadOnlySpan<byte>(metadataPtr, 4));
-                bool checksumPresent = (flagBits & 1) != 0;
-                
-                if (checksumPresent)
+                // Adjust metadataPtr for BSON document extraction based on OpCode
+                if (opCode == OpCode.OP_MSG)
                 {
+                    // OP_MSG: flagBits (4) + sections + [optional checksum (4)]
+                    int flagBits = BinaryPrimitives.ReadInt32LittleEndian(new ReadOnlySpan<byte>(metadataPtr, 4));
+                    bool checksumPresent = (flagBits & 1) != 0;
+                    
+                    if (checksumPresent)
+                    {
+                        metadataLen -= 4;
+                    }
+
+                    // Move past flagBits
+                    metadataPtr += 4;
                     metadataLen -= 4;
-                }
 
-                // Move past flagBits
-                metadataPtr += 4;
-                metadataLen -= 4;
-
-                // Iterate through sections to find the first Kind 0 (Body) section.
-                // Kind 0 contains the main command document.
-                byte* p = metadataPtr;
-                while (p < metadataPtr + metadataLen)
-                {
-                    byte kind = *p++;
-                    if (kind == 0)
+                    // Iterate through sections to find the first Kind 0 (Body) section.
+                    byte* p = metadataPtr;
+                    while (p < metadataPtr + metadataLen)
                     {
-                        // Single document section - this is what we want
-                        metadataLen -= (int)(p - metadataPtr);
-                        metadataPtr = p;
-                        break;
+                        byte kind = *p++;
+                        if (kind == 0)
+                        {
+                            metadataLen -= (int)(p - metadataPtr);
+                            metadataPtr = p;
+                            break;
+                        }
+                        else if (kind == 1)
+                        {
+                            if (p + 4 > metadataPtr + metadataLen) break;
+                            int seqSize = BinaryPrimitives.ReadInt32LittleEndian(new ReadOnlySpan<byte>(p, 4));
+                            p += seqSize;
+                        }
+                        else break;
                     }
-                    else if (kind == 1)
-                    {
-                        // Document sequence section: skip it and look for Kind 0
-                        if (p + 4 > metadataPtr + metadataLen) break;
-                        int seqSize = BinaryPrimitives.ReadInt32LittleEndian(new ReadOnlySpan<byte>(p, 4));
-                        p += seqSize;
-                    }
-                    else break; // Unknown kind
                 }
-            }
-            else if (opCode == OpCode.OP_QUERY)
-            {
-                // OP_QUERY: flags (4) + fullCollectionName (CString) + numberToSkip (4) + numberToReturn (4) + query (BSON)
-                byte* p = metadataPtr + 4; // skip flags
-                
-                // Extract collection name for better identification
-                byte* collStart = p;
-                while (p < metadataPtr + metadataLen && *p != 0) p++; 
-                if (tag == "to") {
-                     // We could store the collection name here if ObservedMessage had a field for it
-                }
-
-                if (p < metadataPtr + metadataLen) p++; // skip null terminator
-                p += 8; // skip skip/return
-                metadataLen -= (int)(p - metadataPtr);
-                metadataPtr = p;
-            }
-            else if (opCode == OpCode.OP_REPLY)
-            {
-                // OP_REPLY: flags (4) + cursorId (8) + startingFrom (4) + numberReturned (4)
-                if (metadataLen >= 20)
+                else if (opCode == OpCode.OP_QUERY)
                 {
-                    docCount = BinaryPrimitives.ReadInt32LittleEndian(new ReadOnlySpan<byte>(metadataPtr + 16, 4));
-                    metadataPtr += 20;
-                    metadataLen -= 20;
+                    byte* p = metadataPtr + 4; // skip flags
+                    while (p < metadataPtr + metadataLen && *p != 0) p++; 
+                    if (p < metadataPtr + metadataLen) p++; // skip null terminator
+                    p += 8; // skip skip/return
+                    metadataLen -= (int)(p - metadataPtr);
+                    metadataPtr = p;
+                }
+                else if (opCode == OpCode.OP_REPLY)
+                {
+                    if (metadataLen >= 20)
+                    {
+                        docCount = BinaryPrimitives.ReadInt32LittleEndian(new ReadOnlySpan<byte>(metadataPtr + 16, 4));
+                        metadataPtr += 20;
+                        metadataLen -= 20;
+                    }
+                }
+                else
+                {
+                    // For other opcodes (UPDATE, INSERT, DELETE etc), we don't have a standardized simple document start
+                    metadataLen = 0;
+                }
+
+                if (metadataLen >= 5)
+                {
+                    doc = Bson.ArenaBsonReader.ReadInPlace(metadataPtr, metadataLen, arena);
                 }
             }
-            else if (opCode == OpCode.OP_GET_MORE)
-            {
-                // OP_GET_MORE: ZERO (4) + fullCollectionName (CString) + numberToReturn (4) + cursorId (8)
-                // No BSON document to parse here, but we should identify it.
-                metadataLen = 0; 
-            }
-            else if (opCode == OpCode.OP_KILL_CURSORS)
-            {
-                // OP_KILL_CURSORS: ZERO (4) + numberOfCursors (4) + cursorIds (int64[])
-                metadataLen = 0;
-            }
-            else if (opCode == (OpCode)2001 || opCode == (OpCode)2002 || opCode == (OpCode)2006)
-            {
-                // Legacy OP_UPDATE (2001), OP_INSERT (2002), OP_DELETE (2006)
-                // We'll mark them as identified but currently not deep-parsing BSON headers for these
-                // to avoid malformed BSON errors.
-                metadataLen = 0; 
-            }
-
-            var doc = metadataLen >= 5 ? Bson.ArenaBsonReader.ReadInPlace(metadataPtr, metadataLen, arena) : default;
             
             if (opCode == OpCode.OP_MSG && !doc.IsDefault)
             {
@@ -351,15 +334,24 @@ public class MongoDbProxy : IHostedService
                 listener.OnMessage(in observed);
             }
             
-            observed.Release(); // Release the initial reference from Rent()
+            observed.Release(); 
         }
         catch (Exception e)
         {
-            if (_logger.IsEnabled(LogLevel.Trace))
-            {
-                _logger.LogTrace(e, "Error observing message");
-            }
+            _logger.LogDebug(e, $"Error observing message (OpCode: {correlationBuffer.ToString()}, Conn: {connectionId})");
             tracker.Release();
         }
+    }
+
+    private bool ShouldParseBody(OpCode opCode, int bodyLength)
+    {
+        // Don't parse high-frequency/low-value opcodes
+        if (opCode == OpCode.OP_GET_MORE || opCode == OpCode.OP_KILL_CURSORS) return false;
+        if ((int)opCode is 2001 or 2002 or 2006) return false; // Legacy UPDATE, INSERT, DELETE
+
+        // OP_MSG under ~128 bytes are almost always administrative heartbeats (ping, hello, isMaster)
+        if (opCode == OpCode.OP_MSG && bodyLength < 128) return false;
+
+        return true;
     }
 }
