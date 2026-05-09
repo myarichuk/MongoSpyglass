@@ -82,7 +82,7 @@
         BsonType.DateTime => $"ISODate(\"{Value.ToUniversalTime():yyyy-MM-ddTHH:mm:ss.fffZ}\")",
         BsonType.Boolean => Value.AsBoolean.ToString().ToLower(),
         BsonType.Null => "null",
-        _ => Value.ToString()
+        _ => Value.ToString() ?? string.Empty
     };
 
     private string GetValueColorClass() => Value.BsonType switch
