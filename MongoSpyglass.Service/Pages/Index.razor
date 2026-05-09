@@ -2,6 +2,7 @@
 @using MongoSpyglass.Service.Data
 @namespace MongoSpyglass.Service.Pages
 @inject TrafficMonitorService TrafficMonitor
+@inject DialogService DialogService
 @implements IDisposable
 
 <div class="flex flex-col flex-grow min-w-0">
@@ -106,17 +107,17 @@
                 <h2 class="font-ui-header text-ui-header text-on-surface">Recent Slow Queries (>100ms)</h2>
             </div>
             <div class="w-full overflow-x-auto p-2">
-                <RadzenDataGrid Data="@_slowQueries" TItem="DecryptedTraffic" Density="Density.Compact" GridLines="DataGridGridLines.None" AllowPaging="false" AllowSorting="true">
+                <RadzenDataGrid Data="@_slowQueries" TItem="DecryptedTraffic" Density="Density.Compact" GridLines="DataGridGridLines.None" AllowPaging="false" AllowSorting="true" RowClick="@((DataGridRowMouseEventArgs<DecryptedTraffic> args) => ShowDetails(args.Data))">
                     <Columns>
-                        <RadzenDataGridColumn TItem="DecryptedTraffic" Property="Timestamp" Title="Time" FormatString="{0:HH:mm:ss}" />
+                        <RadzenDataGridColumn TItem="DecryptedTraffic" Property="Timestamp" Title="Time" FormatString="{0:HH:mm:ss}" Width="100px" />
                         <RadzenDataGridColumn TItem="DecryptedTraffic" Property="Collection" Title="Namespace" />
-                        <RadzenDataGridColumn TItem="DecryptedTraffic" Property="Command" Title="Operation" />
-                        <RadzenDataGridColumn TItem="DecryptedTraffic" Property="DurationMs" Title="Time">
+                        <RadzenDataGridColumn TItem="DecryptedTraffic" Property="Command" Title="Operation" Width="120px" />
+                        <RadzenDataGridColumn TItem="DecryptedTraffic" Property="DurationMs" Title="Time" Width="100px">
                             <Template Context="q">
-                                @q.DurationMs?.ToString("F1") ms
+                                <span class="text-error font-medium">@q.DurationMs?.ToString("F1") ms</span>
                             </Template>
                         </RadzenDataGridColumn>
-                        <RadzenDataGridColumn TItem="DecryptedTraffic" Property="PayloadJson" Title="Payload" Width="300px" />
+                        <RadzenDataGridColumn TItem="DecryptedTraffic" Property="SummaryJson" Title="Payload" />
                     </Columns>
                 </RadzenDataGrid>
             </div>
@@ -171,6 +172,21 @@
     {
         RefreshMetrics();
         await InvokeAsync(StateHasChanged);
+    }
+
+    private async Task ShowDetails(DecryptedTraffic entry)
+    {
+        await DialogService.OpenAsync<OperationDetail>($"Operation Detail: {entry.Command}",
+            new Dictionary<string, object> { { "Entry", entry } },
+            new DialogOptions 
+            { 
+                Width = "1100px", 
+                Height = "800px", 
+                Resizable = true, 
+                Draggable = true,
+                CloseDialogOnOverlayClick = true,
+                CloseDialogOnEsc = true
+            });
     }
 
     public void Dispose()
