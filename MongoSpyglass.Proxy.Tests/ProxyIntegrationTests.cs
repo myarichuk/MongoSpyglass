@@ -11,6 +11,16 @@ namespace MongoSpyglass.Proxy.Tests;
 
 public class ProxyIntegrationTests
 {
+    private class SimpleProxySettingsProvider : IProxySettingsProvider
+    {
+        public IPEndPoint TargetServer { get; set; } = new(IPAddress.Loopback, 27017);
+        public int IncomingPort { get; set; } = 27018;
+        public event Action? OnSettingsChanged;
+
+        public (IPEndPoint TargetServer, int IncomingPort) GetCurrentSettings() => (TargetServer, IncomingPort);
+        public void TriggerChange() => OnSettingsChanged?.Invoke();
+    }
+
     [Fact]
     public async Task Proxy_ShouldForwardTraffic_AndTriggerListener()
     {
@@ -21,8 +31,8 @@ public class ProxyIntegrationTests
 
         // 2. Setup Proxy
         var mockListener = new MockTrafficListener();
-        var proxyPort = 0; // Let OS choose
-        var proxy = new MongoDbProxy(new IPEndPoint(IPAddress.Loopback, serverPort), 0, NullLogger<MongoDbProxy>.Instance, new[] { mockListener });
+        var settings = new SimpleProxySettingsProvider { TargetServer = new IPEndPoint(IPAddress.Loopback, serverPort), IncomingPort = 0 };
+        var proxy = new MongoDbProxy(settings, NullLogger<MongoDbProxy>.Instance, new[] { mockListener });
         
         // We need to start the proxy but it uses a hardcoded port in StartAsync if we don't fix it.
         // I'll assume for this test we manually start the listener logic if needed or just test the internal methods.
@@ -33,11 +43,12 @@ public class ProxyIntegrationTests
     public void TryReadMessage_ShouldHandlePartialReads()
     {
         var buffer = new ReadOnlySequence<byte>(new byte[] { 10, 0, 0, 0, 1, 2, 3 }); // Length 10, but only 7 bytes
-        var proxy = new MongoDbProxy(new IPEndPoint(IPAddress.Any, 0), 0, NullLogger<MongoDbProxy>.Instance, Enumerable.Empty<ITrafficListener>());
+        var settings = new SimpleProxySettingsProvider();
+        var proxy = new MongoDbProxy(settings, NullLogger<MongoDbProxy>.Instance, Enumerable.Empty<ITrafficListener>());
         
         var method = typeof(MongoDbProxy).GetMethod("TryReadMessage", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
         
-        var args = new object[] { buffer, null };
+        var args = new object[] { buffer, default(ReadOnlySequence<byte>) };
         var result = (bool)method.Invoke(proxy, args);
         
         Assert.False(result);
@@ -48,11 +59,12 @@ public class ProxyIntegrationTests
     {
         var data = new byte[] { 8, 0, 0, 0, 1, 2, 3, 4 };
         var buffer = new ReadOnlySequence<byte>(data);
-        var proxy = new MongoDbProxy(new IPEndPoint(IPAddress.Any, 0), 0, NullLogger<MongoDbProxy>.Instance, Enumerable.Empty<ITrafficListener>());
+        var settings = new SimpleProxySettingsProvider();
+        var proxy = new MongoDbProxy(settings, NullLogger<MongoDbProxy>.Instance, Enumerable.Empty<ITrafficListener>());
         
         var method = typeof(MongoDbProxy).GetMethod("TryReadMessage", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
         
-        var args = new object[] { buffer, null };
+        var args = new object[] { buffer, default(ReadOnlySequence<byte>) };
         var result = (bool)method.Invoke(proxy, args);
         
         Assert.True(result);

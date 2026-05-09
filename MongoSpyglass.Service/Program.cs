@@ -23,6 +23,7 @@ builder.Services.AddSingleton<ITrafficListener>(sp => sp.GetRequiredService<Traf
 
 builder.Services.AddSingleton<RavenStorageService>();
 builder.Services.AddSingleton<SettingsService>();
+builder.Services.AddSingleton<IProxySettingsProvider>(sp => sp.GetRequiredService<SettingsService>());
 builder.Services.AddSingleton<NotificationHubService>();
 
 builder.Services.AddSingleton<SlowQueryAnalyzer>();
@@ -33,18 +34,7 @@ builder.Services.AddSingleton<CursorAnalyzer>();
 builder.Services.AddSingleton<ITrafficListener>(sp => sp.GetRequiredService<CursorAnalyzer>());
 builder.Services.AddSingleton<IAnalyzerPlugin>(sp => sp.GetRequiredService<CursorAnalyzer>());
 
-builder.Services.AddHostedService(sp =>
-{
-    var config = sp.GetRequiredService<IConfiguration>();
-    var logger = sp.GetRequiredService<ILogger<MongoDbProxy>>();
-    var listeners = sp.GetServices<ITrafficListener>();
-    
-    var serverAddr = IPAddress.Parse(config["Proxy:MongoDbServer"] ?? "127.0.0.1");
-    var serverPort = int.Parse(config["Proxy:MongoDbPort"] ?? "27017");
-    var incomingPort = int.Parse(config["Proxy:IncomingPort"] ?? "27018");
-
-    return new MongoDbProxy(new IPEndPoint(serverAddr, serverPort), incomingPort, logger, listeners);
-});
+builder.Services.AddHostedService<MongoDbProxy>();
 
 // Add any custom registrations here
 // containerBuilder.RegisterType<YourType>().As<IYourInterface>();
@@ -55,9 +45,12 @@ builder.Host
 
 var app = builder.Build();
 
-// Initialize RavenDB
+// Initialize Services
 var ravenService = app.Services.GetRequiredService<RavenStorageService>();
 ravenService.Initialize();
+
+var settingsService = app.Services.GetRequiredService<SettingsService>();
+await settingsService.InitializeAsync();
 
 if (!app.Environment.IsDevelopment())
 {

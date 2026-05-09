@@ -1,3 +1,4 @@
+#file: noinspection SpellCheckingInspection
 version: '3.8'
 
 services:
@@ -23,11 +24,12 @@ services:
 
   demoapp:
     build:
-      context: DemoApp/DemoApp
+      context: DemoApp
       dockerfile: Dockerfile
     ports:
       - "5000:8080"
     environment:
       - ASPNETCORE_ENVIRONMENT=Development
     depends_on:
+      - mongodb
       - mongospyglass
