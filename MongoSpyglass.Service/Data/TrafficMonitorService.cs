@@ -62,6 +62,17 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
         };
         _uiUpdateTimer.Start();
 
+        _ravenService.OnSessionChanged += (sessionId) => {
+            _lock.EnterWriteLock();
+            try {
+                Array.Clear(_circularBuffer, 0, _circularBuffer.Length);
+                _head = 0;
+                _count = 0;
+                _pendingRequests.Clear();
+            } finally { _lock.ExitWriteLock(); }
+            RequestUiUpdate();
+        };
+
         // Preload data from resumed session
         Task.Run(async () => {
             var activeSessionId = await GetActiveSessionIdAsync();

@@ -34,20 +34,26 @@
 </header>
 
 @code {
+    private readonly CancellationTokenSource _cts = new();
+
     protected override void OnInitialized()
     {
         NotificationHub.OnNotificationsUpdated += HandleUpdate;
-        // Start a background timer to poll for new insights every 2 seconds
-        _ = PollInsights();
+        // Start a background timer to poll for new insights
+        _ = PollInsights(_cts.Token);
     }
 
-    private async Task PollInsights()
+    private async Task PollInsights(CancellationToken ct)
     {
-        while (true)
+        try 
         {
-            await Task.Delay(2000);
-            NotificationHub.Refresh();
+            while (!ct.IsCancellationRequested)
+            {
+                await Task.Delay(2000, ct);
+                NotificationHub.Refresh();
+            }
         }
+        catch (OperationCanceledException) { }
     }
 
     private async void HandleUpdate()
@@ -63,6 +69,8 @@
 
     public void Dispose()
     {
+        _cts.Cancel();
+        _cts.Dispose();
         NotificationHub.OnNotificationsUpdated -= HandleUpdate;
     }
 }

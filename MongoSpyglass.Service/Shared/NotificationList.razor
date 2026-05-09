@@ -4,6 +4,13 @@
 @inject DialogService DialogService
 
 <div class="flex flex-col h-full bg-surface">
+    <div class="px-4 py-2 border-b border-outline-variant flex justify-between items-center shrink-0">
+        <span class="font-ui-label-sm text-on-surface-variant uppercase tracking-wider">Recent Insights</span>
+        @if (NotificationHub.GetAll().Count > 0)
+        {
+            <RadzenButton Text="Dismiss All" ButtonStyle="ButtonStyle.Base" Variant="Variant.Text" Size="ButtonSize.Small" Click="@DismissAll" class="text-primary" />
+        }
+    </div>
     @if (NotificationHub.GetAll().Count == 0)
     {
         <div class="flex-1 flex flex-col items-center justify-center opacity-50 gap-4">
@@ -54,5 +61,10 @@
     private async Task Dismiss(MongoInsight insight)
     {
         await NotificationHub.DismissAsync(insight.Id);
+    }
+
+    private async Task DismissAll()
+    {
+        await NotificationHub.DismissAllAsync();
     }
 }
