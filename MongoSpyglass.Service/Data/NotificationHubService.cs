@@ -17,6 +17,14 @@ public class NotificationHubService
         _analyzers = analyzers;
         _ravenService = ravenService;
         
+        _ravenService.OnSessionChanged += (sessionId) => {
+            lock (_lock)
+            {
+                _notifications.Clear();
+            }
+            OnNotificationsUpdated?.Invoke();
+        };
+
         // Initial load
         Task.Run(async () => {
             _notifications = await _ravenService.GetInsightsAsync();
