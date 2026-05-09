@@ -242,7 +242,6 @@ public class MongoDbProxy : IHostedService
             // Adjust metadataPtr for BSON document extraction based on OpCode
             if (opCode == OpCode.OP_MSG)
             {
-                // OP_MSG: flagBits (4) + sections + [optional checksum (4)]
                 int flagBits = BinaryPrimitives.ReadInt32LittleEndian(new ReadOnlySpan<byte>(metadataPtr, 4));
                 bool checksumPresent = (flagBits & 1) != 0;
                 
@@ -251,9 +250,29 @@ public class MongoDbProxy : IHostedService
                     metadataLen -= 4;
                 }
 
-                // First section kind (1) + document
-                metadataPtr += 5;
-                metadataLen -= 5;
+                // Improved section parsing for OP_MSG
+                int sectionOffset = 4; // after flagBits
+                if (metadataLen > sectionOffset)
+                {
+                    byte sectionKind = metadataPtr[sectionOffset];
+                    if (sectionKind == 0)
+                    {
+                        // Single document section
+                        metadataPtr += sectionOffset + 1;
+                        metadataLen -= sectionOffset + 1;
+                    }
+                    else if (sectionKind == 1)
+                    {
+                        // Document sequence: skip identifier cstring + point to first document
+                        int idStart = sectionOffset + 1;
+                        int idEnd = idStart;
+                        while (idEnd < metadataLen && metadataPtr[idEnd] != 0) idEnd++;
+                        if (idEnd < metadataLen) idEnd++; // skip null terminator
+                        metadataPtr += idEnd;
+                        metadataLen -= idEnd;
+                    }
+                    // else: unknown section kind - leave as-is (best effort)
+                }
             }
             else if (opCode == OpCode.OP_QUERY)
             {
@@ -277,28 +296,21 @@ public class MongoDbProxy : IHostedService
             }
             else if (opCode == OpCode.OP_GET_MORE)
             {
-                // OP_GET_MORE: ZERO (4) + fullCollectionName (CString) + numberToReturn (4) + cursorId (8)
-                // No BSON document to parse here, but we should identify it.
                 metadataLen = 0; 
             }
             else if (opCode == OpCode.OP_KILL_CURSORS)
             {
-                // OP_KILL_CURSORS: ZERO (4) + numberOfCursors (4) + cursorIds (int64[])
                 metadataLen = 0;
             }
             else if (opCode == (OpCode)2001 || opCode == (OpCode)2002 || opCode == (OpCode)2006)
             {
-                // Legacy OP_UPDATE (2001), OP_INSERT (2002), OP_DELETE (2006)
-                // We'll mark them as identified but currently not deep-parsing BSON headers for these
-                // to avoid malformed BSON errors.
-                metadataLen = 0; 
+                metadataLen = 0;
             }
 
             var doc = metadataLen >= 5 ? Bson.ArenaBsonReader.ReadInPlace(metadataPtr, metadataLen, arena) : default;
             
             if (opCode == OpCode.OP_MSG && !doc.IsDefault)
             {
-                // Extract doc count from cursor batches
                 if (doc.TryGetElementOffset("cursor", out var cursorOff))
                 {
                     var cursorDoc = doc.GetDocument(cursorOff, arena);
@@ -321,13 +333,13 @@ public class MongoDbProxy : IHostedService
                 listener.OnMessage(in observed);
             }
             
-            observed.Release(); // Release the initial reference from Rent()
+            observed.Release();
         }
         catch (Exception e)
         {
-            if (_logger.IsEnabled(LogLevel.Trace))
+            if (_logger.IsEnabled(LogLevel.Debug))
             {
-                _logger.LogTrace(e, "Error observing message");
+                _logger.LogDebug(e, "Error observing {0} message on connection {1}", opCode, connectionId);
             }
             tracker.Release();
         }
