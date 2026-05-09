@@ -345,13 +345,13 @@ public class MongoDbProxy : IHostedService
 
     private bool ShouldParseBody(OpCode opCode, int bodyLength)
     {
-        // Don't parse high-frequency/low-value opcodes
+        // Don't parse high-frequency/low-value opcodes that usually don't contain metadata for us
         if (opCode == OpCode.OP_GET_MORE || opCode == OpCode.OP_KILL_CURSORS) return false;
         if ((int)opCode is 2001 or 2002 or 2006) return false; // Legacy UPDATE, INSERT, DELETE
 
-        // OP_MSG under ~128 bytes are almost always administrative heartbeats (ping, hello, isMaster)
-        if (opCode == OpCode.OP_MSG && bodyLength < 128) return false;
-
+        // Always parse OP_MSG because it contains the command metadata.
+        // Small control messages (hello, ping) are cheap to parse and necessary for filtering.
+        // Large data messages (find results) are only skipped if NO listener wants them (handled in ObserveMessage).
         return true;
     }
 }
