@@ -98,17 +98,17 @@
 
 @code {
     private int _opsCount => _trafficSnapshot?.Count ?? 0;
-    private IReadOnlyList<DecryptedTraffic> _trafficSnapshot = new List<DecryptedTraffic>();
+    private List<DecryptedTraffic> _trafficSnapshot = new();
 
     protected override void OnInitialized()
     {
         TrafficMonitor.OnTrafficReceived += HandleTrafficReceived;
-        _trafficSnapshot = TrafficMonitor.Traffic ?? new List<DecryptedTraffic>();
+        _trafficSnapshot = TrafficMonitor.Traffic?.ToList() ?? new List<DecryptedTraffic>();
     }
 
     private async void HandleTrafficReceived()
     {
-        _trafficSnapshot = TrafficMonitor.Traffic ?? new List<DecryptedTraffic>();
+        _trafficSnapshot = TrafficMonitor.Traffic?.ToList() ?? new List<DecryptedTraffic>();
         await InvokeAsync(StateHasChanged);
     }
 
