@@ -106,7 +106,7 @@ public static unsafe class ArenaBsonReader
                 dataPos + 4 + SafeReadInt32(ptr, dataPos, totalLen),
             BlittableBsonConstants.BsonType.Document or
             BlittableBsonConstants.BsonType.Array or
-            (BlittableBsonConstants.BsonType)15 => // CodeWithScope
+            BlittableBsonConstants.BsonType.CodeWithScope => 
                 dataPos + SafeReadInt32(ptr, dataPos, totalLen),
             BlittableBsonConstants.BsonType.Binary =>
                 dataPos + 4 + 1 + SafeReadInt32(ptr, dataPos, totalLen),
@@ -117,8 +117,9 @@ public static unsafe class ArenaBsonReader
             BlittableBsonConstants.BsonType.Int32 => dataPos + 4,
             BlittableBsonConstants.BsonType.Int64 => dataPos + 8,
             BlittableBsonConstants.BsonType.Decimal128 => dataPos + 16,
-            (BlittableBsonConstants.BsonType)17 => dataPos + 8, // Timestamp
-            (BlittableBsonConstants.BsonType)255 or (BlittableBsonConstants.BsonType)127 => dataPos, // MinKey / MaxKey
+            BlittableBsonConstants.BsonType.Timestamp => dataPos + 8,
+            BlittableBsonConstants.BsonType.MinKey or 
+            BlittableBsonConstants.BsonType.MaxKey => dataPos,
             _ => -1 // Unsupported or invalid type
         };
     }
