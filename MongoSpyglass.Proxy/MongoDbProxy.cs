@@ -251,6 +251,29 @@ public class MongoDbProxy : IHostedService
                     metadataLen -= 4;
                 }
 
+                // Improved section parsing for OP_MSG
+                int sectionOffset = 4; // after flagBits
+                if (metadataLen > sectionOffset)
+                {
+                    byte sectionKind = metadataPtr[sectionOffset];
+                    if (sectionKind == 0)
+                    {
+                        // Single document section
+                        metadataPtr += sectionOffset + 1;
+                        metadataLen -= sectionOffset + 1;
+                    }
+                    else if (sectionKind == 1)
+                    {
+                        // Document sequence: skip identifier cstring + point to first document
+                        int idStart = sectionOffset + 1;
+                        int idEnd = idStart;
+                        while (idEnd < metadataLen && metadataPtr[idEnd] != 0) idEnd++;
+                        if (idEnd < metadataLen) idEnd++; // skip null terminator
+                        metadataPtr += idEnd;
+                        metadataLen -= idEnd;
+                    }
+                    // else: unknown section kind - leave as-is (best effort)
+                }
                 // Move past flagBits
                 metadataPtr += 4;
                 metadataLen -= 4;
