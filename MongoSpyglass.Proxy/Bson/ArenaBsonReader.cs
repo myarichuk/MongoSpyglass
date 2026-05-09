@@ -79,6 +79,18 @@ public static unsafe class ArenaBsonReader
         return (BlittableBsonConstants.BsonType)doc.Pointer[offset];
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int SafeReadInt32(byte* ptr, int offset, int totalLen)
+    {
+        if (offset + 4 > totalLen)
+            return -1; // signal invalid
+        return *(int*)(ptr + offset);
+    }
+
+    /// <summary>
+    /// Skips over a BSON element. Returns the new position or -1 on invalid/truncated data.
+    /// This version is hardened against malicious or truncated documents.
+    /// </summary>
     public static int SkipElement(byte* ptr, int dataPos, BlittableBsonConstants.BsonType type, int totalLen)
     {
         if (dataPos >= totalLen)
@@ -89,10 +101,15 @@ public static unsafe class ArenaBsonReader
         return type switch
         {
             BlittableBsonConstants.BsonType.Double => dataPos + 8,
-            BlittableBsonConstants.BsonType.String => dataPos + 4 + (dataPos + 4 <= totalLen ? *(int*)(ptr + dataPos) : 1000000),
-            BlittableBsonConstants.BsonType.Document => dataPos + (dataPos + 4 <= totalLen ? *(int*)(ptr + dataPos) : 1000000),
-            BlittableBsonConstants.BsonType.Array => dataPos + (dataPos + 4 <= totalLen ? *(int*)(ptr + dataPos) : 1000000),
-            BlittableBsonConstants.BsonType.Binary => dataPos + 4 + 1 + (dataPos + 4 <= totalLen ? *(int*)(ptr + dataPos) : 1000000),
+            BlittableBsonConstants.BsonType.String or
+            BlittableBsonConstants.BsonType.Symbol =>
+                dataPos + 4 + SafeReadInt32(ptr, dataPos, totalLen),
+            BlittableBsonConstants.BsonType.Document or
+            BlittableBsonConstants.BsonType.Array or
+            (BlittableBsonConstants.BsonType)15 => // CodeWithScope
+                dataPos + SafeReadInt32(ptr, dataPos, totalLen),
+            BlittableBsonConstants.BsonType.Binary =>
+                dataPos + 4 + 1 + SafeReadInt32(ptr, dataPos, totalLen),
             BlittableBsonConstants.BsonType.ObjectId => dataPos + 12,
             BlittableBsonConstants.BsonType.Boolean => dataPos + 1,
             BlittableBsonConstants.BsonType.DateTime => dataPos + 8,
@@ -100,12 +117,9 @@ public static unsafe class ArenaBsonReader
             BlittableBsonConstants.BsonType.Int32 => dataPos + 4,
             BlittableBsonConstants.BsonType.Int64 => dataPos + 8,
             BlittableBsonConstants.BsonType.Decimal128 => dataPos + 16,
-            (BlittableBsonConstants.BsonType)14 => dataPos + 4 + (dataPos + 4 <= totalLen ? *(int*)(ptr + dataPos) : 1000000), // Symbol
-            (BlittableBsonConstants.BsonType)15 => dataPos + (dataPos + 4 <= totalLen ? *(int*)(ptr + dataPos) : 1000000), // CodeWithScope
             (BlittableBsonConstants.BsonType)17 => dataPos + 8, // Timestamp
-            (BlittableBsonConstants.BsonType)255 => dataPos, // MinKey
-            (BlittableBsonConstants.BsonType)127 => dataPos, // MaxKey
-            _ => -1 // Unsupported/Invalid
+            (BlittableBsonConstants.BsonType)255 or (BlittableBsonConstants.BsonType)127 => dataPos, // MinKey / MaxKey
+            _ => -1 // Unsupported or invalid type
         };
     }
 }
