@@ -352,7 +352,7 @@ public unsafe struct ArenaBsonWriter(ArenaAllocator arena, int initialCapacity =
         else
         {
             WriteName(name, (BlittableBsonConstants.BsonType)value.BsonType);
-            using var ms = new System.IO.MemoryStream();
+            using var ms = Utils.RecyclableMemoryStreamManager.GetStream();
             using (var bsonWriter = new MongoDB.Bson.IO.BsonBinaryWriter(ms))
             {
                 bsonWriter.WriteStartDocument();
