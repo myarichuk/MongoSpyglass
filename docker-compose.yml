@@ -19,6 +19,7 @@ services:
       - Proxy__MongoDbServer=mongodb
       - Proxy__MongoDbPort=27017
       - Proxy__IncomingPort=27018
+      - RavenDB__DataDir=/var/lib/ravendb
     depends_on:
       - mongodb
 
