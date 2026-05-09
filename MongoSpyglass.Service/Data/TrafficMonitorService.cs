@@ -10,91 +10,6 @@ using MongoDB.Bson.IO;
 
 namespace MongoSpyglass.Service.Data;
 
-public record DecryptedTraffic
-{
-    public DateTime Timestamp { get; init; } = DateTime.Now;
-    public string Tag { get; init; } = string.Empty;
-    public int RequestId { get; init; }
-    public string OpCode { get; init; } = string.Empty;
-    public string Command { get; init; } = string.Empty;
-    public string Collection { get; init; } = string.Empty;
-    public byte[]? RawBson { get; init; }
-    public double? DurationMs { get; init; }
-    public int SizeBytes { get; init; }
-    public int DocumentCount { get; init; }
-
-    public string PayloadJson 
-    {
-        get 
-        {
-            if (RawBson == null || RawBson.Length == 0) return "{}";
-            try 
-            {
-                if (OpCode == "OP_MSG")
-                {
-                    return ParseOpMsg(RawBson);
-                }
-
-                var doc = BsonSerializer.Deserialize<BsonDocument>(RawBson);
-                return doc.ToJson(new JsonWriterSettings { Indent = true });
-            } 
-            catch 
-            {
-                return "{ \"error\": \"failed to parse bson\" }";
-            }
-        }
-    }
-
-    private static string ParseOpMsg(byte[] bytes)
-    {
-        var result = new BsonDocument();
-        ReadOnlyMemory<byte> memory = bytes;
-        
-        if (memory.Length < 4) return "{}";
-        
-        int flagBits = BinaryPrimitives.ReadInt32LittleEndian(memory.Span);
-        bool checksumPresent = (flagBits & 1) != 0;
-        int dataLen = memory.Length - (checksumPresent ? 4 : 0);
-        
-        int pos = 4;
-        while (pos < dataLen)
-        {
-            byte kind = memory.Span[pos++];
-            if (kind == 0) // Body
-            {
-                int docLen = BinaryPrimitives.ReadInt32LittleEndian(memory.Span.Slice(pos));
-                var doc = BsonSerializer.Deserialize<BsonDocument>(memory.Slice(pos, docLen).ToArray());
-                foreach (var el in doc) result[el.Name] = el.Value;
-                pos += docLen;
-            }
-            else if (kind == 1) // Sequence
-            {
-                int seqSize = BinaryPrimitives.ReadInt32LittleEndian(memory.Span.Slice(pos));
-                int seqEnd = pos + seqSize;
-                pos += 4;
-                
-                // Read identifier
-                int identStart = pos;
-                while (pos < seqEnd && memory.Span[pos] != 0) pos++;
-                string identifier = System.Text.Encoding.UTF8.GetString(memory.Span.Slice(identStart, pos - identStart).ToArray());
-                pos++; // null
-                
-                var array = new BsonArray();
-                while (pos < seqEnd)
-                {
-                    int docLen = BinaryPrimitives.ReadInt32LittleEndian(memory.Span.Slice(pos));
-                    array.Add(BsonSerializer.Deserialize<BsonDocument>(memory.Slice(pos, docLen).ToArray()));
-                    pos += docLen;
-                }
-                result[identifier] = array;
-            }
-            else break;
-        }
-
-        return result.ToJson(new JsonWriterSettings { Indent = true });
-    }
-}
-
 public class TrafficMonitorService : ITrafficListener, IDisposable
 {
     private const int MaxItems = 1000;
@@ -107,13 +22,16 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
     private readonly Channel<ObservedMessage> _incomingChannel;
     private readonly CancellationTokenSource _cts = new();
     private readonly System.Timers.Timer _throughputTimer;
+    private readonly System.Timers.Timer _uiUpdateTimer;
     private readonly RavenStorageService _ravenService;
     private readonly NotificationHubService _notificationHub;
+    private bool _needsUiUpdate = false;
 
     public event Action? OnTrafficReceived;
 
     public bool ShowHello { get; set; } = false;
     public int ThroughputOpsPerSec { get; private set; }
+    public double? AverageLatencyMs { get; private set; }
 
     public TrafficMonitorService(RavenStorageService ravenService, NotificationHubService notificationHub)
     {
@@ -128,8 +46,21 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
         Task.Run(ProcessMessagesAsync);
 
         _throughputTimer = new System.Timers.Timer(1000);
-        _throughputTimer.Elapsed += (s, e) => CalculateThroughput();
+        _throughputTimer.Elapsed += (s, e) => {
+            CalculateThroughput();
+            CalculateAvgLatency();
+        };
         _throughputTimer.Start();
+
+        _uiUpdateTimer = new System.Timers.Timer(100); // 10 FPS max for UI updates
+        _uiUpdateTimer.Elapsed += (s, e) => {
+            if (_needsUiUpdate)
+            {
+                _needsUiUpdate = false;
+                OnTrafficReceived?.Invoke();
+            }
+        };
+        _uiUpdateTimer.Start();
 
         // Preload data from resumed session
         Task.Run(async () => {
@@ -161,10 +92,12 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
                         if (_count < MaxItems) _count++;
                     }
                 } finally { _lock.ExitWriteLock(); }
-                OnTrafficReceived?.Invoke();
+                RequestUiUpdate();
             }
         });
     }
+
+    private void RequestUiUpdate() => _needsUiUpdate = true;
 
     private async Task<string?> GetActiveSessionIdAsync()
     {
@@ -199,16 +132,17 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
             _lock.ExitReadLock();
         }
         
-        OnTrafficReceived?.Invoke();
+        RequestUiUpdate();
     }
 
-    public IEnumerable<DecryptedTraffic> Traffic
+    public IReadOnlyList<DecryptedTraffic> Traffic
     {
         get
         {
             _lock.EnterReadLock();
             try
             {
+                // Return a snapshot to avoid multi-threaded access issues in the UI
                 var result = new List<DecryptedTraffic>(_count);
                 for (int i = 0; i < _count; i++)
                 {
@@ -246,6 +180,7 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
                         if (_pendingRequests.TryRemove(msg.ResponseTo, out var pending))
                         {
                             var duration = (DateTime.Now - pending.Op.Timestamp).TotalMilliseconds;
+                            var responseBson = msg.FullBody.ToArray();
                             var finalOp = pending.Op with 
                             { 
                                 DurationMs = duration,
@@ -259,18 +194,16 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
                             _lock.EnterWriteLock();
                             try
                             {
-                                // Find in circular buffer to update duration/size/docCount
+                                // Find in circular buffer to update duration/size/docCount/response
                                 for (int i = 0; i < _count; i++)
                                 {
                                     int index = (_head - 1 - i + MaxItems) % MaxItems;
                                     if (_circularBuffer[index].RequestId == msg.ResponseTo)
                                     {
-                                        _circularBuffer[index] = _circularBuffer[index] with 
-                                        { 
-                                            DurationMs = duration,
-                                            SizeBytes = finalOp.SizeBytes,
-                                            DocumentCount = finalOp.DocumentCount
-                                        };
+                                        _circularBuffer[index].DurationMs = duration;
+                                        _circularBuffer[index].SizeBytes = finalOp.SizeBytes;
+                                        _circularBuffer[index].DocumentCount = finalOp.DocumentCount;
+                                        _circularBuffer[index].ResponseBson = responseBson;
                                         break;
                                     }
                                 }
@@ -280,7 +213,7 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
                                 _lock.ExitWriteLock();
                             }
                         }
-                        OnTrafficReceived?.Invoke();
+                        RequestUiUpdate();
                         continue;
                     }
 
@@ -394,7 +327,7 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
                     }
 
                     _notificationHub.Refresh();
-                    OnTrafficReceived?.Invoke();
+                    RequestUiUpdate();
                 }
                 finally
                 {
@@ -411,10 +344,33 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
                cmd == "buildinfo" || cmd == "buildInfo" || cmd == "whatsmyuri" || cmd == "listDatabases";
     }
 
+    private void CalculateAvgLatency()
+    {
+        _lock.EnterReadLock();
+        try
+        {
+            var latencies = new List<double>();
+            for (int i = 0; i < _count; i++)
+            {
+                if (_circularBuffer[i].DurationMs.HasValue)
+                {
+                    latencies.Add(_circularBuffer[i].DurationMs.Value);
+                }
+            }
+            AverageLatencyMs = latencies.Count > 0 ? latencies.Average() : null;
+        }
+        finally
+        {
+            _lock.ExitReadLock();
+        }
+        RequestUiUpdate();
+    }
+
     public void Dispose()
     {
         _cts.Cancel();
         _throughputTimer.Dispose();
+        _uiUpdateTimer.Dispose();
         _lock.Dispose();
     }
 }
