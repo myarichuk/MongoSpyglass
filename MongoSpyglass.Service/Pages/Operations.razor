@@ -17,7 +17,7 @@
         <div class="w-px h-8 bg-outline-variant/50"></div>
         <div class="flex flex-col">
             <span class="font-ui-label-sm text-ui-label-sm text-on-surface-variant uppercase">Avg Read Latency</span>
-            <span class="font-display-mono text-[16px] text-secondary font-medium mt-0.5">@(_avgLatency?.ToString("F1") ?? "N/A") <span class="text-[12px] text-on-surface-variant">ms</span></span>
+            <span class="font-display-mono text-[16px] text-secondary font-medium mt-0.5">@(TrafficMonitor.AverageLatencyMs?.ToString("F1") ?? "N/A") <span class="text-[12px] text-on-surface-variant">ms</span></span>
         </div>
         <div class="w-px h-8 bg-outline-variant/50"></div>
         <div class="flex flex-col">
@@ -32,7 +32,7 @@
     </div>
 
     <!-- Dense Operations Table (The Feed) -->
-    <div class="flex-1 overflow-auto bg-surface relative">
+    <div class="flex-1 overflow-auto bg-surface relative min-h-0">
         <table class="w-full text-left border-collapse table-fixed">
             <colgroup>
                 <col class="w-[120px]"/> <!-- Timestamp -->
@@ -55,13 +55,12 @@
                 </tr>
             </thead>
             <tbody class="divide-y divide-outline-variant/30 font-code-block text-code-block bg-surface-dim/30">
-                @foreach (var entry in TrafficMonitor.Traffic)
-                {
+                <Virtualize Items="@_trafficSnapshot" Context="entry">
                     <tr class="hover:bg-surface-container-high transition-colors group cursor-pointer" @onclick="@(() => ShowDetails(entry))">
                         <td class="py-cell-padding-y px-cell-padding-x text-on-surface-variant text-[12px] align-top">@entry.Timestamp.ToString("HH:mm:ss.fff")</td>
                         <td class="py-cell-padding-y px-cell-padding-x align-top flex flex-col gap-1">
                             <span class="px-1.5 py-0.5 rounded-sm bg-surface-container-highest border border-outline-variant/50 text-secondary-fixed text-[11px] w-fit">@entry.Command</span>
-                            @if (entry.Command == "getMore" || entry.PayloadJson.Contains("\"cursor\"") || entry.PayloadJson.Contains("\"cursorId\""))
+                            @if (entry.Command == "getMore" || (entry.RawBson != null && entry.SummaryJson.Contains("\"cursor\"")))
                             {
                                 <span class="px-1 py-0.5 rounded-sm bg-tertiary/10 text-tertiary text-[9px] font-bold border border-tertiary/20 w-fit">CURSOR</span>
                             }
@@ -77,10 +76,10 @@
                             @(entry.DocumentCount > 0 ? entry.DocumentCount.ToString() : "-")
                         </td>
                         <td class="py-cell-padding-y px-cell-padding-x text-on-surface-variant text-[12px] align-top truncate max-w-0 pr-4">
-                            @entry.PayloadJson
+                            @entry.SummaryJson
                         </td>
                     </tr>
-                }
+                </Virtualize>
             </tbody>
         </table>
     </div>
@@ -88,26 +87,28 @@
     <!-- Bottom Status Bar -->
     <div class="h-6 bg-surface-container-lowest border-t border-outline-variant flex items-center px-4 justify-between shrink-0 font-ui-label-sm text-[10px] text-on-surface-variant uppercase tracking-wider">
         <div class="flex items-center gap-4">
-            <span class="flex items-center gap-1.5"><span class="w-1.5 h-1.5 rounded-full bg-secondary-fixed"></span> Connected to Primary</span>
+            <span class="flex items-center gap-1.5"><span class="w-1.5 h-1.5 rounded-full bg-secondary-fixed"></span> MongoDB Proxy Active</span>
             <span>@_opsCount Events Captured</span>
         </div>
         <div>
-            Profiling Level: 2 (All Operations)
+            Monitoring All Traffic
         </div>
     </div>
 </div>
 
 @code {
     private int _opsCount => TrafficMonitor.Traffic.Count();
-    private double? _avgLatency => TrafficMonitor.Traffic.Where(t => t.DurationMs.HasValue).Average(t => t.DurationMs);
+    private IReadOnlyList<DecryptedTraffic> _trafficSnapshot = new List<DecryptedTraffic>();
 
     protected override void OnInitialized()
     {
         TrafficMonitor.OnTrafficReceived += HandleTrafficReceived;
+        _trafficSnapshot = TrafficMonitor.Traffic;
     }
 
     private async void HandleTrafficReceived()
     {
+        _trafficSnapshot = TrafficMonitor.Traffic;
         await InvokeAsync(StateHasChanged);
     }
 
@@ -115,7 +116,14 @@
     {
         await DialogService.OpenAsync<OperationDetail>("Operation Details", 
             new Dictionary<string, object> { { "Entry", entry } },
-            new DialogOptions { Width = "900px", Height = "700px", Resizable = true, Draggable = true });
+            new DialogOptions { 
+                Width = "1000px", 
+                Height = "800px", 
+                Resizable = true, 
+                Draggable = true,
+                CloseDialogOnOverlayClick = true,
+                CloseDialogOnEsc = true
+            });
     }
 
     public void Dispose()

@@ -1,0 +1,97 @@
+@using MongoDB.Bson
+@using MongoDB.Bson.IO
+
+<div class="bson-tree font-code-block text-[13px]">
+    @if (Value.IsBsonDocument)
+    {
+        <div class="flex items-center gap-1 cursor-pointer hover:text-primary transition-colors" @onclick="Toggle">
+            <span class="material-symbols-outlined text-[14px] transform @(IsExpanded ? "rotate-90" : "") transition-transform">chevron_right</span>
+            <span class="text-outline">{</span>
+            @if (!IsExpanded)
+            {
+                <span class="text-on-surface-variant text-[11px]"> @Value.AsBsonDocument.ElementCount items </span>
+                <span class="text-outline">}</span>
+            }
+        </div>
+        @if (IsExpanded)
+        {
+            <div class="pl-4 border-l border-outline-variant/30 ml-1.5 flex flex-col gap-0.5">
+                @foreach (var element in Value.AsBsonDocument)
+                {
+                    <div class="flex gap-2">
+                        <span class="text-secondary">"@element.Name"</span>
+                        <span class="text-outline">:</span>
+                        <BsonVisualizer Value="@element.Value" />
+                    </div>
+                }
+            </div>
+            <div class="text-outline">}</div>
+        }
+    }
+    else if (Value.IsBsonArray)
+    {
+        <div class="flex items-center gap-1 cursor-pointer hover:text-primary transition-colors" @onclick="Toggle">
+            <span class="material-symbols-outlined text-[14px] transform @(IsExpanded ? "rotate-90" : "") transition-transform">chevron_right</span>
+            <span class="text-outline">[</span>
+            @if (!IsExpanded)
+            {
+                <span class="text-on-surface-variant text-[11px]"> @Value.AsBsonArray.Count items </span>
+                <span class="text-outline">]</span>
+            }
+        </div>
+        @if (IsExpanded)
+        {
+            <div class="pl-4 border-l border-outline-variant/30 ml-1.5 flex flex-col gap-0.5">
+                @for (int i = 0; i < Value.AsBsonArray.Count; i++)
+                {
+                    <div class="flex gap-2">
+                        <BsonVisualizer Value="@Value.AsBsonArray[i]" />
+                        @if (i < Value.AsBsonArray.Count - 1)
+                        {
+                            <span class="text-outline">,</span>
+                        }
+                    </div>
+                }
+            </div>
+            <div class="text-outline">]</div>
+        }
+    }
+    else
+    {
+        <span class="@GetValueColorClass()">@FormattedValue</span>
+    }
+</div>
+
+@code {
+    [Parameter] public BsonValue Value { get; set; } = BsonNull.Value;
+    [Parameter] public bool InitiallyExpanded { get; set; } = false;
+
+    private bool IsExpanded { get; set; }
+
+    protected override void OnInitialized()
+    {
+        IsExpanded = InitiallyExpanded;
+    }
+
+    private void Toggle() => IsExpanded = !IsExpanded;
+
+    private string FormattedValue => Value.BsonType switch
+    {
+        BsonType.String => $"\"{Value.AsString}\"",
+        BsonType.ObjectId => $"ObjectId(\"{Value}\")",
+        BsonType.DateTime => $"ISODate(\"{Value.ToUniversalTime():yyyy-MM-ddTHH:mm:ss.fffZ}\")",
+        BsonType.Boolean => Value.AsBoolean.ToString().ToLower(),
+        BsonType.Null => "null",
+        _ => Value.ToString()
+    };
+
+    private string GetValueColorClass() => Value.BsonType switch
+    {
+        BsonType.String => "text-[#A5D6FF]",
+        BsonType.Int32 or BsonType.Int64 or BsonType.Double or BsonType.Decimal128 => "text-[#D2A8FF]",
+        BsonType.Boolean => "text-[#79C0FF]",
+        BsonType.ObjectId or BsonType.DateTime => "text-[#FFA657]",
+        BsonType.Null => "text-on-surface-variant/60",
+        _ => "text-on-surface"
+    };
+}

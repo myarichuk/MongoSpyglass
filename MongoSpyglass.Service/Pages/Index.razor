@@ -125,42 +125,52 @@
 </div>
 
 @code {
-    private int _totalOps => TrafficMonitor.Traffic.Count();
-    private double? _avgLatency => TrafficMonitor.Traffic.Any(t => t.DurationMs.HasValue) ? TrafficMonitor.Traffic.Where(t => t.DurationMs.HasValue).Average(t => t.DurationMs) : null;
-    private double? _maxLatency => TrafficMonitor.Traffic.Any(t => t.DurationMs.HasValue) ? TrafficMonitor.Traffic.Where(t => t.DurationMs.HasValue).Max(t => t.DurationMs) : null;
-
-    private IEnumerable<KeyValuePair<string, int>> _topCommands => TrafficMonitor.Traffic
-        .GroupBy(t => t.Command)
-        .Select(g => new KeyValuePair<string, int>(g.Key, g.Count()))
-        .OrderByDescending(kv => kv.Value)
-        .Take(5);
-
-    private IEnumerable<DecryptedTraffic> _slowQueries => TrafficMonitor.Traffic
-        .Where(t => t.DurationMs > 100)
-        .Take(10);
-
+    private int _totalOps = 0;
+    private double? _avgLatency;
+    private double? _maxLatency;
+    private IEnumerable<KeyValuePair<string, int>> _topCommands = Enumerable.Empty<KeyValuePair<string, int>>();
+    private IEnumerable<DecryptedTraffic> _slowQueries = Enumerable.Empty<DecryptedTraffic>();
     private List<LatencyPoint> _latencyHistory = new();
 
     protected override void OnInitialized()
     {
         TrafficMonitor.OnTrafficReceived += HandleTrafficReceived;
-        UpdateHistory();
+        RefreshMetrics();
     }
 
-    private async void HandleTrafficReceived()
+    private void RefreshMetrics()
     {
-        UpdateHistory();
-        await InvokeAsync(StateHasChanged);
-    }
+        var traffic = TrafficMonitor.Traffic;
+        _totalOps = traffic.Count;
+        
+        var latencies = traffic.Where(t => t.DurationMs.HasValue).Select(t => t.DurationMs!.Value).ToList();
+        _avgLatency = latencies.Count > 0 ? latencies.Average() : null;
+        _maxLatency = latencies.Count > 0 ? latencies.Max() : null;
 
-    private void UpdateHistory()
-    {
-        _latencyHistory = TrafficMonitor.Traffic
+        _topCommands = traffic
+            .GroupBy(t => t.Command)
+            .Select(g => new KeyValuePair<string, int>(g.Key, g.Count()))
+            .OrderByDescending(kv => kv.Value)
+            .Take(5)
+            .ToList();
+
+        _slowQueries = traffic
+            .Where(t => t.DurationMs > 100)
+            .Take(10)
+            .ToList();
+
+        _latencyHistory = traffic
             .Where(t => t.DurationMs.HasValue)
             .Take(20)
             .Reverse()
             .Select(t => new LatencyPoint { Timestamp = t.Timestamp, Latency = t.DurationMs!.Value })
             .ToList();
+    }
+
+    private async void HandleTrafficReceived()
+    {
+        RefreshMetrics();
+        await InvokeAsync(StateHasChanged);
     }
 
     public void Dispose()
