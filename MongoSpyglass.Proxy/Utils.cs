@@ -11,7 +11,7 @@ namespace MongoSpyglass.Proxy;
 
 internal unsafe class Utils
 {
-    private static readonly RecyclableMemoryStreamManager RecyclableMemoryStreamManager = new();
+    internal static readonly RecyclableMemoryStreamManager RecyclableMemoryStreamManager = new();
 
     public static BsonDocument DeserializeBsonFromStream(Stream stream)
     {
