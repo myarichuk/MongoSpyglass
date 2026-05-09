@@ -49,6 +49,8 @@ public class RavenStorageService(ILogger<RavenStorageService> logger) : IDisposa
     private readonly CancellationTokenSource _bulkCts = new();
     private static readonly RecyclableMemoryStreamManager _streamManager = new();
 
+    public event Action<string>? OnSessionChanged;
+
     public void Initialize(bool isEmbedded = true, string? remoteUrl = null, string database = "MongoSpyglass")
     {
         if (isEmbedded)
@@ -105,6 +107,7 @@ public class RavenStorageService(ILogger<RavenStorageService> logger) : IDisposa
         await session.SaveChangesAsync();
 
         _activeSessionId = newSession.Id;
+        OnSessionChanged?.Invoke(newSession.Id);
         return newSession;
     }
 
@@ -128,6 +131,18 @@ public class RavenStorageService(ILogger<RavenStorageService> logger) : IDisposa
         if (_store == null || id == null) return;
         using var session = _store.OpenAsyncSession();
         session.Delete(id);
+        await session.SaveChangesAsync();
+    }
+
+    public async Task DeleteAllInsightsAsync()
+    {
+        if (_store == null) return;
+        using var session = _store.OpenAsyncSession();
+        var insights = await session.Query<MongoInsight>().ToListAsync();
+        foreach (var insight in insights)
+        {
+            session.Delete(insight.Id);
+        }
         await session.SaveChangesAsync();
     }
 

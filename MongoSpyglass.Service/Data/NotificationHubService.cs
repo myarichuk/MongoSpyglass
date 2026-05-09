@@ -81,6 +81,17 @@ public class NotificationHubService
         OnNotificationsUpdated?.Invoke();
     }
 
+    public async Task DismissAllAsync()
+    {
+        lock (_lock)
+        {
+            _notifications.Clear();
+        }
+
+        await _ravenService.DeleteAllInsightsAsync();
+        OnNotificationsUpdated?.Invoke();
+    }
+
     public List<MongoInsight> GetAll()
     {
         lock (_lock) return _notifications.OrderByDescending(n => n.Timestamp).ToList();
