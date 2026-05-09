@@ -48,7 +48,7 @@
     {
         await DialogService.OpenAsync<InsightDetail>(insight.Title, 
             new Dictionary<string, object> { { "Insight", insight } },
-            new DialogOptions { Width = "600px" });
+            new DialogOptions { Width = "700px", Height = "600px", Resizable = true, Draggable = true });
     }
 
     private async Task Dismiss(MongoInsight insight)
