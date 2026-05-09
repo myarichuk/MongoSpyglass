@@ -102,7 +102,7 @@ public static unsafe class ArenaBsonReader
         {
             BlittableBsonConstants.BsonType.Double => dataPos + 8,
             BlittableBsonConstants.BsonType.String or
-            BlittableBsonConstants.BsonType.Symbol =>
+            (BlittableBsonConstants.BsonType)14 => // Symbol
                 dataPos + 4 + SafeReadInt32(ptr, dataPos, totalLen),
             BlittableBsonConstants.BsonType.Document or
             BlittableBsonConstants.BsonType.Array or
