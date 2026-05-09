@@ -352,9 +352,10 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
             var latencies = new List<double>();
             for (int i = 0; i < _count; i++)
             {
-                if (_circularBuffer[i].DurationMs.HasValue)
+                var duration = _circularBuffer[i].DurationMs;
+                if (duration.HasValue)
                 {
-                    latencies.Add(_circularBuffer[i].DurationMs.Value);
+                    latencies.Add(duration.Value);
                 }
             }
             AverageLatencyMs = latencies.Count > 0 ? latencies.Average() : null;

@@ -131,7 +131,7 @@
 
     protected override void OnParametersSet()
     {
-        _requestBson = BsonUtils.ToBsonValue(Entry.RawBson, Entry.OpCode);
-        _responseBson = BsonUtils.ToBsonValue(Entry.ResponseBson, Entry.OpCode);
+        _requestBson = MongoSpyglass.Service.Data.BsonUtils.ToBsonValue(Entry.RawBson, Entry.OpCode);
+        _responseBson = MongoSpyglass.Service.Data.BsonUtils.ToBsonValue(Entry.ResponseBson, Entry.OpCode);
     }
 }

@@ -176,8 +176,8 @@
                 Namespace = g.Key.Collection,
                 Command = g.Key.Command,
                 Payload = g.First().SummaryJson,
-                MaxTime = g.Max(t => t.DurationMs!.Value),
-                AvgTime = g.Average(t => t.DurationMs!.Value),
+                MaxTime = g.Max(t => t.DurationMs ?? 0),
+                AvgTime = g.Average(t => t.DurationMs ?? 0),
                 AvgSize = g.Average(t => t.SizeBytes),
                 Count = g.Count()
             })

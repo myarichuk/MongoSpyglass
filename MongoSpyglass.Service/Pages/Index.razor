@@ -143,7 +143,7 @@
         var traffic = TrafficMonitor.Traffic;
         _totalOps = traffic.Count;
         
-        var latencies = traffic.Where(t => t.DurationMs.HasValue).Select(t => t.DurationMs!.Value).ToList();
+        var latencies = traffic.Where(t => t.DurationMs.HasValue).Select(t => t.DurationMs ?? 0).ToList();
         _avgLatency = latencies.Count > 0 ? latencies.Average() : null;
         _maxLatency = latencies.Count > 0 ? latencies.Max() : null;
 
@@ -163,7 +163,7 @@
             .Where(t => t.DurationMs.HasValue)
             .Take(20)
             .Reverse()
-            .Select(t => new LatencyPoint { Timestamp = t.Timestamp, Latency = t.DurationMs!.Value })
+            .Select(t => new LatencyPoint { Timestamp = t.Timestamp, Latency = t.DurationMs ?? 0 })
             .ToList();
     }
 
