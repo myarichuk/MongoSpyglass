@@ -8,7 +8,7 @@
         <span class="font-ui-label-sm text-on-surface-variant uppercase tracking-wider">Recent Insights</span>
         @if (NotificationHub.GetAll().Count > 0)
         {
-            <RadzenButton Text="Dismiss All" ButtonStyle="ButtonStyle.Base" Variant="Variant.Text" Size="ButtonSize.Small" Click="@DismissAll" class="text-primary" />
+            <RadzenButton Text="Dismiss All" ButtonStyle="ButtonStyle.Primary" Variant="Variant.Text" Size="ButtonSize.Small" Click="@DismissAll" class="text-primary" />
         }
     </div>
     @if (NotificationHub.GetAll().Count == 0)
