@@ -155,7 +155,10 @@ public class MongoDbProxy : IHostedService
 
                 reader.AdvanceTo(buffer.Start, buffer.End);
 
-                if (result.IsCompleted) break;
+                if (result.IsCompleted)
+                {
+                    break;
+                }
             }
         }
         catch (OperationCanceledException)
@@ -218,6 +221,8 @@ public class MongoDbProxy : IHostedService
             var bodyPtr = bytes + headerSize;
             int bodyLength = (int)message.Length - headerSize;
 
+            var fullBodySpan = new ReadOnlySpan<byte>(bodyPtr, bodyLength);
+
             int docCount = 0;
             double? durationMs = null;
             if (tag == "from" && responseTo != 0 && correlationBuffer.TryGetRequest(responseTo, out var reqMetrics))
@@ -230,35 +235,66 @@ public class MongoDbProxy : IHostedService
                 correlationBuffer.RecordRequest(requestId, new OperationMetrics { TimestampStart = System.Diagnostics.Stopwatch.GetTimestamp(), OpCode = opCode, RequestId = requestId });
             }
 
-            // Adjust bodyPtr for BSON document extraction based on OpCode
+            // Pointer for metadata extraction
+            byte* metadataPtr = bodyPtr;
+            int metadataLen = bodyLength;
+
+            // Adjust metadataPtr for BSON document extraction based on OpCode
             if (opCode == OpCode.OP_MSG)
             {
-                // OP_MSG: flagBits (4) + kind (1) + document
-                bodyPtr += 5;
-                bodyLength -= 5;
+                // OP_MSG: flagBits (4) + sections + [optional checksum (4)]
+                int flagBits = BinaryPrimitives.ReadInt32LittleEndian(new ReadOnlySpan<byte>(metadataPtr, 4));
+                bool checksumPresent = (flagBits & 1) != 0;
+                
+                if (checksumPresent)
+                {
+                    metadataLen -= 4;
+                }
+
+                // First section kind (1) + document
+                metadataPtr += 5;
+                metadataLen -= 5;
             }
             else if (opCode == OpCode.OP_QUERY)
             {
                 // OP_QUERY: flags (4) + fullCollectionName (CString) + numberToSkip (4) + numberToReturn (4) + query (BSON)
-                byte* p = bodyPtr + 4; // skip flags
-                while (*p != 0) p++; // skip CString
-                p++; // skip null terminator
+                byte* p = metadataPtr + 4; // skip flags
+                while (p < metadataPtr + metadataLen && *p != 0) p++; // skip CString
+                if (p < metadataPtr + metadataLen) p++; // skip null terminator
                 p += 8; // skip skip/return
-                bodyLength -= (int)(p - bodyPtr);
-                bodyPtr = p;
+                metadataLen -= (int)(p - metadataPtr);
+                metadataPtr = p;
             }
             else if (opCode == OpCode.OP_REPLY)
             {
                 // OP_REPLY: flags (4) + cursorId (8) + startingFrom (4) + numberReturned (4)
-                if (bodyLength >= 20)
+                if (metadataLen >= 20)
                 {
-                    docCount = BinaryPrimitives.ReadInt32LittleEndian(new ReadOnlySpan<byte>(bodyPtr + 16, 4));
-                    bodyPtr += 20;
-                    bodyLength -= 20;
+                    docCount = BinaryPrimitives.ReadInt32LittleEndian(new ReadOnlySpan<byte>(metadataPtr + 16, 4));
+                    metadataPtr += 20;
+                    metadataLen -= 20;
                 }
             }
+            else if (opCode == OpCode.OP_GET_MORE)
+            {
+                // OP_GET_MORE: ZERO (4) + fullCollectionName (CString) + numberToReturn (4) + cursorId (8)
+                // No BSON document to parse here, but we should identify it.
+                metadataLen = 0; 
+            }
+            else if (opCode == OpCode.OP_KILL_CURSORS)
+            {
+                // OP_KILL_CURSORS: ZERO (4) + numberOfCursors (4) + cursorIds (int64[])
+                metadataLen = 0;
+            }
+            else if (opCode == (OpCode)2001 || opCode == (OpCode)2002 || opCode == (OpCode)2006)
+            {
+                // Legacy OP_UPDATE (2001), OP_INSERT (2002), OP_DELETE (2006)
+                // We'll mark them as identified but currently not deep-parsing BSON headers for these
+                // to avoid malformed BSON errors.
+                metadataLen = 0; 
+            }
 
-            var doc = bodyLength >= 5 ? Bson.ArenaBsonReader.ReadInPlace(bodyPtr, bodyLength, arena) : default;
+            var doc = metadataLen >= 5 ? Bson.ArenaBsonReader.ReadInPlace(metadataPtr, metadataLen, arena) : default;
             
             if (opCode == OpCode.OP_MSG && !doc.IsDefault)
             {
@@ -277,7 +313,7 @@ public class MongoDbProxy : IHostedService
                 }
             }
 
-            var observed = new ObservedMessage(tag, connectionId, requestId, responseTo, opCode, doc, tracker, durationMs, (int)message.Length, docCount);
+            var observed = new ObservedMessage(tag, connectionId, requestId, responseTo, opCode, doc, bodyPtr, bodyLength, tracker, durationMs, (int)message.Length, docCount);
 
             foreach (var listener in _listeners)
             {

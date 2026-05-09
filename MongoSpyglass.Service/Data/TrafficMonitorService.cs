@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Threading.Channels;
+using System.Buffers.Binary;
 using MongoSpyglass.Proxy;
 using MongoSpyglass.Proxy.WireProtocol;
 using MongoSpyglass.Proxy.Bson;
@@ -17,10 +18,81 @@ public record DecryptedTraffic
     public string OpCode { get; init; } = string.Empty;
     public string Command { get; init; } = string.Empty;
     public string Collection { get; init; } = string.Empty;
-    public byte[]? RawBson { get; init; } // REPLACED: PayloadJson
+    public byte[]? RawBson { get; init; }
     public double? DurationMs { get; init; }
     public int SizeBytes { get; init; }
     public int DocumentCount { get; init; }
+
+    public string PayloadJson 
+    {
+        get 
+        {
+            if (RawBson == null || RawBson.Length == 0) return "{}";
+            try 
+            {
+                if (OpCode == "OP_MSG")
+                {
+                    return ParseOpMsg(RawBson);
+                }
+
+                var doc = BsonSerializer.Deserialize<BsonDocument>(RawBson);
+                return doc.ToJson(new JsonWriterSettings { Indent = true });
+            } 
+            catch 
+            {
+                return "{ \"error\": \"failed to parse bson\" }";
+            }
+        }
+    }
+
+    private static string ParseOpMsg(byte[] bytes)
+    {
+        var result = new BsonDocument();
+        ReadOnlyMemory<byte> memory = bytes;
+        
+        if (memory.Length < 4) return "{}";
+        
+        int flagBits = BinaryPrimitives.ReadInt32LittleEndian(memory.Span);
+        bool checksumPresent = (flagBits & 1) != 0;
+        int dataLen = memory.Length - (checksumPresent ? 4 : 0);
+        
+        int pos = 4;
+        while (pos < dataLen)
+        {
+            byte kind = memory.Span[pos++];
+            if (kind == 0) // Body
+            {
+                int docLen = BinaryPrimitives.ReadInt32LittleEndian(memory.Span.Slice(pos));
+                var doc = BsonSerializer.Deserialize<BsonDocument>(memory.Slice(pos, docLen).ToArray());
+                foreach (var el in doc) result[el.Name] = el.Value;
+                pos += docLen;
+            }
+            else if (kind == 1) // Sequence
+            {
+                int seqSize = BinaryPrimitives.ReadInt32LittleEndian(memory.Span.Slice(pos));
+                int seqEnd = pos + seqSize;
+                pos += 4;
+                
+                // Read identifier
+                int identStart = pos;
+                while (pos < seqEnd && memory.Span[pos] != 0) pos++;
+                string identifier = System.Text.Encoding.UTF8.GetString(memory.Span.Slice(identStart, pos - identStart).ToArray());
+                pos++; // null
+                
+                var array = new BsonArray();
+                while (pos < seqEnd)
+                {
+                    int docLen = BinaryPrimitives.ReadInt32LittleEndian(memory.Span.Slice(pos));
+                    array.Add(BsonSerializer.Deserialize<BsonDocument>(memory.Slice(pos, docLen).ToArray()));
+                    pos += docLen;
+                }
+                result[identifier] = array;
+            }
+            else break;
+        }
+
+        return result.ToJson(new JsonWriterSettings { Indent = true });
+    }
 }
 
 public class TrafficMonitorService : ITrafficListener, IDisposable
@@ -30,7 +102,7 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
     private int _head = 0;
     private int _count = 0;
     private readonly ReaderWriterLockSlim _lock = new();
-    private readonly ConcurrentDictionary<int, (DateTime Start, int Size)> _pendingRequests = new();
+    private readonly ConcurrentDictionary<int, (MongoOperation Op, byte[]? Bson)> _pendingRequests = new();
     
     private readonly Channel<ObservedMessage> _incomingChannel;
     private readonly CancellationTokenSource _cts = new();
@@ -58,6 +130,46 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
         _throughputTimer = new System.Timers.Timer(1000);
         _throughputTimer.Elapsed += (s, e) => CalculateThroughput();
         _throughputTimer.Start();
+
+        // Preload data from resumed session
+        Task.Run(async () => {
+            var activeSessionId = await GetActiveSessionIdAsync();
+            if (activeSessionId != null)
+            {
+                var history = await _ravenService.GetLatestOperationsAsync(activeSessionId, 1000);
+                _lock.EnterWriteLock();
+                try {
+                    // History is desc, we want to add in chronological order
+                    foreach (var item in history.AsEnumerable().Reverse())
+                    {
+                        var entry = new DecryptedTraffic
+                        {
+                            Timestamp = item.Op.Timestamp,
+                            Tag = "to", // Assumption for preloaded request view
+                            RequestId = item.Op.RequestId,
+                            OpCode = item.Op.Command == "find" ? "OP_QUERY" : "OP_MSG",
+                            Command = item.Op.Command,
+                            Collection = item.Op.Collection,
+                            RawBson = item.Bson,
+                            DurationMs = item.Op.DurationMs,
+                            SizeBytes = item.Op.SizeBytes,
+                            DocumentCount = item.Op.DocumentCount
+                        };
+
+                        _circularBuffer[_head] = entry;
+                        _head = (_head + 1) % MaxItems;
+                        if (_count < MaxItems) _count++;
+                    }
+                } finally { _lock.ExitWriteLock(); }
+                OnTrafficReceived?.Invoke();
+            }
+        });
+    }
+
+    private async Task<string?> GetActiveSessionIdAsync()
+    {
+        var sessions = await _ravenService.GetSessionsAsync();
+        return sessions.FirstOrDefault(x => x.IsActive)?.Id;
     }
 
     private void CalculateThroughput()
@@ -131,13 +243,23 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
                 {
                     if (msg.Tag == "from")
                     {
-                        if (_pendingRequests.TryRemove(msg.ResponseTo, out var req))
+                        if (_pendingRequests.TryRemove(msg.ResponseTo, out var pending))
                         {
-                            var duration = (DateTime.Now - req.Start).TotalMilliseconds;
+                            var duration = (DateTime.Now - pending.Op.Timestamp).TotalMilliseconds;
+                            var finalOp = pending.Op with 
+                            { 
+                                DurationMs = duration,
+                                SizeBytes = pending.Op.SizeBytes + msg.MessageSizeBytes,
+                                DocumentCount = msg.DocumentCount
+                            };
+
+                            // Persist COMPLETED operation to RavenDB
+                            _ = _ravenService.StoreOperationAsync(finalOp, pending.Bson);
+
                             _lock.EnterWriteLock();
                             try
                             {
-                                // Find in circular buffer to update duration/size
+                                // Find in circular buffer to update duration/size/docCount
                                 for (int i = 0; i < _count; i++)
                                 {
                                     int index = (_head - 1 - i + MaxItems) % MaxItems;
@@ -146,7 +268,8 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
                                         _circularBuffer[index] = _circularBuffer[index] with 
                                         { 
                                             DurationMs = duration,
-                                            SizeBytes = _circularBuffer[index].SizeBytes + msg.MessageSizeBytes
+                                            SizeBytes = finalOp.SizeBytes,
+                                            DocumentCount = finalOp.DocumentCount
                                         };
                                         break;
                                     }
@@ -160,8 +283,6 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
                         OnTrafficReceived?.Invoke();
                         continue;
                     }
-
-                    _pendingRequests[msg.RequestId] = (DateTime.Now, msg.MessageSizeBytes);
 
                     string cmdName = "unknown";
                     string collection = "N/A";
@@ -187,25 +308,47 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
                                     {
                                         collection = msg.Document.GetString(collOff);
                                     }
-                                    else if (msg.Document.TryGetElementOffset("$db", out var dbOff))
-                                    {
-                                        collection = msg.Document.GetString(dbOff);
-                                    }
-                                    else if (msg.Document.ContainsKey(cmdName))
+                                    else if (msg.Document.TryGetElementOffset(cmdName.AsSpan(), out var valOff))
                                     {
                                          try {
-                                            collection = msg.Document.GetString(cmdName.AsSpan());
-                                         } catch { }
+                                            // Many commands have { "cmd": "collection" }
+                                            collection = msg.Document.GetString(valOff);
+                                         } catch { 
+                                            // If it's not a string (e.g. { "ping": 1 }), use $db or keep N/A
+                                            if (msg.Document.TryGetElementOffset("$db", out var dbOff))
+                                            {
+                                                collection = $"$db:{msg.Document.GetString(dbOff)}";
+                                            }
+                                         }
                                     }
                                 }
+                                else
+                                {
+                                    cmdName = $"unknown_empty_bson_{(int)msg.OpCode}";
+                                }
+                                break;
+                            default:
+                                cmdName = $"unknown_unhandled_op_{(int)msg.OpCode}";
                                 break;
                         }
-
-                        // Noise filtering
-                        if (!ShowHello && IsNoisyCommand(cmdName))
+                    }
+                    else
+                    {
+                        cmdName = msg.OpCode switch
                         {
-                            continue;
-                        }
+                            OpCode.OP_GET_MORE => "getMore",
+                            OpCode.OP_KILL_CURSORS => "killCursors",
+                            (OpCode)2001 => "update",
+                            (OpCode)2002 => "insert",
+                            (OpCode)2006 => "delete",
+                            _ => $"unknown_failed_bson_{(int)msg.OpCode}"
+                        };
+                    }
+
+                    // Noise filtering
+                    if (!ShowHello && IsNoisyCommand(cmdName))
+                    {
+                        continue;
                     }
 
                     var entry = new DecryptedTraffic
@@ -215,14 +358,13 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
                         OpCode = msg.OpCode.ToString(),
                         Command = cmdName,
                         Collection = collection,
-                        RawBson = msg.Document.AsReadOnlySpan().ToArray(),
+                        RawBson = msg.FullBody.ToArray(),
                         DurationMs = msg.DurationMs,
                         SizeBytes = msg.MessageSizeBytes,
                         DocumentCount = msg.DocumentCount
                     };
 
-                    // Persist to RavenDB
-                    _ = _ravenService.StoreOperationAsync(new MongoOperation
+                    var op = new MongoOperation
                     {
                         RequestId = msg.RequestId,
                         Collection = collection,
@@ -231,7 +373,10 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
                         SizeBytes = msg.MessageSizeBytes,
                         DocumentCount = msg.DocumentCount,
                         Timestamp = entry.Timestamp
-                    }, entry.RawBson);
+                    };
+
+                    // Store in pending for correlation
+                    _pendingRequests[msg.RequestId] = (op, entry.RawBson);
 
                     _lock.EnterWriteLock();
                     try

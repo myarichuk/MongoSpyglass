@@ -1,0 +1,77 @@
+@page "/settings"
+@using MongoSpyglass.Service.Data
+@inject SettingsService SettingsService
+@inject NotificationService NotificationService
+
+<RadzenContent Container="main">
+    <ChildContent>
+        <RadzenText Text="System Settings" TextStyle="TextStyle.H4" />
+        
+        <RadzenCard class="rz-my-4">
+            <RadzenStack Gap="1.5rem">
+                <RadzenStack Orientation="Orientation.Horizontal" AlignItems="AlignItems.Center" Gap="1rem">
+                    <RadzenText Text="Proxy Port" Style="width: 150px;" />
+                    <RadzenNumeric @bind-Value="@_settings.ProxyPort" Style="width: 100px;" />
+                    <RadzenText Text="(Requires Restart)" TextStyle="TextStyle.Caption" />
+                </RadzenStack>
+
+                <RadzenStack Orientation="Orientation.Horizontal" AlignItems="AlignItems.Center" Gap="1rem">
+                    <RadzenText Text="Target MongoDB" Style="width: 150px;" />
+                    <RadzenTextBox @bind-Value="@_settings.MongoDbUrl" Style="width: 300px;" />
+                </RadzenStack>
+
+                <RadzenStack Orientation="Orientation.Horizontal" AlignItems="AlignItems.Center" Gap="1rem">
+                    <RadzenText Text="Slow Query (ms)" Style="width: 150px;" />
+                    <RadzenNumeric @bind-Value="@_settings.SlowQueryThresholdMs" Style="width: 100px;" />
+                </RadzenStack>
+
+                <RadzenStack Orientation="Orientation.Horizontal" AlignItems="AlignItems.Center" Gap="1rem">
+                    <RadzenText Text="RavenDB Mode" Style="width: 150px;" />
+                    <RadzenSelectBar TValue="bool" @bind-Value="@_settings.RavenEmbedded">
+                        <Items>
+                            <RadzenSelectBarItem Text="Embedded" Value="true" />
+                            <RadzenSelectBarItem Text="Remote" Value="false" />
+                        </Items>
+                    </RadzenSelectBar>
+                </RadzenStack>
+
+                @if (!_settings.RavenEmbedded)
+                {
+                    <RadzenStack Orientation="Orientation.Horizontal" AlignItems="AlignItems.Center" Gap="1rem">
+                        <RadzenText Text="Raven URL" Style="width: 150px;" />
+                        <RadzenTextBox @bind-Value="@_settings.RavenRemoteUrl" Style="width: 300px;" />
+                    </RadzenStack>
+                }
+
+                <RadzenStack Orientation="Orientation.Horizontal" JustifyContent="JustifyContent.End" class="rz-mt-4">
+                    <RadzenButton Text="Save Settings" Icon="save" Click="@Save" ButtonStyle="ButtonStyle.Primary" />
+                </RadzenStack>
+            </RadzenStack>
+        </RadzenCard>
+    </ChildContent>
+</RadzenContent>
+
+@code {
+    private AppSettings _settings = new();
+
+    protected override void OnInitialized()
+    {
+        // Clone current settings
+        var current = SettingsService.Current;
+        _settings = new AppSettings
+        {
+            ProxyPort = current.ProxyPort,
+            MongoDbUrl = current.MongoDbUrl,
+            RavenEmbedded = current.RavenEmbedded,
+            RavenRemoteUrl = current.RavenRemoteUrl,
+            RavenDatabase = current.RavenDatabase,
+            SlowQueryThresholdMs = current.SlowQueryThresholdMs
+        };
+    }
+
+    private void Save()
+    {
+        SettingsService.Update(_settings);
+        NotificationService.Notify(new NotificationMessage { Severity = NotificationSeverity.Success, Summary = "Settings Saved", Detail = "Some changes may require restart." });
+    }
+}

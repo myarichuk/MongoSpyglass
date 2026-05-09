@@ -56,7 +56,11 @@ public class CursorAnalyzer : IAnalyzerPlugin
                                 stats.TotalDocs += msg.DocumentCount;
 
                                 var cursorList = _connectionToCursors.GetOrAdd(msg.ConnectionId, _ => new());
-                                lock(cursorList) { if (!cursorList.Contains(id)) cursorList.Add(id); }
+                                lock(cursorList) { if (!cursorList.Contains(id))
+                                    {
+                                        cursorList.Add(id);
+                                    }
+                                }
                             }
                             else if (id == 0 && msg.ResponseTo != 0)
                             {
@@ -109,7 +113,10 @@ public class CursorAnalyzer : IAnalyzerPlugin
             if (_pendingGetMores.Count > 1000)
             {
                 var keys = _pendingGetMores.Keys.Take(100).ToList();
-                foreach (var k in keys) _pendingGetMores.TryRemove(k, out _);
+                foreach (var k in keys)
+                {
+                    _pendingGetMores.TryRemove(k, out _);
+                }
             }
         }
         finally
@@ -142,7 +149,8 @@ public class CursorAnalyzer : IAnalyzerPlugin
                 "Open Cursors",
                 $"There are currently {active.Count} active cursors.",
                 InsightLevel.Info,
-                string.Join("\n", active.Select(s => $"ID: {s.Id} | NS: {s.Namespace} | Duration: {(DateTime.Now - s.StartTime).TotalSeconds:F1}s | Data: {s.TotalBytes / 1024.0:F1} KB | Rows: {s.TotalDocs}"))
+                string.Join("\n", active.Select(s => $"ID: {s.Id} | NS: {s.Namespace} | Duration: {(DateTime.Now - s.StartTime).TotalSeconds:F1}s | Data: {s.TotalBytes / 1024.0:F1} KB | Rows: {s.TotalDocs}")),
+                Category: "Cursors"
             );
         }
 
@@ -153,7 +161,8 @@ public class CursorAnalyzer : IAnalyzerPlugin
                 "Abandoned Cursors",
                 $"{leaky.Count} cursors were abandoned due to connection closure.",
                 InsightLevel.Warning,
-                string.Join("\n", leaky.Select(s => $"ID: {s.Id} | NS: {s.Namespace} | Rows: {s.TotalDocs}"))
+                string.Join("\n", leaky.Select(s => $"ID: {s.Id} | NS: {s.Namespace} | Rows: {s.TotalDocs}")),
+                Category: "Cursors"
             );
         }
     }

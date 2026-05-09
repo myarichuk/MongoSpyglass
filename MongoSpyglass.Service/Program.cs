@@ -9,7 +9,7 @@ using Serilog;
 
 Log.Logger = new LoggerConfiguration()
     .WriteTo.Console()
-    .WriteTo.File("Logs/service-log.txt", rollingInterval: RollingInterval.Day)
+    //.WriteTo.File("Logs/service-log.txt", rollingInterval: RollingInterval.Day)
     .CreateLogger();
 
 var builder = WebApplication.CreateBuilder(args);
@@ -22,6 +22,8 @@ builder.Services.AddSingleton<TrafficMonitorService>();
 builder.Services.AddSingleton<ITrafficListener>(sp => sp.GetRequiredService<TrafficMonitorService>());
 
 builder.Services.AddSingleton<RavenStorageService>();
+builder.Services.AddSingleton<SettingsService>();
+builder.Services.AddSingleton<NotificationHubService>();
 
 builder.Services.AddSingleton<SlowQueryAnalyzer>();
 builder.Services.AddSingleton<ITrafficListener>(sp => sp.GetRequiredService<SlowQueryAnalyzer>());
@@ -43,9 +45,6 @@ builder.Services.AddHostedService(sp =>
 
     return new MongoDbProxy(new IPEndPoint(serverAddr, serverPort), incomingPort, logger, listeners);
 });
-
-// Create a container builder
-var containerBuilder = new ContainerBuilder();
 
 // Add any custom registrations here
 // containerBuilder.RegisterType<YourType>().As<IYourInterface>();

@@ -4,6 +4,7 @@
 @namespace MongoSpyglass.Service.Pages
 @inject TrafficMonitorService TrafficMonitor
 @inject IEnumerable<IAnalyzerPlugin> Analyzers
+@inject DialogService DialogService
 @implements IDisposable
 
 <main class="flex-1 overflow-auto p-container-padding flex flex-col gap-gutter">
@@ -95,7 +96,7 @@
                     {
                         @foreach (var insight in _insights.Take(10))
                         {
-                            <div class="bg-surface-container-highest border border-outline-variant/50 rounded p-3 flex flex-col gap-2 relative overflow-hidden group hover:border-secondary/50 transition-colors">
+                            <div class="bg-surface-container-highest border border-outline-variant/50 rounded p-3 flex flex-col gap-2 relative overflow-hidden group hover:border-secondary/50 transition-colors cursor-pointer" @onclick="@(() => ShowInsightDetail(insight))">
                                 <div class="absolute top-0 right-0 w-1 @(GetInsightColorClass(insight.Level)) h-full"></div>
                                 <div class="flex justify-between items-start">
                                     <div class="font-ui-label-sm text-ui-label-sm font-bold text-on-surface">@insight.Title</div>
@@ -104,15 +105,8 @@
                                     </div>
                                 </div>
                                 <div class="text-[11px] text-on-surface-variant leading-tight">@insight.Description</div>
-                                @if (!string.IsNullOrEmpty(insight.Details))
-                                {
-                                    <details class="mt-2 text-[10px] text-on-surface-variant bg-surface-container-low p-2 rounded border border-outline-variant/30">
-                                        <summary class="cursor-pointer hover:text-secondary font-bold uppercase tracking-wider">Technical Details</summary>
-                                        <pre class="mt-2 whitespace-pre-wrap font-display-mono overflow-x-auto">@insight.Details</pre>
-                                    </details>
-                                }
                                 <div class="mt-1 flex justify-end">
-                                    <button class="px-3 py-1 bg-secondary/10 opacity-50 cursor-not-allowed pointer-events-none text-secondary border border-secondary/30 rounded font-ui-label-sm text-[10px]">Action</button>
+                                    <button class="px-3 py-1 bg-secondary/10 text-secondary border border-secondary/30 rounded font-ui-label-sm text-[10px] hover:bg-secondary/20 transition-colors">View Details</button>
                                 </div>
                             </div>
                         }
@@ -195,6 +189,13 @@
     public void Dispose()
     {
         TrafficMonitor.OnTrafficReceived -= HandleTrafficReceived;
+    }
+
+    private async Task ShowInsightDetail(Insight insight)
+    {
+        await DialogService.OpenAsync<InsightDetail>(insight.Title, 
+            new Dictionary<string, object> { { "Insight", insight } },
+            new DialogOptions { Width = "600px" });
     }
 
     private string GetInsightColorClass(InsightLevel level) => level switch
