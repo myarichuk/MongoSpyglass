@@ -3,6 +3,7 @@ using Raven.Embedded;
 using System.Collections.Concurrent;
 using System.Threading.Channels;
 using MongoSpyglass.Proxy;
+using Microsoft.IO;
 
 namespace MongoSpyglass.Service.Data;
 
@@ -45,6 +46,7 @@ public class RavenStorageService(ILogger<RavenStorageService> logger) : IDisposa
     private readonly Channel<(MongoOperation Op, byte[]? Bson)> _bulkChannel = Channel.CreateBounded<(MongoOperation, byte[]?)>(10000);
     private Task? _bulkWorkerTask;
     private readonly CancellationTokenSource _bulkCts = new();
+    private static readonly RecyclableMemoryStreamManager _streamManager = new();
 
     public void Initialize(bool isEmbedded = true, string? remoteUrl = null, string database = "MongoSpyglass")
     {
@@ -158,7 +160,7 @@ public class RavenStorageService(ILogger<RavenStorageService> logger) : IDisposa
                 using var attachment = await session.Advanced.Attachments.GetAsync(op.Id, "raw.bson");
                 if (attachment != null)
                 {
-                    using var ms = new MemoryStream();
+                    using var ms = _streamManager.GetStream();
                     await attachment.Stream.CopyToAsync(ms);
                     bson = ms.ToArray();
                 }
@@ -209,19 +211,23 @@ public class RavenStorageService(ILogger<RavenStorageService> logger) : IDisposa
                 // Attachments MUST be stored via standard session as BulkInsert doesn't support them
                 // We do this in parallel to not block the next bulk batch
                 _ = Task.Run(async () => {
+                    var streams = new List<MemoryStream>();
                     try {
                         using var session = _store.OpenAsyncSession();
                         foreach (var item in items)
                         {
                             if (item.Bson != null && item.Bson.Length > 0 && item.Op.Id != null)
                             {
-                                using var ms = new MemoryStream(item.Bson);
+                                var ms = _streamManager.GetStream(item.Bson);
+                                streams.Add(ms);
                                 session.Advanced.Attachments.Store(item.Op.Id, "raw.bson", ms);
                             }
                         }
                         await session.SaveChangesAsync();
                     } catch (Exception ex) {
                         logger.LogError(ex, "Error storing attachments");
+                    } finally {
+                        foreach (var s in streams) s.Dispose();
                     }
                 }, CancellationToken.None);
             }
