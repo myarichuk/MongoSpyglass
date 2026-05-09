@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:latest
+    ports:
+      - "27017:27017"
+
+  mongospyglass:
+    build:
+      context: .
+      dockerfile: MongoSpyglass.Service/Dockerfile
+    ports:
+      - "8080:8080"
+      - "27018:27018"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - Proxy__MongoDbServer=mongodb
+      - Proxy__MongoDbPort=27017
+      - Proxy__IncomingPort=27018
+    depends_on:
+      - mongodb
+
+  demoapp:
+    build:
+      context: DemoApp/DemoApp
+      dockerfile: Dockerfile
+    ports:
+      - "5000:8080"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+    depends_on:
+      - mongospyglass
