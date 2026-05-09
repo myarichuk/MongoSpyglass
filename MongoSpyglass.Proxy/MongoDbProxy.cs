@@ -251,15 +251,41 @@ public class MongoDbProxy : IHostedService
                     metadataLen -= 4;
                 }
 
-                // First section kind (1) + document
-                metadataPtr += 5;
-                metadataLen -= 5;
+                // Move past flagBits
+                metadataPtr += 4;
+                metadataLen -= 4;
+
+                // Find the first Kind 0 section (Body)
+                byte* p = metadataPtr;
+                while (p < metadataPtr + metadataLen)
+                {
+                    byte kind = *p++;
+                    if (kind == 0)
+                    {
+                        metadataLen -= (int)(p - metadataPtr);
+                        metadataPtr = p;
+                        break;
+                    }
+                    else if (kind == 1)
+                    {
+                        int seqSize = BinaryPrimitives.ReadInt32LittleEndian(new ReadOnlySpan<byte>(p, 4));
+                        p += seqSize;
+                    }
+                    else break;
+                }
             }
             else if (opCode == OpCode.OP_QUERY)
             {
                 // OP_QUERY: flags (4) + fullCollectionName (CString) + numberToSkip (4) + numberToReturn (4) + query (BSON)
                 byte* p = metadataPtr + 4; // skip flags
-                while (p < metadataPtr + metadataLen && *p != 0) p++; // skip CString
+                
+                // Extract collection name for better identification
+                byte* collStart = p;
+                while (p < metadataPtr + metadataLen && *p != 0) p++; 
+                if (tag == "to") {
+                     // We could store the collection name here if ObservedMessage had a field for it
+                }
+
                 if (p < metadataPtr + metadataLen) p++; // skip null terminator
                 p += 8; // skip skip/return
                 metadataLen -= (int)(p - metadataPtr);

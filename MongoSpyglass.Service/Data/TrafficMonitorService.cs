@@ -204,6 +204,7 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
                                         _circularBuffer[index].SizeBytes = finalOp.SizeBytes;
                                         _circularBuffer[index].DocumentCount = finalOp.DocumentCount;
                                         _circularBuffer[index].ResponseBson = responseBson;
+                                        _circularBuffer[index].ResponseOpCode = msg.OpCode.ToString();
                                         break;
                                     }
                                 }
@@ -220,16 +221,15 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
                     string cmdName = "unknown";
                     string collection = "N/A";
 
+                    byte[] fullBody = msg.FullBody.ToArray();
+
                     if (!msg.Document.IsDefault)
                     {
                         switch (msg.OpCode)
                         {
                             case OpCode.OP_QUERY:
-                                if (msg.Document.TryGetElementOffset("collection", out var colOffset))
-                                {
-                                    collection = msg.Document.GetString(colOffset);
-                                }
                                 cmdName = "find";
+                                collection = ExtractCollectionFromLegacy(fullBody);
                                 break;
                             case OpCode.OP_MSG:
                                 if (msg.Document.KeysEnumerable.Any())
@@ -244,10 +244,8 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
                                     else if (msg.Document.TryGetElementOffset(cmdName.AsSpan(), out var valOff))
                                     {
                                          try {
-                                            // Many commands have { "cmd": "collection" }
                                             collection = msg.Document.GetString(valOff);
                                          } catch { 
-                                            // If it's not a string (e.g. { "ping": 1 }), use $db or keep N/A
                                             if (msg.Document.TryGetElementOffset("$db", out var dbOff))
                                             {
                                                 collection = $"$db:{msg.Document.GetString(dbOff)}";
@@ -276,6 +274,11 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
                             (OpCode)2006 => "delete",
                             _ => $"unknown_failed_bson_{(int)msg.OpCode}"
                         };
+
+                        if (msg.OpCode == OpCode.OP_GET_MORE || (int)msg.OpCode is 2001 or 2002 or 2006)
+                        {
+                            collection = ExtractCollectionFromLegacy(fullBody);
+                        }
                     }
 
                     // Noise filtering
@@ -291,7 +294,7 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
                         OpCode = msg.OpCode.ToString(),
                         Command = cmdName,
                         Collection = collection,
-                        RawBson = msg.FullBody.ToArray(),
+                        RawBson = fullBody,
                         DurationMs = msg.DurationMs,
                         SizeBytes = msg.MessageSizeBytes,
                         DocumentCount = msg.DocumentCount
@@ -342,6 +345,16 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
     {
         return cmd == "hello" || cmd == "isMaster" || cmd == "ismaster" || cmd == "ping" || 
                cmd == "buildinfo" || cmd == "buildInfo" || cmd == "whatsmyuri" || cmd == "listDatabases";
+    }
+
+    private string ExtractCollectionFromLegacy(byte[] body)
+    {
+        if (body.Length < 5) return "N/A";
+        int pos = 4; // Skip flags
+        int start = pos;
+        while (pos < body.Length && body[pos] != 0) pos++;
+        if (pos == start) return "N/A";
+        return System.Text.Encoding.UTF8.GetString(body, start, pos - start);
     }
 
     private void CalculateAvgLatency()
