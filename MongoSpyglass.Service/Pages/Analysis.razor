@@ -140,8 +140,10 @@
 </main>
 
 @code {
-    private int _totalOps => TrafficMonitor.Traffic.Count();
-    private IEnumerable<Insight> _insights => Analyzers.SelectMany(a => a.GetInsights()).Reverse();
+    private int _totalOps = 0;
+    private IEnumerable<Insight> _insights = Enumerable.Empty<Insight>();
+    private IEnumerable<AggregatedQuery> _slowestGroups = Enumerable.Empty<AggregatedQuery>();
+    private IEnumerable<KeyValuePair<string, int>> _frequentPatterns = Enumerable.Empty<KeyValuePair<string, int>>();
 
     private class AggregatedQuery
     {
@@ -154,35 +156,46 @@
         public int Count { get; set; }
     }
 
-    private IEnumerable<AggregatedQuery> _slowestGroups => TrafficMonitor.Traffic
-        .Where(t => t.DurationMs.HasValue)
-        .GroupBy(t => new { t.Collection, t.Command })
-        .Select(g => new AggregatedQuery
-        {
-            Namespace = g.Key.Collection,
-            Command = g.Key.Command,
-            Payload = g.First().PayloadJson,
-            MaxTime = g.Max(t => t.DurationMs!.Value),
-            AvgTime = g.Average(t => t.DurationMs!.Value),
-            AvgSize = g.Average(t => t.SizeBytes),
-            Count = g.Count()
-        })
-        .OrderByDescending(g => g.MaxTime)
-        .Take(10);
-
-    private IEnumerable<KeyValuePair<string, int>> _frequentPatterns => TrafficMonitor.Traffic
-        .GroupBy(t => $"{t.Command}: {t.Collection}")
-        .Select(g => new KeyValuePair<string, int>(g.Key, g.Count()))
-        .OrderByDescending(kv => kv.Value)
-        .Take(5);
-
     protected override void OnInitialized()
     {
         TrafficMonitor.OnTrafficReceived += HandleTrafficReceived;
+        RefreshAnalysis();
+    }
+
+    private void RefreshAnalysis()
+    {
+        var traffic = TrafficMonitor.Traffic;
+        _totalOps = traffic.Count;
+        _insights = Analyzers.SelectMany(a => a.GetInsights()).Reverse().ToList();
+
+        _slowestGroups = traffic
+            .Where(t => t.DurationMs.HasValue)
+            .GroupBy(t => new { t.Collection, t.Command })
+            .Select(g => new AggregatedQuery
+            {
+                Namespace = g.Key.Collection,
+                Command = g.Key.Command,
+                Payload = g.First().SummaryJson,
+                MaxTime = g.Max(t => t.DurationMs!.Value),
+                AvgTime = g.Average(t => t.DurationMs!.Value),
+                AvgSize = g.Average(t => t.SizeBytes),
+                Count = g.Count()
+            })
+            .OrderByDescending(g => g.MaxTime)
+            .Take(10)
+            .ToList();
+
+        _frequentPatterns = traffic
+            .GroupBy(t => $"{t.Command}: {t.Collection}")
+            .Select(g => new KeyValuePair<string, int>(g.Key, g.Count()))
+            .OrderByDescending(kv => kv.Value)
+            .Take(5)
+            .ToList();
     }
 
     private async void HandleTrafficReceived()
     {
+        RefreshAnalysis();
         await InvokeAsync(StateHasChanged);
     }
 
