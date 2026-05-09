@@ -55,7 +55,7 @@
                 </tr>
             </thead>
             <tbody class="divide-y divide-outline-variant/30 font-code-block text-code-block bg-surface-dim/30">
-                <Virtualize Items="@_trafficSnapshot" Context="entry">
+                <Virtualize Items="@_trafficSnapshot" TItem="DecryptedTraffic" Context="entry">
                     <tr class="hover:bg-surface-container-high transition-colors group cursor-pointer" @onclick="@(() => ShowDetails(entry))">
                         <td class="py-cell-padding-y px-cell-padding-x text-on-surface-variant text-[12px] align-top">@entry.Timestamp.ToString("HH:mm:ss.fff")</td>
                         <td class="py-cell-padding-y px-cell-padding-x align-top flex flex-col gap-1">
