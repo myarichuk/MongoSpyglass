@@ -22,17 +22,20 @@ namespace MongoSpyglass.Proxy;
 public class MongoDbProxy : IHostedService
 {
     private readonly AsyncRetryPolicy _retryPolicy;
-    private readonly CancellationTokenSource _cts = new();
-    private readonly IPEndPoint _mongoDbServer;
-    private readonly int _port;
+    private readonly IProxySettingsProvider _settingsProvider;
     private readonly ILogger<MongoDbProxy> _logger;
     private readonly IEnumerable<ITrafficListener> _listeners;
+    private readonly object _lifecycleLock = new();
+    
+    private IPEndPoint _mongoDbServer = new(IPAddress.Loopback, 27017);
+    private int _port = 27018;
     private TcpListener? _listener;
+    private CancellationTokenSource? _runCts;
+    private Task? _acceptTask;
 
-    public MongoDbProxy(IPEndPoint mongoDbServer, int incomingPort, ILogger<MongoDbProxy> logger, IEnumerable<ITrafficListener> listeners)
+    public MongoDbProxy(IProxySettingsProvider settingsProvider, ILogger<MongoDbProxy> logger, IEnumerable<ITrafficListener> listeners)
     {
-        _mongoDbServer = mongoDbServer;
-        _port = incomingPort;
+        _settingsProvider = settingsProvider;
         _logger = logger;
         _listeners = listeners;
 
@@ -42,29 +45,98 @@ public class MongoDbProxy : IHostedService
                 attempt => TimeSpan.FromSeconds(Math.Pow(2, attempt)),
                 (exception, timeSpan, retryCount, context) =>
                 {
-                    _logger.LogError(exception, $"Retry {retryCount} after {timeSpan.Seconds} seconds delay due to '{context["Message"]}'");
+                    _logger.LogError(exception, $"Retry {retryCount} after {timeSpan.Seconds} seconds delay");
                 });
+
+        _settingsProvider.OnSettingsChanged += HandleSettingsChanged;
+    }
+
+    private void HandleSettingsChanged()
+    {
+        _logger.LogInformation("Proxy settings changed, restarting listener...");
+        _ = RestartProxyAsync();
+    }
+
+    private async Task RestartProxyAsync()
+    {
+        await StopProxyInternalAsync();
+        StartProxyInternal();
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
-        _listener = new TcpListener(IPAddress.Any, _port);
-        _listener.Start();
-        _logger.LogInformation($"Started listening on incoming port {_port}");
-
-        _ = Task.Run(AcceptConnectionsAsync, _cts.Token);
-
+        StartProxyInternal();
         return Task.CompletedTask;
     }
 
-    private async Task AcceptConnectionsAsync()
+    private void StartProxyInternal()
     {
-        while (!_cts.IsCancellationRequested)
+        lock (_lifecycleLock)
+        {
+            if (_runCts != null) return; // Already running
+
+            var settings = _settingsProvider.GetCurrentSettings();
+            _mongoDbServer = settings.TargetServer;
+            _port = settings.IncomingPort;
+
+            _runCts = new CancellationTokenSource();
+            _listener = new TcpListener(IPAddress.Any, _port);
+            
+            try 
+            {
+                _listener.Start();
+                _logger.LogInformation($"Proxy started: listening on port {_port}, forwarding to {_mongoDbServer}");
+                _acceptTask = Task.Run(() => AcceptConnectionsAsync(_runCts.Token), _runCts.Token);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogCritical(ex, $"Failed to start proxy listener on port {_port}");
+                _runCts.Cancel();
+                _runCts = null;
+            }
+        }
+    }
+
+    public async Task StopAsync(CancellationToken cancellationToken)
+    {
+        await StopProxyInternalAsync();
+    }
+
+    private async Task StopProxyInternalAsync()
+    {
+        CancellationTokenSource? cts;
+        Task? acceptTask;
+
+        lock (_lifecycleLock)
+        {
+            _logger.LogInformation("Stopping proxy listener...");
+            _listener?.Stop();
+            _listener = null;
+            cts = _runCts;
+            acceptTask = _acceptTask;
+            _runCts = null;
+            _acceptTask = null;
+        }
+
+        if (cts != null)
+        {
+            cts.Cancel();
+            if (acceptTask != null)
+            {
+                try { await acceptTask; } catch { }
+            }
+            cts.Dispose();
+        }
+    }
+
+    private async Task AcceptConnectionsAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
         {
             TcpClient client;
             try
             {
-                client = await _listener!.AcceptTcpClientAsync(_cts.Token);
+                client = await _listener!.AcceptTcpClientAsync(ct);
             }
             catch (OperationCanceledException)
             {
@@ -72,26 +144,38 @@ public class MongoDbProxy : IHostedService
             }
             catch (Exception e)
             {
-                _logger.LogError(e, "Error accepting client connection");
+                if (!ct.IsCancellationRequested)
+                {
+                    _logger.LogError(e, "Error accepting client connection");
+                }
                 continue;
             }
 
-            _ = Task.Run(() => ProxyConnection(client), _cts.Token);
+            _ = Task.Run(() => ProxyConnection(client, ct), ct);
         }
     }
 
-    private async Task ProxyConnection(TcpClient client)
+    private async Task ProxyConnection(TcpClient client, CancellationToken ct)
     {
         using var clientScope = client;
         var connectionId = Guid.NewGuid().ToString("N");
         _logger.LogDebug($"Accepted connection {connectionId} from {client.Client.RemoteEndPoint}");
 
         using var server = new TcpClient();
-        await server.ConnectAsync(_mongoDbServer.Address, _mongoDbServer.Port);
-        _logger.LogDebug($"Connected to MongoDB server {_mongoDbServer}");
+        try 
+        {
+            await server.ConnectAsync(_mongoDbServer.Address, _mongoDbServer.Port, ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, $"Failed to connect {connectionId} to target MongoDB server {_mongoDbServer}");
+            return;
+        }
+
+        _logger.LogDebug($"Connected {connectionId} to MongoDB server {_mongoDbServer}");
 
         using var correlationBuffer = new CorrelationRingBuffer();
-        using var connectionCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        using var connectionCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
 
         var clientStream = client.GetStream();
         var serverStream = server.GetStream();
@@ -122,13 +206,6 @@ public class MongoDbProxy : IHostedService
                 listener.OnConnectionClosed(connectionId);
             }
         }
-    }
-
-    public Task StopAsync(CancellationToken cancellationToken)
-    {
-        _cts.Cancel();
-        _listener?.Stop();
-        return Task.CompletedTask;
     }
 
     private async Task ProcessPipeAsync(PipeReader reader, PipeWriter writer, string tag, string connectionId, CorrelationRingBuffer correlationBuffer, CancellationToken ct)
@@ -207,6 +284,8 @@ public class MongoDbProxy : IHostedService
     {
         var tracker = ArenaPool.Shared.Rent();
         var arena = tracker.Arena;
+        OpCode opCode = (OpCode)0;
+
         try
         {
             var bytes = (byte*)arena.Alloc((nuint)message.Length);
@@ -215,7 +294,7 @@ public class MongoDbProxy : IHostedService
             var header = (MsgHeader*)bytes;
             int requestId = header->RequestID;
             int responseTo = header->ResponseTo;
-            OpCode opCode = header->OpCode;
+            opCode = header->OpCode;
 
             int headerSize = Unsafe.SizeOf<MsgHeader>();
             var bodyPtr = bytes + headerSize;
@@ -338,7 +417,7 @@ public class MongoDbProxy : IHostedService
         }
         catch (Exception e)
         {
-            _logger.LogDebug(e, $"Error observing message (OpCode: {correlationBuffer.ToString()}, Conn: {connectionId})");
+            _logger.LogDebug(e, $"Error observing message (OpCode: {opCode}, Conn: {connectionId})");
             tracker.Release();
         }
     }

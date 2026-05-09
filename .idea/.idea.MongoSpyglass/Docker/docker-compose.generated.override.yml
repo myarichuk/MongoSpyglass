@@ -1,0 +1,41 @@
+# This is a generated file. Not intended for manual editing.
+version: "3.8"
+services:
+  demoapp:
+    build:
+      context: "C:\\Users\\myarichuk\\source\\repos\\MongoSpyglass\\DemoApp"
+      dockerfile: "Dockerfile"
+      target: "base"
+    command: []
+    entrypoint:
+    - "dotnet"
+    - "/app/bin/Release/net10.0/DemoApp.dll"
+    environment:
+      ASPNETCORE_STATICWEBASSETS: "/app/bin/Release/net10.0/DemoApp.staticwebassets.runtime.CT.json"
+      DOTNET_USE_POLLING_FILE_WATCHER: "true"
+    image: "demoapp:dev"
+    ports: []
+    volumes:
+    - "C:\\Users\\myarichuk\\source\\repos\\MongoSpyglass\\DemoApp:/app:rw"
+    - "C:\\Users\\myarichuk\\source\\repos\\MongoSpyglass:/src:rw"
+    - "C:\\Users\\myarichuk\\.nuget\\packages:/root/.nuget/packages"
+    working_dir: "/app"
+  mongospyglass:
+    build:
+      context: "C:\\Users\\myarichuk\\source\\repos\\MongoSpyglass"
+      dockerfile: "MongoSpyglass.Service/Dockerfile"
+      target: "base"
+    command: []
+    entrypoint:
+    - "dotnet"
+    - "/app/bin/Release/net10.0/MongoSpyglass.Service.dll"
+    environment:
+      ASPNETCORE_STATICWEBASSETS: "/app/bin/Release/net10.0/MongoSpyglass.Service.staticwebassets.runtime.CT.json"
+      DOTNET_USE_POLLING_FILE_WATCHER: "true"
+    image: "mongospyglass.service:dev"
+    ports: []
+    volumes:
+    - "C:\\Users\\myarichuk\\source\\repos\\MongoSpyglass\\MongoSpyglass.Service:/app:rw"
+    - "C:\\Users\\myarichuk\\source\\repos\\MongoSpyglass:/src:rw"
+    - "C:\\Users\\myarichuk\\.nuget\\packages:/root/.nuget/packages"
+    working_dir: "/app"

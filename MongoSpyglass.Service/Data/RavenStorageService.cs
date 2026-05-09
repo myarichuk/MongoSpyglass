@@ -275,6 +275,21 @@ public class RavenStorageService(ILogger<RavenStorageService> logger) : IDisposa
         await session.SaveChangesAsync();
     }
 
+    public async Task<AppSettings?> GetSettingsAsync()
+    {
+        if (_store == null) return null;
+        using var session = _store.OpenAsyncSession();
+        return await session.LoadAsync<AppSettings>("AppSettings/Default");
+    }
+
+    public async Task SaveSettingsAsync(AppSettings settings)
+    {
+        if (_store == null) return;
+        using var session = _store.OpenAsyncSession();
+        await session.StoreAsync(settings, "AppSettings/Default");
+        await session.SaveChangesAsync();
+    }
+
     public void Dispose()
     {
         _bulkCts.Cancel();
