@@ -251,50 +251,31 @@ public class MongoDbProxy : IHostedService
                     metadataLen -= 4;
                 }
 
-                // Improved section parsing for OP_MSG
-                int sectionOffset = 4; // after flagBits
-                if (metadataLen > sectionOffset)
-                {
-                    byte sectionKind = metadataPtr[sectionOffset];
-                    if (sectionKind == 0)
-                    {
-                        // Single document section
-                        metadataPtr += sectionOffset + 1;
-                        metadataLen -= sectionOffset + 1;
-                    }
-                    else if (sectionKind == 1)
-                    {
-                        // Document sequence: skip identifier cstring + point to first document
-                        int idStart = sectionOffset + 1;
-                        int idEnd = idStart;
-                        while (idEnd < metadataLen && metadataPtr[idEnd] != 0) idEnd++;
-                        if (idEnd < metadataLen) idEnd++; // skip null terminator
-                        metadataPtr += idEnd;
-                        metadataLen -= idEnd;
-                    }
-                    // else: unknown section kind - leave as-is (best effort)
-                }
                 // Move past flagBits
                 metadataPtr += 4;
                 metadataLen -= 4;
 
-                // Find the first Kind 0 section (Body)
+                // Iterate through sections to find the first Kind 0 (Body) section.
+                // Kind 0 contains the main command document.
                 byte* p = metadataPtr;
                 while (p < metadataPtr + metadataLen)
                 {
                     byte kind = *p++;
                     if (kind == 0)
                     {
+                        // Single document section - this is what we want
                         metadataLen -= (int)(p - metadataPtr);
                         metadataPtr = p;
                         break;
                     }
                     else if (kind == 1)
                     {
+                        // Document sequence section: skip it and look for Kind 0
+                        if (p + 4 > metadataPtr + metadataLen) break;
                         int seqSize = BinaryPrimitives.ReadInt32LittleEndian(new ReadOnlySpan<byte>(p, 4));
                         p += seqSize;
                     }
-                    else break;
+                    else break; // Unknown kind
                 }
             }
             else if (opCode == OpCode.OP_QUERY)
