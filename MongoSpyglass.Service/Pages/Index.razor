@@ -160,11 +160,13 @@
 
         _slowQueries = traffic
             .Where(t => t != null && t.DurationMs > 100)
+            .OrderByDescending(t => t.Timestamp)
             .Take(10)
             .ToList();
 
         _latencyHistory = traffic
             .Where(t => t != null && t.DurationMs.HasValue)
+            .Reverse()
             .Take(20)
             .Reverse()
             .Select(t => new LatencyPoint { Timestamp = t.Timestamp, Latency = t.DurationMs ?? 0 })
