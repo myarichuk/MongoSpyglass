@@ -3,7 +3,7 @@
 @using MongoSpyglass.Service.Analyzers
 @namespace MongoSpyglass.Service.Pages
 @inject TrafficMonitorService TrafficMonitor
-@inject CursorAnalyzer CursorTracker
+@inject ReteAnalyzerEngine ReteEngine
 @inject DialogService DialogService
 @implements IDisposable
 
@@ -22,7 +22,7 @@
         <div class="w-px h-8 bg-outline-variant/50"></div>
         <div class="flex flex-col">
             <span class="font-ui-label-sm text-ui-label-sm text-on-surface-variant uppercase">Active Cursors</span>
-            <span class="font-display-mono text-[16px] text-tertiary font-medium mt-0.5">@CursorTracker.ActiveCursorsCount</span>
+            <span class="font-display-mono text-[16px] text-tertiary font-medium mt-0.5">@ReteEngine.ActiveCursorsCount</span>
         </div>
         <div class="flex-1"></div>
         <div class="flex items-center gap-2">

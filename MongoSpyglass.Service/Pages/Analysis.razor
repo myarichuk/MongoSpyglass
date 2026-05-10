@@ -1,6 +1,7 @@
 @page "/analysis"
 @using MongoSpyglass.Service.Data
 @using MongoSpyglass.Service.Analyzers
+@using MongoSpyglass.Service.Analyzers.Rete
 @namespace MongoSpyglass.Service.Pages
 @inject TrafficMonitorService TrafficMonitor
 @inject IEnumerable<IAnalyzerPlugin> Analyzers
@@ -22,6 +23,22 @@
                 <span class="material-symbols-outlined text-[16px]">download</span>
                 Export Report
             </button>
+        </div>
+    </div>
+
+    <!-- Cursor Stats Widget -->
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+        <div class="bg-surface-container border border-outline-variant rounded p-4 flex flex-col items-center justify-center">
+            <div class="text-xs text-on-surface-variant font-ui-label-sm mb-1 uppercase tracking-wider">Active Cursors</div>
+            <div class="text-3xl font-display-mono text-primary">@(Analyzers.OfType<ReteAnalyzerEngine>().FirstOrDefault()?.ActiveCursorsCount)</div>
+        </div>
+        <div class="bg-surface-container border border-outline-variant rounded p-4 flex flex-col items-center justify-center">
+            <div class="text-xs text-on-surface-variant font-ui-label-sm mb-1 uppercase tracking-wider">Avg Open Duration (Sliding 100)</div>
+            <div class="text-3xl font-display-mono text-secondary">@(Analyzers.OfType<ReteAnalyzerEngine>().FirstOrDefault()?.GetCursorStats().AverageOpenTimeMs.ToString("F0"))ms</div>
+        </div>
+        <div class="bg-surface-container border border-outline-variant rounded p-4 flex flex-col items-center justify-center">
+            <div class="text-xs text-on-surface-variant font-ui-label-sm mb-1 uppercase tracking-wider">Total Cursors Tracked</div>
+            <div class="text-3xl font-display-mono text-tertiary">@(Analyzers.OfType<ReteAnalyzerEngine>().FirstOrDefault()?.GetCursorStats().TotalClosedCount)</div>
         </div>
     </div>
 
@@ -206,8 +223,18 @@
 
     private async Task ShowInsightDetail(Insight insight)
     {
+        var mongoInsight = new MongoInsight
+        {
+            Title = insight.Title,
+            Description = insight.Description,
+            Level = insight.Level.ToString(),
+            Category = insight.Category,
+            Details = insight.Details ?? "",
+            Timestamp = insight.Timestamp
+        };
+
         await DialogService.OpenAsync<InsightDetail>(insight.Title, 
-            new Dictionary<string, object> { { "Insight", insight } },
+            new Dictionary<string, object> { { "Insight", mongoInsight } },
             new DialogOptions { Width = "600px" });
     }
 

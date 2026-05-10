@@ -28,16 +28,26 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
         repository.Load(x => x.From(typeof(CleanupRule).Assembly));
         var factory = repository.Compile();
         _session = factory.CreateSession();
+        _session.Insert(new CursorStatsFact());
         _pool = ObjectPool.Create(new DefaultPooledObjectPolicy<MessageFact>());
 
         ravenService.OnSessionChanged += (sessionId) => {
             _insights.Clear();
+            // Clear facts in session
+            var facts = _session.Query<object>().ToList();
+            foreach (var f in facts) _session.Retract(f);
+            _session.Insert(_tick);
+            _session.Insert(new CursorStatsFact());
         };
     }
 
     public string Name => "Rete Analyzer Engine";
 
     public IEnumerable<Insight> GetInsights() => _insights.ToArray();
+
+    public int ActiveCursorsCount => _session.Query<CursorFact>().Count(x => !x.IsClosed);
+
+    public CursorStatsFact GetCursorStats() => _session.Query<CursorStatsFact>().FirstOrDefault() ?? new CursorStatsFact();
 
     public void OnMessage(in ObservedMessage msg)
     {
@@ -61,7 +71,8 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
 
     public void OnConnectionClosed(string connectionId)
     {
-        // Could insert a ConnectionClosedFact later
+        _session.Insert(new ConnectionClosedFact { ConnectionId = connectionId });
+        _session.Fire();
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -82,7 +93,6 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
             }
 
             // Periodic tick for TTL
-            // We use a non-blocking check for the timer to avoid stalling message processing
             if (timer.WaitForNextTickAsync(stoppingToken).IsCompleted)
             {
                 _tick.CurrentTime = DateTime.UtcNow;
@@ -91,7 +101,6 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
             }
             else if (!hasItems)
             {
-                // If no items and no tick, wait for something
                 try {
                     await _channel.Reader.WaitToReadAsync(stoppingToken);
                 } catch (OperationCanceledException) { break; }
@@ -101,6 +110,17 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
             if (hasItems)
             {
                 _session.Fire();
+                
+                // Harvest insights produced by rules
+                var insights = _session.Query<Insight>().ToList();
+                foreach (var insight in insights)
+                {
+                    _insights.Enqueue(insight);
+                    _session.Retract(insight);
+                    
+                    // Limit insights
+                    while (_insights.Count > 100) _insights.TryDequeue(out _);
+                }
             }
         }
     }
