@@ -17,7 +17,7 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
     private int _head = 0;
     private int _count = 0;
     private readonly ReaderWriterLockSlim _lock = new();
-    private readonly ConcurrentDictionary<int, (MongoOperation Op, byte[]? Bson)> _pendingRequests = new();
+    private readonly ConcurrentDictionary<(string ConnectionId, int RequestId), (MongoOperation Op, byte[]? Bson)> _pendingRequests = new();
     
     private readonly Channel<ObservedMessage> _incomingChannel;
     private readonly CancellationTokenSource _cts = new();
@@ -192,7 +192,7 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
                 {
                     if (msg.Tag == "from")
                     {
-                        if (_pendingRequests.TryRemove(msg.ResponseTo, out var pending))
+                        if (_pendingRequests.TryRemove((msg.ConnectionId, msg.ResponseTo), out var pending))
                         {
                             var duration = (DateTime.Now - pending.Op.Timestamp).TotalMilliseconds;
                             var responseBson = msg.FullBody.ToArray();
@@ -329,7 +329,7 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
                     };
 
                     // Store in pending for correlation
-                    _pendingRequests[msg.RequestId] = (op, entry.RawBson);
+                    _pendingRequests[(msg.ConnectionId, msg.RequestId)] = (op, entry.RawBson);
 
                     _lock.EnterWriteLock();
                     try

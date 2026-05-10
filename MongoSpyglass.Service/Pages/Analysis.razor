@@ -192,7 +192,7 @@
             {
                 Namespace = g.Key.Collection,
                 Command = g.Key.Command,
-                Payload = g.First().SummaryJson,
+                Payload = g.FirstOrDefault(x => x.SummaryJson != "{}" && !string.IsNullOrWhiteSpace(x.SummaryJson))?.SummaryJson ?? "{}",
                 MaxTime = g.Max(t => t.DurationMs ?? 0),
                 AvgTime = g.Average(t => t.DurationMs ?? 0),
                 AvgSize = g.Average(t => t.SizeBytes),
