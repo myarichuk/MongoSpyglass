@@ -4,6 +4,7 @@ public class DecryptedTraffic
 {
     public DateTime Timestamp { get; set; } = DateTime.Now;
     public string Tag { get; set; } = string.Empty;
+    public string ConnectionId { get; set; } = string.Empty;
     public int RequestId { get; set; }
     public string OpCode { get; set; } = string.Empty;
     public string Command { get; set; } = string.Empty;

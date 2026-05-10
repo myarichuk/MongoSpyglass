@@ -213,7 +213,8 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
                                 for (int i = 0; i < _count; i++)
                                 {
                                     int index = (_head - 1 - i + MaxItems) % MaxItems;
-                                    if (_circularBuffer[index].RequestId == msg.ResponseTo)
+                                    if (_circularBuffer[index].ConnectionId == msg.ConnectionId && 
+                                        _circularBuffer[index].RequestId == msg.ResponseTo)
                                     {
                                         _circularBuffer[index].DurationMs = duration;
                                         _circularBuffer[index].SizeBytes = finalOp.SizeBytes;
@@ -305,6 +306,7 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
                     var entry = new DecryptedTraffic
                     {
                         Tag = msg.Tag,
+                        ConnectionId = msg.ConnectionId,
                         RequestId = msg.RequestId,
                         OpCode = msg.OpCode.ToString(),
                         Command = cmdName,
