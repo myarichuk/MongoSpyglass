@@ -377,6 +377,39 @@ public class RavenStorageService(ILogger<RavenStorageService> logger) : IDisposa
         return await session.LoadAsync<CursorStatsFact>($"CursorStats/{sessionId}");
     }
 
+    public async Task<byte[]> ExportSessionDataAsync(string sessionId, DateTime? start, DateTime? end)
+    {
+        if (_store == null) return Array.Empty<byte>();
+
+        using var ms = new MemoryStream();
+        
+        // We'll export specific collections and filter using a transform script
+        // Note: Smuggler export is usually for the whole DB, but we can filter by collection.
+        var options = new Raven.Client.Documents.Smuggler.DatabaseSmugglerExportOptions
+        {
+            OperateOnTypes = Raven.Client.Documents.Smuggler.DatabaseItemType.Documents,
+            Collections = new List<string> { "MongoSessions", "MongoOperations", "MongoInsights", "CursorFacts", "CursorStatsFacts" },
+            TransformScript = $@"
+                if (this['@metadata']['@collection'] === 'MongoSessions') {{
+                    if (this.Id !== '{sessionId}') return;
+                }} else {{
+                    if (this.SessionId !== '{sessionId}') return;
+                }}
+
+                if (this.Timestamp) {{
+                    var ts = new Date(this.Timestamp);
+                    {(start.HasValue ? $"if (ts < new Date('{start.Value:yyyy-MM-ddTHH:mm:ss}')) return;" : "")}
+                    {(end.HasValue ? $"if (ts > new Date('{end.Value:yyyy-MM-ddTHH:mm:ss}')) return;" : "")}
+                }}
+            "
+        };
+
+        var operation = await _store.Smuggler.ExportAsync(options, ms);
+        await operation.WaitForCompletionAsync();
+
+        return ms.ToArray();
+    }
+
     public void Dispose()
     {
         _bulkCts.Cancel();

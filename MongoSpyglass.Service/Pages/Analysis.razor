@@ -4,6 +4,7 @@
 @using MongoSpyglass.Service.Analyzers.Rete
 @namespace MongoSpyglass.Service.Pages
 @inject TrafficMonitorService TrafficMonitor
+@inject RavenStorageService RavenService
 @inject IEnumerable<IAnalyzerPlugin> Analyzers
 @inject DialogService DialogService
 @implements IDisposable
@@ -19,9 +20,9 @@
                 <span class="material-symbols-outlined text-[16px]">calendar_today</span>
                 Last 24h
             </button>
-            <button class="flex items-center gap-1.5 px-3 py-1.5 bg-primary/10 border border-primary/30 text-primary rounded opacity-50 cursor-not-allowed pointer-events-none font-ui-label-sm text-ui-label-sm">
+            <button class="flex items-center gap-1.5 px-3 py-1.5 bg-primary/10 border border-primary/30 text-primary rounded hover:bg-primary/20 transition-colors font-ui-label-sm text-ui-label-sm" @onclick="@ShowExportDialog">
                 <span class="material-symbols-outlined text-[16px]">download</span>
-                Export Report
+                Export Session
             </button>
         </div>
     </div>
@@ -227,6 +228,20 @@
     public void Dispose()
     {
         TrafficMonitor.OnTrafficReceived -= HandleTrafficReceived;
+    }
+
+    private async Task ShowExportDialog()
+    {
+        var activeSessionId = RavenService.ActiveSessionId;
+        if (string.IsNullOrEmpty(activeSessionId))
+        {
+            await DialogService.Alert("No active session to export.", "Export Session");
+            return;
+        }
+
+        await DialogService.OpenAsync<ExportDialog>("Export Session Data",
+            new Dictionary<string, object> { { "SessionId", activeSessionId } },
+            new DialogOptions { Width = "500px" });
     }
 
     private async Task ShowDetails(DecryptedTraffic entry)

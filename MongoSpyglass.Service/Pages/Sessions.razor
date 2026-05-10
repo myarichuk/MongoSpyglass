@@ -3,6 +3,7 @@
 @inject RavenStorageService RavenService
 @inject NotificationService NotificationService
 @inject DialogService DialogService
+@inject NavigationManager NavigationManager
 
 <RadzenContent Container="main">
     <ChildContent>
@@ -15,33 +16,42 @@
             </RadzenStack>
         </RadzenCard>
 
-        <RadzenDataGrid Data="@_sessions" TItem="MongoSession" AllowPaging="true" PageSize="10" AllowSorting="true" class="rz-shadow-2">
-            <Columns>
-                <RadzenDataGridColumn TItem="MongoSession" Property="Name" Title="Name" />
-                <RadzenDataGridColumn TItem="MongoSession" Property="StartTime" Title="Started" FormatString="{0:g}" />
-                <RadzenDataGridColumn TItem="MongoSession" Property="IsActive" Title="Status">
-                    <Template Context="session">
-                        @if (session.IsActive)
-                        {
-                            <RadzenBadge BadgeStyle="BadgeStyle.Success" Text="Active" />
-                        }
-                        else
-                        {
-                            <RadzenBadge BadgeStyle="BadgeStyle.Info" Text="Archived" />
-                        }
-                    </Template>
-                </RadzenDataGridColumn>
-                <RadzenDataGridColumn TItem="MongoSession" Width="250px" TextAlign="TextAlign.Center">
-                    <Template Context="session">
-                        @if (!session.IsActive)
-                        {
-                            <RadzenButton Icon="play_arrow" ButtonStyle="ButtonStyle.Success" Size="ButtonSize.Small" Text="Switch" Click="@(() => SwitchSession(session.Id))" class="rz-mr-2" />
-                        }
-                        <RadzenButton Icon="delete" ButtonStyle="ButtonStyle.Danger" Size="ButtonSize.Small" Click="@(() => DeleteSession(session))" />
-                    </Template>
-                </RadzenDataGridColumn>
-            </Columns>
-        </RadzenDataGrid>
+        @if (_sessions.Any())
+        {
+            <RadzenDataGrid Data="@_sessions" TItem="MongoSession" AllowPaging="true" PageSize="10" AllowSorting="true" class="rz-shadow-2">
+                <Columns>
+                    <RadzenDataGridColumn TItem="MongoSession" Property="Name" Title="Name" />
+                    <RadzenDataGridColumn TItem="MongoSession" Property="StartTime" Title="Started" FormatString="{0:g}" />
+                    <RadzenDataGridColumn TItem="MongoSession" Property="IsActive" Title="Status">
+                        <Template Context="session">
+                            @if (session.IsActive)
+                            {
+                                <RadzenBadge BadgeStyle="BadgeStyle.Success" Text="Active" />
+                            }
+                            else
+                            {
+                                <RadzenBadge BadgeStyle="BadgeStyle.Info" Text="Archived" />
+                            }
+                        </Template>
+                    </RadzenDataGridColumn>
+                    <RadzenDataGridColumn TItem="MongoSession" Width="250px" TextAlign="TextAlign.Center">
+                        <Template Context="session">
+                            @if (!session.IsActive)
+                            {
+                                <RadzenButton Icon="play_arrow" ButtonStyle="ButtonStyle.Success" Size="ButtonSize.Small" Text="Switch" Click="@(() => SwitchSession(session.Id))" class="rz-mr-2" />
+                            }
+                            <RadzenButton Icon="delete" ButtonStyle="ButtonStyle.Danger" Size="ButtonSize.Small" Click="@(() => DeleteSession(session))" />
+                        </Template>
+                    </RadzenDataGridColumn>
+                </Columns>
+            </RadzenDataGrid>
+        }
+        else
+        {
+            <RadzenAlert Severity="NotificationSeverity.Info" AllowClose="false" Variant="Variant.Flat" Shade="Shade.Lighter">
+                No sessions found. Please start a new session to begin profiling.
+            </RadzenAlert>
+        }
     </ChildContent>
 </RadzenContent>
 
@@ -68,22 +78,34 @@
 
         await RavenService.StartNewSessionAsync(_newSessionName);
         _newSessionName = $"Session {DateTime.Now:yyyy-MM-dd HH:mm}";
-        await LoadSessions();
         
         NotificationService.Notify(new NotificationMessage { Severity = NotificationSeverity.Success, Summary = "Session Started", Detail = "New session is now active." });
+        NavigationManager.NavigateTo("/");
     }
 
     private async Task SwitchSession(string id)
     {
         await RavenService.SwitchSessionAsync(id);
-        await LoadSessions();
         NotificationService.Notify(new NotificationMessage { Severity = NotificationSeverity.Success, Summary = "Session Switched" });
+        NavigationManager.NavigateTo("/");
     }
 
     private async Task DeleteSession(MongoSession session)
     {
         if (session.IsActive)
         {
+            var otherSessionCount = _sessions.Count(x => x.Id != session.Id);
+            
+            if (otherSessionCount == 0)
+            {
+                var confirm = await DialogService.Confirm("You are about to delete the ONLY session. You must start a new one to continue using the system.", "Delete Final Session", new ConfirmOptions { OkButtonText = "Delete & Start New", CancelButtonText = "Cancel" });
+                if (confirm != true) return;
+                
+                await RavenService.DeleteSessionAsync(session.Id);
+                await StartSession();
+                return;
+            }
+
             var result = await DialogService.OpenAsync("Delete Active Session", ds =>
                 @<RadzenStack Gap="1.5rem">
                     <p>You are about to delete the active session. What would you like to do next?</p>
@@ -96,25 +118,27 @@
 
             if ((int)result == 1)
             {
+                await RavenService.DeleteSessionAsync(session.Id);
                 await StartSession();
+                return;
             }
             else if ((int)result == 2)
             {
                 var otherSession = _sessions.FirstOrDefault(x => x.Id != session.Id);
                 if (otherSession != null)
                 {
+                    await RavenService.DeleteSessionAsync(session.Id);
                     await RavenService.SwitchSessionAsync(otherSession.Id);
-                }
-                else
-                {
-                     NotificationService.Notify(new NotificationMessage { Severity = NotificationSeverity.Warning, Summary = "No other sessions", Detail = "Please start a new session first." });
-                     return;
+                    await LoadSessions();
+                    return;
                 }
             }
         }
-
-        await RavenService.DeleteSessionAsync(session.Id);
-        await LoadSessions();
-        NotificationService.Notify(new NotificationMessage { Severity = NotificationSeverity.Info, Summary = "Session Deleted" });
+        else
+        {
+            await RavenService.DeleteSessionAsync(session.Id);
+            await LoadSessions();
+            NotificationService.Notify(new NotificationMessage { Severity = NotificationSeverity.Info, Summary = "Session Deleted" });
+        }
     }
 }

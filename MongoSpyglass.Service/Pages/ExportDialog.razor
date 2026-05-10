@@ -1,0 +1,70 @@
+@using MongoSpyglass.Service.Data
+@inject RavenStorageService RavenService
+@inject DialogService DialogService
+@inject IJSRuntime JSRuntime
+
+<RadzenStack Gap="1.5rem" class="rz-p-4">
+    <RadzenText Text="Export Session Data" TextStyle="TextStyle.H5" />
+    <p class="text-on-surface-variant text-xs">Select a date range to export operations and insights from the current session.</p>
+    
+    <RadzenStack Orientation="Orientation.Horizontal" Gap="1rem" AlignItems="AlignItems.Center">
+        <RadzenLabel Text="From:" Style="width: 50px;" />
+        <RadzenDatePicker @bind-Value="@_startDate" ShowTime="true" ShowSeconds="true" DateFormat="yyyy-MM-dd HH:mm:ss" Style="flex: 1;" />
+    </RadzenStack>
+
+    <RadzenStack Orientation="Orientation.Horizontal" Gap="1rem" AlignItems="AlignItems.Center">
+        <RadzenLabel Text="To:" Style="width: 50px;" />
+        <RadzenDatePicker @bind-Value="@_endDate" ShowTime="true" ShowSeconds="true" DateFormat="yyyy-MM-dd HH:mm:ss" Style="flex: 1;" />
+    </RadzenStack>
+
+    <RadzenAlert Severity="NotificationSeverity.Info" AllowClose="false" Variant="Variant.Flat" Shade="Shade.Lighter">
+        Data will be exported as a RavenDB-compatible JSON snapshot.
+    </RadzenAlert>
+
+    <RadzenStack Orientation="Orientation.Horizontal" JustifyContent="JustifyContent.End" Gap="0.5rem" class="rz-mt-4">
+        <RadzenButton Text="Cancel" Click="() => DialogService.Close(false)" ButtonStyle="ButtonStyle.Light" />
+        <RadzenButton Text="Export" Click="@StartExport" ButtonStyle="ButtonStyle.Primary" Icon="download" IsBusy="@_isExporting" />
+    </RadzenStack>
+</RadzenStack>
+
+@code {
+    [Parameter] public string SessionId { get; set; } = string.Empty;
+
+    private DateTime? _startDate;
+    private DateTime? _endDate;
+    private bool _isExporting = false;
+
+    protected override void OnInitialized()
+    {
+        _endDate = DateTime.Now;
+        _startDate = DateTime.Now.AddHours(-24);
+    }
+
+    private async Task StartExport()
+    {
+        _isExporting = true;
+        StateHasChanged();
+
+        try
+        {
+            // We'll generate the export data in memory for now, or stream it if it's large.
+            // For simplicity and reliably triggering a browser download, we'll use a byte array.
+            var data = await RavenService.ExportSessionDataAsync(SessionId, _startDate, _endDate);
+            
+            var fileName = $"MongoSpyglass_Export_{SessionId.Replace("/", "_")}_{DateTime.Now:yyyyMMddHHmm}.json";
+            
+            await JSRuntime.InvokeVoidAsync("downloadFileFromStream", fileName, Convert.ToBase64String(data));
+            
+            DialogService.Close(true);
+        }
+        catch (Exception ex)
+        {
+            await DialogService.Alert($"Export failed: {ex.Message}", "Error");
+        }
+        finally
+        {
+            _isExporting = false;
+            StateHasChanged();
+        }
+    }
+}
