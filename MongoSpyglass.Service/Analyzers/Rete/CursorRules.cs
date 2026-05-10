@@ -15,7 +15,8 @@ public class DetectNewCursorRule : Rule
 
         When()
             .Match<MessageFact>(() => msg, m => m.Message.Tag == "from" && !m.Message.Document.IsDefault && HasCursor(m))
-            .Match<SessionFact>(() => session);
+            .Match<SessionFact>(() => session)
+            .Not<CursorFact>(c => c.Id == GetCursorIdFromResponse(msg!) && c.ConnectionId == msg!.Message.ConnectionId);
 
         Then()
             .Do(ctx => ProcessCursorResponse(ctx, msg!, session!));
@@ -23,29 +24,40 @@ public class DetectNewCursorRule : Rule
 
     private bool HasCursor(MessageFact m) => m.Message.Document.TryGetElementOffset("cursor", out _);
 
-    private void ProcessCursorResponse(IContext ctx, MessageFact msg, SessionFact session)
+    private long GetCursorIdFromResponse(MessageFact msg)
     {
         try {
             if (msg.Message.Document.TryGetElementOffset("cursor", out var cursorOffset)) {
                 var cursorDoc = msg.Message.Document.GetDocument(cursorOffset, msg.Message.Tracker.Arena);
                 if (cursorDoc.TryGetElementOffset("id", out var idOffset)) {
-                    long id = cursorDoc.GetInt64(idOffset);
-                    if (id > 0) {
-                        string ns = "unknown";
-                        if (cursorDoc.TryGetElementOffset("ns", out var nsOffset)) ns = cursorDoc.GetString(nsOffset);
-                        
-                        var cursor = new CursorFact { 
-                            Id = id, 
-                            Namespace = ns, 
-                            ConnectionId = msg.Message.ConnectionId, 
-                            SessionId = session.Id,
-                            StartTime = msg.Timestamp, 
-                            TotalBytes = msg.Message.MessageSizeBytes, 
-                            TotalDocs = msg.Message.DocumentCount 
-                        };
-                        ctx.Insert(cursor);
-                    }
+                    return cursorDoc.GetInt64(idOffset);
                 }
+            }
+        } catch {}
+        return 0;
+    }
+
+    private void ProcessCursorResponse(IContext ctx, MessageFact msg, SessionFact session)
+    {
+        long id = GetCursorIdFromResponse(msg);
+        if (id <= 0) return;
+
+        try {
+            if (msg.Message.Document.TryGetElementOffset("cursor", out var cursorOffset)) {
+                var cursorDoc = msg.Message.Document.GetDocument(cursorOffset, msg.Message.Tracker.Arena);
+                string ns = "unknown";
+                if (cursorDoc.TryGetElementOffset("ns", out var nsOffset)) ns = cursorDoc.GetString(nsOffset);
+                
+                var cursor = new CursorFact { 
+                    Id = id, 
+                    Namespace = ns, 
+                    ConnectionId = msg.Message.ConnectionId, 
+                    SessionId = session.Id,
+                    StartTime = msg.Timestamp, 
+                    TotalBytes = msg.Message.MessageSizeBytes, 
+                    TotalDocs = msg.Message.DocumentCount 
+                };
+                ctx.Insert(cursor);
             }
         } catch {}
     }
@@ -86,7 +98,7 @@ public class TrackGetMoreRequestRule : Rule
 
         When()
             .Match<MessageFact>(() => msg, m => m.Message.Tag == "to" && !m.Message.Document.IsDefault && HasGetMore(m))
-            .Match<CursorFact>(() => cursor, c => c.Id == GetCursorId(msg!));
+            .Match<CursorFact>(() => cursor, c => c.Id == GetCursorId(msg!) && c.ConnectionId == msg!.Message.ConnectionId);
 
         Then()
             .Do(ctx => ProcessGetMoreRequest(ctx, msg!, cursor!));
