@@ -174,42 +174,40 @@
         public DecryptedTraffic? SampleInstance { get; set; }
     }
 
-    protected override void OnInitialized()
+    protected override async Task OnInitializedAsync()
     {
         TrafficMonitor.OnTrafficReceived += HandleTrafficReceived;
-        RefreshAnalysis();
+        await RefreshAnalysis();
     }
 
-    private void RefreshAnalysis()
+    private async Task RefreshAnalysis()
     {
-        var traffic = TrafficMonitor.Traffic;
-        _totalOps = traffic.Count;
+        var sessionId = RavenService.ActiveSessionId;
+        if (string.IsNullOrEmpty(sessionId)) return;
+
+        var stats = await RavenService.GetOperationStatsAsync(sessionId);
+        
+        _totalOps = stats.Sum(x => x.Count);
         _insights = Analyzers.SelectMany(a => a.GetInsights()).Reverse().ToList();
 
-        _slowestGroups = traffic
-            .Where(t => t.DurationMs.HasValue)
-            .GroupBy(t => new { t.Collection, t.Command })
-            .Select(g => {
-                var slowestInstance = g.OrderByDescending(x => x.DurationMs).First();
-                return new AggregatedQuery
-                {
-                    Namespace = g.Key.Collection,
-                    Command = g.Key.Command,
-                    Payload = g.FirstOrDefault(x => x.SummaryJson != "{}" && !string.IsNullOrWhiteSpace(x.SummaryJson))?.SummaryJson ?? "{}",
-                    MaxTime = g.Max(t => t.DurationMs ?? 0),
-                    AvgTime = g.Average(t => t.DurationMs ?? 0),
-                    AvgSize = g.Average(t => t.SizeBytes),
-                    Count = g.Count(),
-                    SampleInstance = slowestInstance
-                };
+        _slowestGroups = stats
+            .Select(s => new AggregatedQuery
+            {
+                Namespace = s.Collection,
+                Command = s.Command,
+                Payload = "{ Aggregated }",
+                MaxTime = s.MaxDurationMs,
+                AvgTime = s.TotalDurationMs / s.Count,
+                AvgSize = (double)s.TotalSizeBytes / s.Count,
+                Count = s.Count,
+                SampleInstance = null
             })
             .OrderByDescending(g => g.MaxTime)
             .Take(10)
             .ToList();
 
-        _frequentPatterns = traffic
-            .GroupBy(t => $"{t.Command}: {t.Collection}")
-            .Select(g => new KeyValuePair<string, int>(g.Key, g.Count()))
+        _frequentPatterns = stats
+            .Select(s => new KeyValuePair<string, int>($"{s.Command}: {s.Collection}", s.Count))
             .OrderByDescending(kv => kv.Value)
             .Take(5)
             .ToList();
@@ -217,7 +215,7 @@
 
     private async void HandleTrafficReceived()
     {
-        RefreshAnalysis();
+        await RefreshAnalysis();
         await InvokeAsync(StateHasChanged);
     }
 

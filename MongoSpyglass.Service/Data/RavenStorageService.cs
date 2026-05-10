@@ -1,6 +1,9 @@
 using Raven.Client.Documents;
 using Raven.Client.Documents.Operations;
+using Raven.Client.Documents.Operations.Expiration;
 using Raven.Client.Documents.Queries;
+using Raven.Client.Documents.Indexes;
+using Raven.Client.Documents.Session;
 using Raven.Embedded;
 using System.Collections.Concurrent;
 using System.Threading.Channels;
@@ -81,6 +84,14 @@ public class RavenStorageService(ILogger<RavenStorageService> logger) : IDisposa
                 Database = database
             }.Initialize();
         }
+
+        // Enable Expiration
+        _store.Maintenance.Send(new ConfigureExpirationOperation(new ExpirationConfiguration
+        {
+            Disabled = false
+        }));
+
+        IndexCreation.CreateIndexes(typeof(Operations_ByCommandAndCollection).Assembly, _store);
 
         // Resume last active session if available
         using (var session = _store.OpenSession())
@@ -263,10 +274,15 @@ public class RavenStorageService(ILogger<RavenStorageService> logger) : IDisposa
 
                 using (var bulk = _store.BulkInsert())
                 {
+                    var expiresAt = DateTime.UtcNow.AddHours(24);
                     foreach (var item in items)
                     {
                         item.Op.SessionId = _activeSessionId ?? "default";
-                        await bulk.StoreAsync(item.Op);
+                        
+                        var metadata = new Raven.Client.Json.MetadataAsDictionary();
+                        metadata["@expires"] = expiresAt;
+                        
+                        await bulk.StoreAsync(item.Op, metadata);
                     }
                 }
 
@@ -408,6 +424,15 @@ public class RavenStorageService(ILogger<RavenStorageService> logger) : IDisposa
         await operation.WaitForCompletionAsync();
 
         return ms.ToArray();
+    }
+
+    public async Task<List<Operations_ByCommandAndCollection.Result>> GetOperationStatsAsync(string sessionId)
+    {
+        if (_store == null) return new();
+        using var session = _store.OpenAsyncSession();
+        return await session.Query<Operations_ByCommandAndCollection.Result, Operations_ByCommandAndCollection>()
+            .Where(x => x.SessionId == sessionId)
+            .ToListAsync();
     }
 
     public void Dispose()
