@@ -1,9 +1,7 @@
 using SharpArena.Allocators;
-﻿using MongoDB.Bson.IO;
+using MongoDB.Bson.IO;
 using MongoDB.Bson.Serialization;
 using MongoDB.Bson;
-using System.Runtime.InteropServices;
-using SharpArena.Allocators;
 
 namespace MongoSpyglass.Proxy.WireProtocol
 {

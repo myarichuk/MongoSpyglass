@@ -1,4 +1,3 @@
-using System;
 using SharpArena.Allocators;
 
 namespace MongoSpyglass.Proxy

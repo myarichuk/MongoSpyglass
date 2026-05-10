@@ -7,7 +7,7 @@ using MongoDB.Bson.Serialization;
 
 namespace MongoSpyglass.Proxy;
 
-internal unsafe class Utils
+internal static unsafe class Utils
 {
     internal static readonly RecyclableMemoryStreamManager RecyclableMemoryStreamManager = new();
 
@@ -68,7 +68,6 @@ internal unsafe class Utils
         {
             documentBytes[index] = lengthBytes[index];
         }
-
 
         // Read the rest of the BSON document
         stream.ReadExactly(documentBytes[4..]);

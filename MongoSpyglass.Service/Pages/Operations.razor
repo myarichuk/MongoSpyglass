@@ -60,7 +60,8 @@
                         <td class="py-cell-padding-y px-cell-padding-x text-on-surface-variant text-[12px] align-top">@entry.Timestamp.ToString("HH:mm:ss.fff")</td>
                         <td class="py-cell-padding-y px-cell-padding-x align-top flex flex-col gap-1">
                             <span class="px-1.5 py-0.5 rounded-sm bg-surface-container-highest border border-outline-variant/50 text-secondary-fixed text-[11px] w-fit">@entry.Command</span>
-                            @if (entry.Command == "getMore" || (entry.RawBson != null && entry.SummaryJson.Contains("\"cursor\"")))
+                            @if (entry.Command == "getMore" || 
+                                 (entry.RawBson != null && entry.SummaryJson.Contains("\"cursor\"")))
                             {
                                 <span class="px-1 py-0.5 rounded-sm bg-tertiary/10 text-tertiary text-[9px] font-bold border border-tertiary/20 w-fit">CURSOR</span>
                             }

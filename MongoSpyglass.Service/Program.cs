@@ -26,13 +26,10 @@ builder.Services.AddSingleton<SettingsService>();
 builder.Services.AddSingleton<IProxySettingsProvider>(sp => sp.GetRequiredService<SettingsService>());
 builder.Services.AddSingleton<NotificationHubService>();
 
-builder.Services.AddSingleton<SlowQueryAnalyzer>();
-builder.Services.AddSingleton<ITrafficListener>(sp => sp.GetRequiredService<SlowQueryAnalyzer>());
-builder.Services.AddSingleton<IAnalyzerPlugin>(sp => sp.GetRequiredService<SlowQueryAnalyzer>());
-
-builder.Services.AddSingleton<CursorAnalyzer>();
-builder.Services.AddSingleton<ITrafficListener>(sp => sp.GetRequiredService<CursorAnalyzer>());
-builder.Services.AddSingleton<IAnalyzerPlugin>(sp => sp.GetRequiredService<CursorAnalyzer>());
+builder.Services.AddSingleton<ReteAnalyzerEngine>();
+builder.Services.AddSingleton<IAnalyzerPlugin>(sp => sp.GetRequiredService<ReteAnalyzerEngine>());
+builder.Services.AddHostedService(sp => sp.GetRequiredService<ReteAnalyzerEngine>());
+builder.Services.AddSingleton<ITrafficListener>(sp => sp.GetRequiredService<ReteAnalyzerEngine>());
 
 builder.Services.AddHostedService<MongoDbProxy>();
 
