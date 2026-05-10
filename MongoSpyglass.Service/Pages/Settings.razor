@@ -26,6 +26,12 @@
                 </RadzenStack>
 
                 <RadzenStack Orientation="Orientation.Horizontal" AlignItems="AlignItems.Center" Gap="1rem">
+                    <RadzenText Text="Raw Data TTL (h)" Style="width: 150px;" />
+                    <RadzenNumeric @bind-Value="@_settings.RawDataRetentionHours" Style="width: 100px;" />
+                    <RadzenText Text="(Retention for heavy BSON payloads)" TextStyle="TextStyle.Caption" />
+                </RadzenStack>
+
+                <RadzenStack Orientation="Orientation.Horizontal" AlignItems="AlignItems.Center" Gap="1rem">
                     <RadzenText Text="RavenDB Mode" Style="width: 150px;" />
                     <RadzenSelectBar TValue="bool" @bind-Value="@_settings.RavenEmbedded">
                         <Items>
@@ -65,7 +71,8 @@
             RavenEmbedded = current.RavenEmbedded,
             RavenRemoteUrl = current.RavenRemoteUrl,
             RavenDatabase = current.RavenDatabase,
-            SlowQueryThresholdMs = current.SlowQueryThresholdMs
+            SlowQueryThresholdMs = current.SlowQueryThresholdMs,
+            RawDataRetentionHours = current.RawDataRetentionHours
         };
     }
 

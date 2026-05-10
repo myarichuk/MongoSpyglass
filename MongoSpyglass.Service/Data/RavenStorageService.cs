@@ -59,6 +59,7 @@ public class RavenStorageService(ILogger<RavenStorageService> logger) : IDisposa
     private static readonly RecyclableMemoryStreamManager _streamManager = new();
 
     public event Action<string>? OnSessionChanged;
+    public int RetentionHours { get; set; } = 24;
 
     public void Initialize(bool isEmbedded = true, string? remoteUrl = null, string database = "MongoSpyglass", string? dataDir = null)
     {
@@ -274,7 +275,7 @@ public class RavenStorageService(ILogger<RavenStorageService> logger) : IDisposa
 
                 using (var bulk = _store.BulkInsert())
                 {
-                    var expiresAt = DateTime.UtcNow.AddHours(24);
+                    var expiresAt = DateTime.UtcNow.AddHours(RetentionHours);
                     foreach (var item in items)
                     {
                         item.Op.SessionId = _activeSessionId ?? "default";

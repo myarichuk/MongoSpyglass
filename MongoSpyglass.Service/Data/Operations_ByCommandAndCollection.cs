@@ -7,6 +7,7 @@ public class Operations_ByCommandAndCollection : AbstractIndexCreationTask<Mongo
 {
     public class Result
     {
+        public string Id { get; set; } = string.Empty;
         public string SessionId { get; set; } = string.Empty;
         public string Collection { get; set; } = string.Empty;
         public string Command { get; set; } = string.Empty;
@@ -22,6 +23,7 @@ public class Operations_ByCommandAndCollection : AbstractIndexCreationTask<Mongo
         Map = ops => from op in ops
                      select new Result
                      {
+                         Id = "OperationStats/" + op.SessionId + "/" + op.Collection + "/" + op.Command,
                          SessionId = op.SessionId,
                          Collection = op.Collection,
                          Command = op.Command,
@@ -36,6 +38,7 @@ public class Operations_ByCommandAndCollection : AbstractIndexCreationTask<Mongo
                             group result by new { result.SessionId, result.Collection, result.Command } into g
                             select new Result
                             {
+                                Id = "OperationStats/" + g.Key.SessionId + "/" + g.Key.Collection + "/" + g.Key.Command,
                                 SessionId = g.Key.SessionId,
                                 Collection = g.Key.Collection,
                                 Command = g.Key.Command,
@@ -45,5 +48,7 @@ public class Operations_ByCommandAndCollection : AbstractIndexCreationTask<Mongo
                                 TotalSizeBytes = g.Sum(x => x.TotalSizeBytes),
                                 TotalDocumentCount = g.Sum(x => x.TotalDocumentCount)
                             };
+
+        OutputReduceToCollection = "OperationStats";
     }
 }

@@ -15,6 +15,7 @@ public class AppSettings
     public string? RavenRemoteUrl { get; set; }
     public string RavenDatabase { get; set; } = "MongoSpyglass";
     public int SlowQueryThresholdMs { get; set; } = 100;
+    public int RawDataRetentionHours { get; set; } = 24;
 }
 
 public class SettingsService : IProxySettingsProvider
@@ -49,11 +50,13 @@ public class SettingsService : IProxySettingsProvider
             };
             await _ravenService.SaveSettingsAsync(_current);
         }
+        _ravenService.RetentionHours = _current.RawDataRetentionHours;
     }
 
     public async Task UpdateAsync(AppSettings settings)
     {
         _current = settings;
+        _ravenService.RetentionHours = _current.RawDataRetentionHours;
         await _ravenService.SaveSettingsAsync(_current);
         OnSettingsChanged?.Invoke();
     }
