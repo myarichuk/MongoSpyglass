@@ -2,6 +2,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.ObjectPool;
 using MongoSpyglass.Proxy;
 using MongoSpyglass.Service.Analyzers.Rete;
+using MongoSpyglass.Service.Data;
 using NRules;
 using NRules.Fluent;
 using System;
@@ -21,13 +22,17 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
     private readonly ConcurrentQueue<Insight> _insights = new();
     private readonly TimeTick _tick = new();
 
-    public ReteAnalyzerEngine()
+    public ReteAnalyzerEngine(RavenStorageService ravenService)
     {
         var repository = new RuleRepository();
         repository.Load(x => x.From(typeof(CleanupRule).Assembly));
         var factory = repository.Compile();
         _session = factory.CreateSession();
         _pool = ObjectPool.Create(new DefaultPooledObjectPolicy<MessageFact>());
+
+        ravenService.OnSessionChanged += (sessionId) => {
+            _insights.Clear();
+        };
     }
 
     public string Name => "Rete Analyzer Engine";
