@@ -105,15 +105,32 @@ public class NotificationHubService
         lock (_lock) return _notifications.OrderByDescending(n => n.Timestamp).ToList();
     }
 
-    public int UnreadCount => 0; // Simplified for now since we have dismissal
+    public int UnreadCount => _notifications.Count(n => !n.IsRead);
 
     public void MarkAllAsRead()
     {
+        lock (_lock)
+        {
+            foreach (var n in _notifications)
+            {
+                n.IsRead = true;
+                _ = _ravenService.UpdateInsightAsync(n);
+            }
+        }
         OnNotificationsUpdated?.Invoke();
     }
 
     public void MarkAsRead(MongoInsight insight)
     {
+        lock (_lock)
+        {
+            var found = _notifications.FirstOrDefault(n => n.Id == insight.Id);
+            if (found != null && !found.IsRead)
+            {
+                found.IsRead = true;
+                _ = _ravenService.UpdateInsightAsync(found);
+            }
+        }
         OnNotificationsUpdated?.Invoke();
     }
 }

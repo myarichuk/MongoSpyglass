@@ -43,6 +43,7 @@ public class MongoInsight
     public string Category { get; set; } = string.Empty;
     public string Details { get; set; } = string.Empty;
     public DateTime Timestamp { get; set; } = DateTime.Now;
+    public bool IsRead { get; set; } = false;
 }
 
 public class RavenStorageService(ILogger<RavenStorageService> logger) : IDisposable
@@ -160,6 +161,14 @@ public class RavenStorageService(ILogger<RavenStorageService> logger) : IDisposa
         if (_store == null) return;
         using var session = _store.OpenAsyncSession();
         await session.StoreAsync(insight);
+        await session.SaveChangesAsync();
+    }
+
+    public async Task UpdateInsightAsync(MongoInsight insight)
+    {
+        if (_store == null || string.IsNullOrEmpty(insight.Id)) return;
+        using var session = _store.OpenAsyncSession();
+        await session.StoreAsync(insight, insight.Id);
         await session.SaveChangesAsync();
     }
 

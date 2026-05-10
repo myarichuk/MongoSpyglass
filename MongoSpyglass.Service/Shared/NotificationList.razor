@@ -24,7 +24,11 @@
         <div class="flex-1 overflow-y-auto divide-y divide-outline-variant/30">
             @foreach (var insight in _notifications)
             {
-                <div class="group p-4 hover:bg-surface-container-high transition-colors cursor-pointer" @onclick="@(() => ShowDetail(insight))">
+                <div class="group p-4 hover:bg-surface-container-high transition-colors cursor-pointer relative" @onclick="@(() => ShowDetail(insight))">
+                    @if (!insight.IsRead)
+                    {
+                        <div class="absolute left-1 top-1/2 -translate-y-1/2 w-1.5 h-1.5 bg-primary rounded-full"></div>
+                    }
                     <div class="flex justify-between items-start mb-1">
                         <span class="font-ui-label-sm text-[10px] text-on-surface-variant uppercase tracking-wider">@insight.Category • @insight.Timestamp.ToString("HH:mm")</span>
                         <div class="flex items-center gap-2">
@@ -73,6 +77,7 @@
 
     private async Task ShowDetail(MongoInsight insight)
     {
+        NotificationHub.MarkAsRead(insight);
         await DialogService.OpenAsync<InsightDetail>(insight.Title, 
             new Dictionary<string, object> { { "Insight", insight } },
             new DialogOptions { Width = "700px", Height = "600px", Resizable = true, Draggable = true });
