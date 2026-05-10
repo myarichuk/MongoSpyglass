@@ -18,6 +18,7 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
 {
     private readonly Channel<MessageFact> _channel = Channel.CreateUnbounded<MessageFact>();
     private readonly NRules.ISession _session;
+    private readonly object _syncLock = new();
     private readonly ObjectPool<MessageFact> _pool;
     private readonly ConcurrentQueue<Insight> _insights = new();
     private readonly TimeTick _tick = new();
@@ -35,11 +36,14 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
 
         ravenService.OnSessionChanged += (sessionId) => {
             _insights.Clear();
-            // Clear facts in session
-            var facts = _session.Query<object>().ToList();
-            foreach (var f in facts) _session.Retract(f);
-            _session.Insert(_tick);
-            _hydrated = false;
+            lock (_syncLock)
+            {
+                // Clear facts in session
+                var facts = _session.Query<object>().ToList();
+                foreach (var f in facts) _session.Retract(f);
+                _session.Insert(_tick);
+                _hydrated = false;
+            }
         };
     }
 
@@ -47,9 +51,24 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
 
     public IEnumerable<Insight> GetInsights() => _insights.ToArray();
 
-    public int ActiveCursorsCount => _session.Query<CursorFact>().Count(x => !x.IsClosed);
+    public int ActiveCursorsCount
+    {
+        get
+        {
+            lock (_syncLock)
+            {
+                return _session.Query<CursorFact>().Count(x => !x.IsClosed);
+            }
+        }
+    }
 
-    public CursorStatsFact GetCursorStats() => _session.Query<CursorStatsFact>().FirstOrDefault() ?? new CursorStatsFact();
+    public CursorStatsFact GetCursorStats()
+    {
+        lock (_syncLock)
+        {
+            return _session.Query<CursorStatsFact>().FirstOrDefault() ?? new CursorStatsFact();
+        }
+    }
 
     public void OnMessage(in ObservedMessage msg)
     {
@@ -73,13 +92,19 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
 
     public void OnConnectionClosed(string connectionId)
     {
-        _session.Insert(new ConnectionClosedFact { ConnectionId = connectionId });
-        _session.Fire();
+        lock (_syncLock)
+        {
+            _session.Insert(new ConnectionClosedFact { ConnectionId = connectionId });
+            _session.Fire();
+        }
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _session.Insert(_tick);
+        lock (_syncLock)
+        {
+            _session.Insert(_tick);
+        }
         
         DateTime lastTick = DateTime.UtcNow;
         DateTime lastSave = DateTime.UtcNow;
@@ -97,7 +122,10 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
             // Drain the channel and insert into session
             while (_channel.Reader.TryRead(out var fact))
             {
-                _session.Insert(fact);
+                lock (_syncLock)
+                {
+                    _session.Insert(fact);
+                }
                 hasItems = true;
             }
 
@@ -106,8 +134,11 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
             // Periodic tick for TTL
             if ((now - lastTick).TotalSeconds >= 1)
             {
-                _tick.CurrentTime = now;
-                _session.Update(_tick);
+                lock (_syncLock)
+                {
+                    _tick.CurrentTime = now;
+                    _session.Update(_tick);
+                }
                 hasItems = true;
                 lastTick = now;
             }
@@ -131,17 +162,20 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
 
             if (hasItems)
             {
-                _session.Fire();
-                
-                // Harvest insights produced by rules
-                var insights = _session.Query<Insight>().ToList();
-                foreach (var insight in insights)
+                lock (_syncLock)
                 {
-                    _insights.Enqueue(insight);
-                    _session.Retract(insight);
+                    _session.Fire();
                     
-                    // Limit insights
-                    while (_insights.Count > 100) _insights.TryDequeue(out _);
+                    // Harvest insights produced by rules
+                    var insights = _session.Query<Insight>().ToList();
+                    foreach (var insight in insights)
+                    {
+                        _insights.Enqueue(insight);
+                        _session.Retract(insight);
+                        
+                        // Limit insights
+                        while (_insights.Count > 100) _insights.TryDequeue(out _);
+                    }
                 }
             }
         }
@@ -152,22 +186,28 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
         var sessionId = _ravenService.ActiveSessionId;
         if (string.IsNullOrEmpty(sessionId))
         {
-            _session.Insert(new CursorStatsFact());
+            lock (_syncLock)
+            {
+                _session.Insert(new CursorStatsFact());
+            }
             return;
         }
 
-        _session.Insert(new SessionFact { Id = sessionId });
-
         var stats = await _ravenService.GetLatestCursorStatsAsync(sessionId);
-        _session.Insert(stats ?? new CursorStatsFact { SessionId = sessionId });
-
         var cursors = await _ravenService.GetActiveCursorsAsync(sessionId);
-        foreach (var c in cursors)
+
+        lock (_syncLock)
         {
-            _session.Insert(c);
+            _session.Insert(new SessionFact { Id = sessionId });
+            _session.Insert(stats ?? new CursorStatsFact { SessionId = sessionId });
+
+            foreach (var c in cursors)
+            {
+                _session.Insert(c);
+            }
+            
+            _session.Fire();
         }
-        
-        _session.Fire();
     }
 
     private async Task SaveStateAsync()
@@ -175,11 +215,17 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
         var sessionId = _ravenService.ActiveSessionId;
         if (string.IsNullOrEmpty(sessionId)) return;
 
-        var stats = GetCursorStats();
-        stats.SessionId = sessionId;
+        CursorStatsFact stats;
+        List<CursorFact> activeCursors;
+
+        lock (_syncLock)
+        {
+            stats = _session.Query<CursorStatsFact>().FirstOrDefault() ?? new CursorStatsFact { SessionId = sessionId };
+            activeCursors = _session.Query<CursorFact>().Where(x => !x.IsClosed).ToList();
+        }
+
         await _ravenService.StoreCursorStatsAsync(stats);
 
-        var activeCursors = _session.Query<CursorFact>().Where(x => !x.IsClosed).ToList();
         foreach (var c in activeCursors)
         {
             c.SessionId = sessionId;
