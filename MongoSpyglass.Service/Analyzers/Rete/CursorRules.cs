@@ -11,17 +11,19 @@ public class DetectNewCursorRule : Rule
     public override void Define()
     {
         MessageFact? msg = null;
+        SessionFact? session = null;
 
         When()
-            .Match<MessageFact>(() => msg, m => m.Message.Tag == "from" && !m.Message.Document.IsDefault && HasCursor(m));
+            .Match<MessageFact>(() => msg, m => m.Message.Tag == "from" && !m.Message.Document.IsDefault && HasCursor(m))
+            .Match<SessionFact>(() => session);
 
         Then()
-            .Do(ctx => ProcessCursorResponse(ctx, msg!));
+            .Do(ctx => ProcessCursorResponse(ctx, msg!, session!));
     }
 
     private bool HasCursor(MessageFact m) => m.Message.Document.TryGetElementOffset("cursor", out _);
 
-    private void ProcessCursorResponse(IContext ctx, MessageFact msg)
+    private void ProcessCursorResponse(IContext ctx, MessageFact msg, SessionFact session)
     {
         try {
             if (msg.Message.Document.TryGetElementOffset("cursor", out var cursorOffset)) {
@@ -36,6 +38,7 @@ public class DetectNewCursorRule : Rule
                             Id = id, 
                             Namespace = ns, 
                             ConnectionId = msg.Message.ConnectionId, 
+                            SessionId = session.Id,
                             StartTime = msg.Timestamp, 
                             TotalBytes = msg.Message.MessageSizeBytes, 
                             TotalDocs = msg.Message.DocumentCount 
@@ -79,22 +82,34 @@ public class TrackGetMoreRequestRule : Rule
     public override void Define()
     {
         MessageFact? msg = null;
+        CursorFact? cursor = null;
 
         When()
-            .Match<MessageFact>(() => msg, m => m.Message.Tag == "to" && !m.Message.Document.IsDefault && HasGetMore(m));
+            .Match<MessageFact>(() => msg, m => m.Message.Tag == "to" && !m.Message.Document.IsDefault && HasGetMore(m))
+            .Match<CursorFact>(() => cursor, c => c.Id == GetCursorId(msg!));
 
         Then()
-            .Do(ctx => ProcessGetMoreRequest(ctx, msg!));
+            .Do(ctx => ProcessGetMoreRequest(ctx, msg!, cursor!));
     }
 
     private bool HasGetMore(MessageFact m) => m.Message.Document.TryGetElementOffset("getMore", out _);
+    
+    private long GetCursorId(MessageFact m)
+    {
+        if (m.Message.Document.TryGetElementOffset("getMore", out var offset))
+            return m.Message.Document.GetInt64(offset);
+        return 0;
+    }
 
-    private void ProcessGetMoreRequest(IContext ctx, MessageFact msg)
+    private void ProcessGetMoreRequest(IContext ctx, MessageFact msg, CursorFact cursor)
     {
         if (msg.Message.Document.TryGetElementOffset("getMore", out var offset))
         {
             long id = msg.Message.Document.GetInt64(offset);
             ctx.Insert(new PendingGetMoreFact { RequestId = msg.Message.RequestId, CursorId = id });
+            
+            cursor.LastActivity = msg.Timestamp;
+            ctx.Update(cursor);
         }
     }
 }
@@ -121,6 +136,7 @@ public class HandleGetMoreResponseRule : Rule
         ctx.Retract(pending);
         cursor.TotalBytes += msg.Message.MessageSizeBytes;
         cursor.TotalDocs += msg.Message.DocumentCount;
+        cursor.LastActivity = msg.Timestamp;
         
         try {
             if (msg.Message.Document.TryGetElementOffset("cursor", out var cursorOffset)) {

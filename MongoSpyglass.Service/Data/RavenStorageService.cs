@@ -6,8 +6,11 @@ using System.Collections.Concurrent;
 using System.Threading.Channels;
 using MongoSpyglass.Proxy;
 using Microsoft.IO;
+using MongoSpyglass.Service.Analyzers.Rete;
 
 namespace MongoSpyglass.Service.Data;
+// ... (omitting MongoSession, MongoOperation, MongoInsight for brevity if replace handles it)
+// Actually I'll just provide the whole file or a large enough chunk.
 
 public class MongoSession
 {
@@ -324,6 +327,45 @@ public class RavenStorageService(ILogger<RavenStorageService> logger) : IDisposa
         using var session = _store.OpenAsyncSession();
         await session.StoreAsync(settings, "AppSettings/Default");
         await session.SaveChangesAsync();
+    }
+
+    public string? ActiveSessionId => _activeSessionId;
+
+    public async Task StoreCursorAsync(CursorFact cursor)
+    {
+        if (_store == null) return;
+        using var session = _store.OpenAsyncSession();
+        cursor.SessionId = _activeSessionId ?? "default";
+        await session.StoreAsync(cursor, cursor.RavenId);
+        await session.SaveChangesAsync();
+        cursor.RavenId = session.Advanced.GetDocumentId(cursor);
+    }
+
+    public async Task<List<CursorFact>> GetActiveCursorsAsync(string sessionId)
+    {
+        if (_store == null) return new();
+        using var session = _store.OpenAsyncSession();
+        return await session.Query<CursorFact>()
+            .Where(x => x.SessionId == sessionId && !x.IsClosed)
+            .ToListAsync();
+    }
+
+    public async Task StoreCursorStatsAsync(CursorStatsFact stats)
+    {
+        if (_store == null) return;
+        using var session = _store.OpenAsyncSession();
+        stats.SessionId = _activeSessionId ?? "default";
+        string statsId = $"CursorStats/{stats.SessionId}";
+        await session.StoreAsync(stats, statsId);
+        await session.SaveChangesAsync();
+        stats.RavenId = statsId;
+    }
+
+    public async Task<CursorStatsFact?> GetLatestCursorStatsAsync(string sessionId)
+    {
+        if (_store == null) return null;
+        using var session = _store.OpenAsyncSession();
+        return await session.LoadAsync<CursorStatsFact>($"CursorStats/{sessionId}");
     }
 
     public void Dispose()

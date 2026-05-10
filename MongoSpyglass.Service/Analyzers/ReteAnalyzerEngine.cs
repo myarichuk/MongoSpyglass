@@ -21,14 +21,16 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
     private readonly ObjectPool<MessageFact> _pool;
     private readonly ConcurrentQueue<Insight> _insights = new();
     private readonly TimeTick _tick = new();
+    private readonly RavenStorageService _ravenService;
+    private bool _hydrated = false;
 
     public ReteAnalyzerEngine(RavenStorageService ravenService)
     {
+        _ravenService = ravenService;
         var repository = new RuleRepository();
         repository.Load(x => x.From(typeof(CleanupRule).Assembly));
         var factory = repository.Compile();
         _session = factory.CreateSession();
-        _session.Insert(new CursorStatsFact());
         _pool = ObjectPool.Create(new DefaultPooledObjectPolicy<MessageFact>());
 
         ravenService.OnSessionChanged += (sessionId) => {
@@ -37,7 +39,7 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
             var facts = _session.Query<object>().ToList();
             foreach (var f in facts) _session.Retract(f);
             _session.Insert(_tick);
-            _session.Insert(new CursorStatsFact());
+            _hydrated = false;
         };
     }
 
@@ -80,9 +82,16 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
         _session.Insert(_tick);
         
         var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
+        var saveTimer = new PeriodicTimer(TimeSpan.FromMinutes(1));
         
         while (!stoppingToken.IsCancellationRequested)
         {
+            if (!_hydrated)
+            {
+                await HydrateAsync();
+                _hydrated = true;
+            }
+
             bool hasItems = false;
             
             // Drain the channel and insert into session
@@ -99,7 +108,14 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
                 _session.Update(_tick);
                 hasItems = true;
             }
-            else if (!hasItems)
+
+            // Periodic save
+            if (saveTimer.WaitForNextTickAsync(stoppingToken).IsCompleted)
+            {
+                await SaveStateAsync();
+            }
+
+            if (!hasItems && _channel.Reader.Count == 0)
             {
                 try {
                     await _channel.Reader.WaitToReadAsync(stoppingToken);
@@ -122,6 +138,46 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
                     while (_insights.Count > 100) _insights.TryDequeue(out _);
                 }
             }
+        }
+    }
+
+    private async Task HydrateAsync()
+    {
+        var sessionId = _ravenService.ActiveSessionId;
+        if (string.IsNullOrEmpty(sessionId))
+        {
+            _session.Insert(new CursorStatsFact());
+            return;
+        }
+
+        _session.Insert(new SessionFact { Id = sessionId });
+
+        var stats = await _ravenService.GetLatestCursorStatsAsync(sessionId);
+        _session.Insert(stats ?? new CursorStatsFact { SessionId = sessionId });
+
+        var cursors = await _ravenService.GetActiveCursorsAsync(sessionId);
+        foreach (var c in cursors)
+        {
+            _session.Insert(c);
+        }
+        
+        _session.Fire();
+    }
+
+    private async Task SaveStateAsync()
+    {
+        var sessionId = _ravenService.ActiveSessionId;
+        if (string.IsNullOrEmpty(sessionId)) return;
+
+        var stats = GetCursorStats();
+        stats.SessionId = sessionId;
+        await _ravenService.StoreCursorStatsAsync(stats);
+
+        var activeCursors = _session.Query<CursorFact>().Where(x => !x.IsClosed).ToList();
+        foreach (var c in activeCursors)
+        {
+            c.SessionId = sessionId;
+            await _ravenService.StoreCursorAsync(c);
         }
     }
 }

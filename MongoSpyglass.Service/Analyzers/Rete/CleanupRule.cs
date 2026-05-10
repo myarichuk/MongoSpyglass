@@ -29,3 +29,35 @@ public class CleanupRule : Rule
         fact.Clear();
     }
 }
+
+public class CleanupExpiredRequestRule : Rule
+{
+    public override void Define()
+    {
+        PendingRequestFact? fact = null;
+        TimeTick? tick = null;
+
+        When()
+            .Match<TimeTick>(() => tick)
+            .Match<PendingRequestFact>(() => fact, f => (tick!.CurrentTime - f.Timestamp).TotalMinutes > 5);
+
+        Then()
+            .Do(ctx => ctx.Retract(fact!));
+    }
+}
+
+public class CleanupAbandonedCursorRule : Rule
+{
+    public override void Define()
+    {
+        CursorFact? fact = null;
+        TimeTick? tick = null;
+
+        When()
+            .Match<TimeTick>(() => tick)
+            .Match<CursorFact>(() => fact, f => !f.IsClosed && (tick!.CurrentTime - f.LastActivity).TotalHours > 24);
+
+        Then()
+            .Do(ctx => ctx.Retract(fact!));
+    }
+}

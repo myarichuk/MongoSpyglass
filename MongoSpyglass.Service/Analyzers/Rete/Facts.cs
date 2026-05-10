@@ -7,6 +7,7 @@ namespace MongoSpyglass.Service.Analyzers.Rete;
 public class CursorFact
 {
     public string? RavenId { get; set; } // For persistence
+    public string SessionId { get; set; } = string.Empty;
     public long Id { get; set; }
     public string Namespace { get; set; } = string.Empty;
     public string ConnectionId { get; set; } = string.Empty;
@@ -41,7 +42,8 @@ public class PendingKillFact
 
 public class CursorStatsFact
 {
-    public string Id { get; set; } = "CursorStats/Global";
+    public string? RavenId { get; set; }
+    public string SessionId { get; set; } = string.Empty;
     private const int MaxWindowSize = 100;
     private readonly Queue<double> _durations = new();
 
@@ -69,4 +71,9 @@ public class PendingRequestFact
     public string Collection { get; set; } = string.Empty;
     public MessageFact? TriggerMessage { get; set; } // Memory optimization reference
     public DateTime Timestamp { get; set; } = DateTime.UtcNow;
+}
+
+public class SessionFact
+{
+    public string Id { get; set; } = string.Empty;
 }
