@@ -81,8 +81,8 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
     {
         _session.Insert(_tick);
         
-        var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
-        var saveTimer = new PeriodicTimer(TimeSpan.FromMinutes(1));
+        DateTime lastTick = DateTime.UtcNow;
+        DateTime lastSave = DateTime.UtcNow;
         
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -101,25 +101,31 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
                 hasItems = true;
             }
 
+            var now = DateTime.UtcNow;
+
             // Periodic tick for TTL
-            if (timer.WaitForNextTickAsync(stoppingToken).IsCompleted)
+            if ((now - lastTick).TotalSeconds >= 1)
             {
-                _tick.CurrentTime = DateTime.UtcNow;
+                _tick.CurrentTime = now;
                 _session.Update(_tick);
                 hasItems = true;
+                lastTick = now;
             }
 
             // Periodic save
-            if (saveTimer.WaitForNextTickAsync(stoppingToken).IsCompleted)
+            if ((now - lastSave).TotalMinutes >= 1)
             {
                 await SaveStateAsync();
+                lastSave = now;
             }
 
             if (!hasItems && _channel.Reader.Count == 0)
             {
                 try {
-                    await _channel.Reader.WaitToReadAsync(stoppingToken);
-                } catch (OperationCanceledException) { break; }
+                    using var cts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+                    cts.CancelAfter(TimeSpan.FromSeconds(1));
+                    await _channel.Reader.WaitToReadAsync(cts.Token);
+                } catch (OperationCanceledException) { }
                 continue;
             }
 
