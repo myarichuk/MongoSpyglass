@@ -1,4 +1,6 @@
 using Raven.Client.Documents;
+using Raven.Client.Documents.Operations;
+using Raven.Client.Documents.Queries;
 using Raven.Embedded;
 using System.Collections.Concurrent;
 using System.Threading.Channels;
@@ -116,6 +118,31 @@ public class RavenStorageService(ILogger<RavenStorageService> logger) : IDisposa
         _activeSessionId = newSession.Id;
         OnSessionChanged?.Invoke(newSession.Id);
         return newSession;
+    }
+
+    public async Task<MongoSession?> SwitchSessionAsync(string sessionId)
+    {
+        if (_store == null) throw new InvalidOperationException("Store not initialized");
+
+        using var session = _store.OpenAsyncSession();
+        
+        // Deactivate old sessions
+        var activeSessions = await session.Query<MongoSession>().Where(x => x.IsActive).ToListAsync();
+        foreach (var s in activeSessions)
+        {
+            s.IsActive = false;
+        }
+
+        var newActiveSession = await session.LoadAsync<MongoSession>(sessionId);
+        if (newActiveSession != null)
+        {
+            newActiveSession.IsActive = true;
+            _activeSessionId = newActiveSession.Id;
+            OnSessionChanged?.Invoke(newActiveSession.Id);
+        }
+        
+        await session.SaveChangesAsync();
+        return newActiveSession;
     }
 
     public async Task<List<MongoInsight>> GetInsightsAsync()
@@ -265,21 +292,23 @@ public class RavenStorageService(ILogger<RavenStorageService> logger) : IDisposa
 
     public async Task DeleteSessionAsync(string sessionId)
     {
-        if (_store == null)
-        {
-            return;
-        }
+        if (_store == null) return;
 
-        // In a real app we'd use a Patch or DeleteByQuery, but for simplicity:
+        // Use DeleteByQuery to avoid loading changed entities
+        var operation = await _store.Operations.SendAsync(new Raven.Client.Documents.Operations.DeleteByQueryOperation(new Raven.Client.Documents.Queries.IndexQuery {
+            Query = $"from MongoOperations where SessionId = '{sessionId}'"
+        }));
+        await operation.WaitForCompletionAsync();
+
         using var session = _store.OpenAsyncSession();
-        var ops = await session.Query<MongoOperation>().Where(x => x.SessionId == sessionId).ToListAsync();
-        foreach (var op in ops)
-        {
-            session.Delete(op.Id);
-        }
-
         session.Delete(sessionId);
         await session.SaveChangesAsync();
+
+        if (_activeSessionId == sessionId)
+        {
+            _activeSessionId = null;
+            OnSessionChanged?.Invoke(string.Empty);
+        }
     }
 
     public async Task<AppSettings?> GetSettingsAsync()
