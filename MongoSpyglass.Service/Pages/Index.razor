@@ -107,7 +107,7 @@
                 <h2 class="font-ui-header text-ui-header text-on-surface">Recent Slow Queries (>100ms)</h2>
             </div>
             <div class="w-full overflow-x-auto p-2">
-                <RadzenDataGrid Data="@_slowQueries" TItem="DecryptedTraffic" Density="Density.Compact" GridLines="DataGridGridLines.None" AllowPaging="false" AllowSorting="true" RowClick="@((DataGridRowMouseEventArgs<DecryptedTraffic> args) => ShowDetails(args.Data))">
+                <RadzenDataGrid Data="@_slowQueries" TItem="DecryptedTraffic" Density="Density.Compact" GridLines="DataGridGridLines.None" AllowPaging="false" AllowSorting="true" RowClick="@((DataGridRowMouseEventArgs<DecryptedTraffic> args) => ShowDetails(args.Data))" style="cursor: pointer;">
                     <Columns>
                         <RadzenDataGridColumn TItem="DecryptedTraffic" Property="Timestamp" Title="Time" FormatString="{0:HH:mm:ss}" Width="100px" />
                         <RadzenDataGridColumn TItem="DecryptedTraffic" Property="Collection" Title="Namespace" />

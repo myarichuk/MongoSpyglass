@@ -68,12 +68,15 @@
                     <tbody class="divide-y divide-outline-variant/50">
                         @foreach (var slow in _slowestGroups)
                         {
-                            <tr class="hover:bg-surface-variant/30 group">
+                            <tr class="hover:bg-surface-variant/30 group cursor-pointer" @onclick="@(() => ShowDetails(slow.SampleInstance))">
                                 <td class="py-cell-padding-y px-cell-padding-x">
                                     <span class="font-code-block text-code-block text-secondary">@slow.Namespace</span>
                                 </td>
                                 <td class="py-cell-padding-y px-cell-padding-x w-full max-w-0 truncate">
-                                    <code class="font-code-block text-code-block bg-surface-container-highest px-1.5 py-0.5 rounded text-on-surface border border-outline-variant/30">@slow.Payload</code>
+                                    <div class="flex items-center gap-2">
+                                        <code class="font-code-block text-code-block bg-surface-container-highest px-1.5 py-0.5 rounded text-on-surface border border-outline-variant/30 truncate">@slow.Payload</code>
+                                        <span class="material-symbols-outlined text-[14px] text-on-surface-variant opacity-0 group-hover:opacity-100 transition-opacity shrink-0">visibility</span>
+                                    </div>
                                 </td>
                                 <td class="py-cell-padding-y px-cell-padding-x text-right">
                                     <span class="font-display-mono text-display-mono text-error">@slow.MaxTime.ToString("F0")ms</span>
@@ -171,6 +174,7 @@
         public double AvgTime { get; set; }
         public double AvgSize { get; set; }
         public int Count { get; set; }
+        public DecryptedTraffic? SampleInstance { get; set; }
     }
 
     protected override void OnInitialized()
@@ -188,15 +192,19 @@
         _slowestGroups = traffic
             .Where(t => t.DurationMs.HasValue)
             .GroupBy(t => new { t.Collection, t.Command })
-            .Select(g => new AggregatedQuery
-            {
-                Namespace = g.Key.Collection,
-                Command = g.Key.Command,
-                Payload = g.FirstOrDefault(x => x.SummaryJson != "{}" && !string.IsNullOrWhiteSpace(x.SummaryJson))?.SummaryJson ?? "{}",
-                MaxTime = g.Max(t => t.DurationMs ?? 0),
-                AvgTime = g.Average(t => t.DurationMs ?? 0),
-                AvgSize = g.Average(t => t.SizeBytes),
-                Count = g.Count()
+            .Select(g => {
+                var slowestInstance = g.OrderByDescending(x => x.DurationMs).First();
+                return new AggregatedQuery
+                {
+                    Namespace = g.Key.Collection,
+                    Command = g.Key.Command,
+                    Payload = g.FirstOrDefault(x => x.SummaryJson != "{}" && !string.IsNullOrWhiteSpace(x.SummaryJson))?.SummaryJson ?? "{}",
+                    MaxTime = g.Max(t => t.DurationMs ?? 0),
+                    AvgTime = g.Average(t => t.DurationMs ?? 0),
+                    AvgSize = g.Average(t => t.SizeBytes),
+                    Count = g.Count(),
+                    SampleInstance = slowestInstance
+                };
             })
             .OrderByDescending(g => g.MaxTime)
             .Take(10)
@@ -219,6 +227,21 @@
     public void Dispose()
     {
         TrafficMonitor.OnTrafficReceived -= HandleTrafficReceived;
+    }
+
+    private async Task ShowDetails(DecryptedTraffic entry)
+    {
+        await DialogService.OpenAsync<OperationDetail>($"Operation Detail: {entry.Command}",
+            new Dictionary<string, object> { { "Entry", entry } },
+            new DialogOptions 
+            { 
+                Width = "1100px", 
+                Height = "800px", 
+                Resizable = true, 
+                Draggable = true,
+                CloseDialogOnOverlayClick = true,
+                CloseDialogOnEsc = true
+            });
     }
 
     private async Task ShowInsightDetail(Insight insight)
