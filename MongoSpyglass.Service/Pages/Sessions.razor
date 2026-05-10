@@ -2,6 +2,7 @@
 @using MongoSpyglass.Service.Data
 @inject RavenStorageService RavenService
 @inject NotificationService NotificationService
+@inject DialogService DialogService
 
 <RadzenContent Container="main">
     <ChildContent>
@@ -30,9 +31,13 @@
                         }
                     </Template>
                 </RadzenDataGridColumn>
-                <RadzenDataGridColumn TItem="MongoSession" Width="200px" TextAlign="TextAlign.Center">
+                <RadzenDataGridColumn TItem="MongoSession" Width="250px" TextAlign="TextAlign.Center">
                     <Template Context="session">
-                        <RadzenButton Icon="delete" ButtonStyle="ButtonStyle.Danger" Size="ButtonSize.Small" Click="@(() => DeleteSession(session.Id))" />
+                        @if (!session.IsActive)
+                        {
+                            <RadzenButton Icon="play_arrow" ButtonStyle="ButtonStyle.Success" Size="ButtonSize.Small" Text="Switch" Click="@(() => SwitchSession(session.Id))" class="rz-mr-2" />
+                        }
+                        <RadzenButton Icon="delete" ButtonStyle="ButtonStyle.Danger" Size="ButtonSize.Small" Click="@(() => DeleteSession(session))" />
                     </Template>
                 </RadzenDataGridColumn>
             </Columns>
@@ -68,9 +73,47 @@
         NotificationService.Notify(new NotificationMessage { Severity = NotificationSeverity.Success, Summary = "Session Started", Detail = "New session is now active." });
     }
 
-    private async Task DeleteSession(string id)
+    private async Task SwitchSession(string id)
     {
-        await RavenService.DeleteSessionAsync(id);
+        await RavenService.SwitchSessionAsync(id);
+        await LoadSessions();
+        NotificationService.Notify(new NotificationMessage { Severity = NotificationSeverity.Success, Summary = "Session Switched" });
+    }
+
+    private async Task DeleteSession(MongoSession session)
+    {
+        if (session.IsActive)
+        {
+            var result = await DialogService.OpenAsync("Delete Active Session", ds =>
+                @<RadzenStack Gap="1.5rem">
+                    <p>You are about to delete the active session. What would you like to do next?</p>
+                    <RadzenButton Text="Start New Session" Click="() => ds.Close(1)" ButtonStyle="ButtonStyle.Primary" />
+                    <RadzenButton Text="Switch to Existing" Click="() => ds.Close(2)" ButtonStyle="ButtonStyle.Secondary" />
+                    <RadzenButton Text="Cancel" Click="() => ds.Close(0)" ButtonStyle="ButtonStyle.Light" />
+                </RadzenStack>);
+
+            if (result == null || (int)result == 0) return;
+
+            if ((int)result == 1)
+            {
+                await StartSession();
+            }
+            else if ((int)result == 2)
+            {
+                var otherSession = _sessions.FirstOrDefault(x => x.Id != session.Id);
+                if (otherSession != null)
+                {
+                    await RavenService.SwitchSessionAsync(otherSession.Id);
+                }
+                else
+                {
+                     NotificationService.Notify(new NotificationMessage { Severity = NotificationSeverity.Warning, Summary = "No other sessions", Detail = "Please start a new session first." });
+                     return;
+                }
+            }
+        }
+
+        await RavenService.DeleteSessionAsync(session.Id);
         await LoadSessions();
         NotificationService.Notify(new NotificationMessage { Severity = NotificationSeverity.Info, Summary = "Session Deleted" });
     }
