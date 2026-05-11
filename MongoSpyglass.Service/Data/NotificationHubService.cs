@@ -27,7 +27,11 @@ public class NotificationHubService
 
         // Initial load
         Task.Run(async () => {
-            _notifications = await _ravenService.GetInsightsAsync();
+            var insights = await _ravenService.GetInsightsAsync();
+            lock (_lock)
+            {
+                _notifications = insights;
+            }
             OnNotificationsUpdated?.Invoke();
         });
     }
@@ -105,7 +109,16 @@ public class NotificationHubService
         lock (_lock) return _notifications.OrderByDescending(n => n.Timestamp).ToList();
     }
 
-    public int UnreadCount => _notifications.Count(n => !n.IsRead);
+    public int UnreadCount
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _notifications.Count(n => !n.IsRead);
+            }
+        }
+    }
 
     public void MarkAllAsRead()
     {
