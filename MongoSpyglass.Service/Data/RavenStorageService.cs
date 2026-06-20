@@ -1,4 +1,6 @@
 using Raven.Client.Documents;
+using Raven.Client.Documents.Operations;
+using Raven.Client.Documents.Queries;
 using Raven.Embedded;
 using System.Collections.Concurrent;
 using System.Threading.Channels;
@@ -144,13 +146,13 @@ public class RavenStorageService(ILogger<RavenStorageService> logger) : IDisposa
     public async Task DeleteAllInsightsAsync()
     {
         if (_store == null) return;
-        using var session = _store.OpenAsyncSession();
-        var insights = await session.Query<MongoInsight>().ToListAsync();
-        foreach (var insight in insights)
+
+        var operation = await _store.Operations.SendAsync(new DeleteByQueryOperation(new IndexQuery
         {
-            session.Delete(insight.Id);
-        }
-        await session.SaveChangesAsync();
+            Query = "from MongoInsights"
+        }));
+
+        await operation.WaitForCompletionAsync();
     }
 
     public async Task<List<MongoSession>> GetSessionsAsync()
@@ -270,14 +272,18 @@ public class RavenStorageService(ILogger<RavenStorageService> logger) : IDisposa
             return;
         }
 
-        // In a real app we'd use a Patch or DeleteByQuery, but for simplicity:
-        using var session = _store.OpenAsyncSession();
-        var ops = await session.Query<MongoOperation>().Where(x => x.SessionId == sessionId).ToListAsync();
-        foreach (var op in ops)
+        var operation = await _store.Operations.SendAsync(new DeleteByQueryOperation(new IndexQuery
         {
-            session.Delete(op.Id);
-        }
+            Query = "from MongoOperations where SessionId = $sessionId",
+            QueryParameters = new Raven.Client.Parameters
+            {
+                { "sessionId", sessionId }
+            }
+        }));
 
+        await operation.WaitForCompletionAsync();
+
+        using var session = _store.OpenAsyncSession();
         session.Delete(sessionId);
         await session.SaveChangesAsync();
     }
