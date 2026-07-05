@@ -10,56 +10,34 @@ public class DetectNewCursorRule : Rule
 {
     public override void Define()
     {
-        MessageFact? msg = null;
+        ResponseObservedFact? resp = null;
         SessionFact? session = null;
 
         When()
-            .Match<MessageFact>(() => msg, m => m.Message.Tag == "from" && !m.Message.Document.IsDefault && HasCursor(m))
+            .Match<ResponseObservedFact>(() => resp, r => r.CursorId.HasValue && r.CursorId > 0)
             .Match<SessionFact>(() => session)
-            .Not<CursorFact>(c => c.Id == GetCursorIdFromResponse(msg!) && c.ConnectionId == msg!.Message.ConnectionId);
+            .Not<CursorFact>(c => c.Id == resp!.CursorId && c.ConnectionId == resp!.ConnectionId);
 
         Then()
-            .Do(ctx => ProcessCursorResponse(ctx, msg!, session!));
+            .Do(ctx => ProcessCursorResponse(ctx, resp!, session!));
     }
 
-    private bool HasCursor(MessageFact m) => m.Message.Document.TryGetElementOffset("cursor", out _);
-
-    private long GetCursorIdFromResponse(MessageFact msg)
+    private void ProcessCursorResponse(IContext ctx, ResponseObservedFact resp, SessionFact session)
     {
-        try {
-            if (msg.Message.Document.TryGetElementOffset("cursor", out var cursorOffset)) {
-                var cursorDoc = msg.Message.Document.GetDocument(cursorOffset, msg.Message.Tracker.Arena);
-                if (cursorDoc.TryGetElementOffset("id", out var idOffset)) {
-                    return cursorDoc.GetInt64(idOffset);
-                }
-            }
-        } catch {}
-        return 0;
-    }
+        if (!resp.CursorId.HasValue || resp.CursorId <= 0) return;
 
-    private void ProcessCursorResponse(IContext ctx, MessageFact msg, SessionFact session)
-    {
-        long id = GetCursorIdFromResponse(msg);
-        if (id <= 0) return;
-
-        try {
-            if (msg.Message.Document.TryGetElementOffset("cursor", out var cursorOffset)) {
-                var cursorDoc = msg.Message.Document.GetDocument(cursorOffset, msg.Message.Tracker.Arena);
-                string ns = "unknown";
-                if (cursorDoc.TryGetElementOffset("ns", out var nsOffset)) ns = cursorDoc.GetString(nsOffset);
-                
-                var cursor = new CursorFact { 
-                    Id = id, 
-                    Namespace = ns, 
-                    ConnectionId = msg.Message.ConnectionId, 
-                    SessionId = session.Id,
-                    StartTime = msg.Timestamp, 
-                    TotalBytes = msg.Message.MessageSizeBytes, 
-                    TotalDocs = msg.Message.DocumentCount 
-                };
-                ctx.Insert(cursor);
-            }
-        } catch {}
+        var ns = resp.Namespace ?? "unknown";
+        var cursor = new CursorFact
+        {
+            Id = resp.CursorId.Value,
+            Namespace = ns,
+            ConnectionId = resp.ConnectionId,
+            SessionId = session.Id,
+            StartTime = resp.Timestamp,
+            TotalBytes = resp.MessageSizeBytes,
+            TotalDocs = resp.DocumentCount
+        };
+        ctx.Insert(cursor);
     }
 }
 
@@ -93,36 +71,29 @@ public class TrackGetMoreRequestRule : Rule
 {
     public override void Define()
     {
-        MessageFact? msg = null;
+        GetMoreRequestedFact? getMore = null;
         CursorFact? cursor = null;
 
         When()
-            .Match<MessageFact>(() => msg, m => m.Message.Tag == "to" && !m.Message.Document.IsDefault && HasGetMore(m))
-            .Match<CursorFact>(() => cursor, c => c.Id == GetCursorId(msg!) && c.ConnectionId == msg!.Message.ConnectionId);
+            .Match<GetMoreRequestedFact>(() => getMore)
+            .Match<CursorFact>(() => cursor, c => c.Id == getMore!.CursorId && c.ConnectionId == getMore!.ConnectionId);
 
         Then()
-            .Do(ctx => ProcessGetMoreRequest(ctx, msg!, cursor!));
+            .Do(ctx => ProcessGetMoreRequest(ctx, getMore!, cursor!));
     }
 
-    private bool HasGetMore(MessageFact m) => m.Message.Document.TryGetElementOffset("getMore", out _);
-    
-    private long GetCursorId(MessageFact m)
+    private void ProcessGetMoreRequest(IContext ctx, GetMoreRequestedFact getMore, CursorFact cursor)
     {
-        if (m.Message.Document.TryGetElementOffset("getMore", out var offset))
-            return m.Message.Document.GetInt64(offset);
-        return 0;
-    }
-
-    private void ProcessGetMoreRequest(IContext ctx, MessageFact msg, CursorFact cursor)
-    {
-        if (msg.Message.Document.TryGetElementOffset("getMore", out var offset))
+        ctx.Insert(new PendingGetMoreFact
         {
-            long id = msg.Message.Document.GetInt64(offset);
-            ctx.Insert(new PendingGetMoreFact { RequestId = msg.Message.RequestId, CursorId = id });
-            
-            cursor.LastActivity = msg.Timestamp;
-            ctx.Update(cursor);
-        }
+            RequestId = getMore.RequestId,
+            ConnectionId = getMore.ConnectionId,
+            CursorId = getMore.CursorId,
+            Timestamp = getMore.Timestamp
+        });
+
+        cursor.LastActivity = getMore.Timestamp;
+        ctx.Update(cursor);
     }
 }
 
@@ -130,67 +101,61 @@ public class HandleGetMoreResponseRule : Rule
 {
     public override void Define()
     {
-        MessageFact? msg = null;
+        ResponseObservedFact? resp = null;
         PendingGetMoreFact? pending = null;
         CursorFact? cursor = null;
 
         When()
-            .Match<MessageFact>(() => msg, m => m.Message.Tag == "from")
-            .Match<PendingGetMoreFact>(() => pending, p => p.RequestId == msg!.Message.ResponseTo)
-            .Match<CursorFact>(() => cursor, c => c.Id == pending!.CursorId);
+            .Match<ResponseObservedFact>(() => resp)
+            .Match<PendingGetMoreFact>(() => pending,
+                p => p.RequestId == resp!.RequestId && p.ConnectionId == resp!.ConnectionId)
+            .Match<CursorFact>(() => cursor,
+                c => c.Id == pending!.CursorId && c.ConnectionId == pending!.ConnectionId);
 
         Then()
-            .Do(ctx => UpdateCursor(ctx, msg!, pending!, cursor!));
+            .Do(ctx => UpdateCursor(ctx, resp!, pending!, cursor!));
     }
 
-    private void UpdateCursor(IContext ctx, MessageFact msg, PendingGetMoreFact pending, CursorFact cursor)
+    private void UpdateCursor(IContext ctx, ResponseObservedFact resp, PendingGetMoreFact pending, CursorFact cursor)
     {
         ctx.Retract(pending);
-        cursor.TotalBytes += msg.Message.MessageSizeBytes;
-        cursor.TotalDocs += msg.Message.DocumentCount;
-        cursor.LastActivity = msg.Timestamp;
-        
-        try {
-            if (msg.Message.Document.TryGetElementOffset("cursor", out var cursorOffset)) {
-                var cursorDoc = msg.Message.Document.GetDocument(cursorOffset, msg.Message.Tracker.Arena);
-                if (cursorDoc.TryGetElementOffset("id", out var idOffset)) {
-                    if (cursorDoc.GetInt64(idOffset) == 0) {
-                        cursor.IsClosed = true;
-                        cursor.ClosureReason = "Exhausted";
-                        cursor.ClosedAt = DateTime.UtcNow;
-                    }
-                }
-            }
-        } catch {}
+        cursor.TotalBytes += resp.MessageSizeBytes;
+        cursor.TotalDocs += resp.DocumentCount;
+        cursor.LastActivity = resp.Timestamp;
+
+        // Check if cursor was exhausted (cursor ID == 0 in response)
+        if (resp.CursorId == 0)
+        {
+            cursor.IsClosed = true;
+            cursor.ClosureReason = "Exhausted";
+            cursor.ClosedAt = DateTime.UtcNow;
+        }
+
         ctx.Update(cursor);
     }
 }
 
-public class ExplodeKillCursorsRule : Rule
+public class ProcessKillCursorsRequestRule : Rule
 {
     public override void Define()
     {
-        MessageFact? msg = null;
+        KillCursorsRequestedFact? killReq = null;
 
         When()
-            .Match<MessageFact>(() => msg, m => m.Message.Tag == "to" && HasKillCursors(m));
+            .Match<KillCursorsRequestedFact>(() => killReq);
 
         Then()
-            .Do(ctx => Explode(ctx, msg!));
+            .Do(ctx => ProcessKillRequest(ctx, killReq!));
     }
 
-    private bool HasKillCursors(MessageFact m) => m.Message.Document.TryGetElementOffset("killCursors", out _);
-
-    private void Explode(IContext ctx, MessageFact msg)
+    private void ProcessKillRequest(IContext ctx, KillCursorsRequestedFact killReq)
     {
-        try {
-            if (msg.Message.Document.TryGetElementOffset("cursors", out var cursorsOffset)) {
-                var arr = msg.Message.Document.GetArray(cursorsOffset, msg.Message.Tracker.Arena);
-                foreach (var el in arr) {
-                    ctx.Insert(new PendingKillFact { CursorId = el.Get<long>(), ConnectionId = msg.Message.ConnectionId });
-                }
-            }
-        } catch {}
+        ctx.Insert(new PendingKillFact
+        {
+            CursorId = killReq.CursorId,
+            ConnectionId = killReq.ConnectionId
+        });
+        ctx.Retract(killReq);
     }
 }
 
@@ -239,6 +204,7 @@ public class ConnectionClosedRule : Rule
         cursor.IsClosed = true;
         cursor.ClosureReason = "Connection Closed";
         cursor.ClosedAt = DateTime.UtcNow;
+        cursor.OrphanedByDisconnect = true;
         ctx.Update(cursor);
     }
 }

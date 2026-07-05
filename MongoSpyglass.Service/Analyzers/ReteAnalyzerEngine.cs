@@ -34,7 +34,7 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
     {
         _ravenService = ravenService;
         var repository = new RuleRepository();
-        repository.Load(x => x.From(typeof(CleanupRule).Assembly));
+        repository.Load(x => x.From(typeof(TrackRequestRule).Assembly));
         var factory = repository.Compile();
         _session = factory.CreateSession();
         _channel = Channel.CreateBounded<object>(new BoundedChannelOptions(2048)
