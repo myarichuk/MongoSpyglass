@@ -208,3 +208,38 @@ public class ConnectionClosedRule : Rule
         ctx.Update(cursor);
     }
 }
+
+public class CursorLeakAlertRule : Rule
+{
+    public override void Define()
+    {
+        CursorFact? cursor = null;
+        TimeTick? tick = null;
+        CursorLeakAlertThresholdFact? threshold = null;
+
+        When()
+            .Match<TimeTick>(() => tick)
+            .Match<CursorLeakAlertThresholdFact>(() => threshold)
+            .Match<CursorFact>(() => cursor,
+                c => !c.IsClosed &&
+                     (tick!.CurrentTime - c.LastActivity).TotalHours > threshold!.IdleHoursThreshold);
+
+        Then()
+            .Do(ctx => EmitLeakAlert(ctx, cursor!, tick!, threshold!));
+    }
+
+    private void EmitLeakAlert(IContext ctx, CursorFact cursor, TimeTick tick, CursorLeakAlertThresholdFact threshold)
+    {
+        var idleHours = (tick.CurrentTime - cursor.LastActivity).TotalHours;
+        var insight = new Insight(
+            "Cursor Leak Detected",
+            $"Cursor {cursor.Id} on {cursor.Namespace} from connection {cursor.ConnectionId} idle for {idleHours:F1}h",
+            InsightLevel.Critical,
+            $"Namespace: {cursor.Namespace}\nCursor ID: {cursor.Id}\nConnection: {cursor.ConnectionId}\n" +
+            $"Idle Duration: {idleHours:F1} hours\nThreshold: {threshold.IdleHoursThreshold}h\n" +
+            $"Orphaned: {cursor.OrphanedByDisconnect}\nStarted: {cursor.StartTime:O}",
+            Category: "Cursor Leak"
+        );
+        ctx.Insert(insight);
+    }
+}

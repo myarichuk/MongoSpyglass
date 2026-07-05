@@ -28,6 +28,7 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
     private readonly RavenStorageService _ravenService;
     private readonly SettingsService _settingsService;
     private SettingsSnapshotFact _settingsSnapshot;
+    private CursorLeakAlertThresholdFact _leakAlertThreshold;
     private bool _hydrated = false;
     private bool _healthy = true;
     private DateTime _lastHydrateAttempt = DateTime.MinValue;
@@ -38,6 +39,7 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
         _ravenService = ravenService;
         _settingsService = settingsService;
         _settingsSnapshot = new SettingsSnapshotFact { SlowQueryThresholdMs = settingsService.Current.SlowQueryThresholdMs };
+        _leakAlertThreshold = new CursorLeakAlertThresholdFact { IdleHoursThreshold = settingsService.Current.CursorLeakAlertThresholdHours };
         var repository = new RuleRepository();
         repository.Load(x => x.From(typeof(TrackRequestRule).Assembly));
         var factory = repository.Compile();
@@ -62,9 +64,11 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
 
         settingsService.OnSettingsChanged += () => {
             _settingsSnapshot.SlowQueryThresholdMs = settingsService.Current.SlowQueryThresholdMs;
+            _leakAlertThreshold.IdleHoursThreshold = settingsService.Current.CursorLeakAlertThresholdHours;
             lock (_syncLock)
             {
                 _session.Update(_settingsSnapshot);
+                _session.Update(_leakAlertThreshold);
             }
         };
     }
@@ -557,6 +561,7 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
             {
                 _session.Insert(new CursorStatsFact());
                 _session.Insert(_settingsSnapshot);
+                _session.Insert(_leakAlertThreshold);
             }
             return;
         }
@@ -569,6 +574,7 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
             _session.Insert(new SessionFact { Id = sessionId });
             _session.Insert(stats ?? new CursorStatsFact { SessionId = sessionId });
             _session.Insert(_settingsSnapshot);
+            _session.Insert(_leakAlertThreshold);
 
             foreach (var c in cursors)
             {

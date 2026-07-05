@@ -148,3 +148,8 @@ public class QueryExampleToSaveFact
     public string Namespace { get; set; } = string.Empty;
     public string Command { get; set; } = string.Empty;
 }
+
+public class CursorLeakAlertThresholdFact
+{
+    public double IdleHoursThreshold { get; set; } = 1;
+}
