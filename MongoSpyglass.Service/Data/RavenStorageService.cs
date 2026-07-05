@@ -337,9 +337,16 @@ public class RavenStorageService(ILogger<RavenStorageService> logger) : IDisposa
     {
         if (_store == null) return;
 
-        // Use DeleteByQuery to avoid loading changed entities
+        // Validate sessionId to prevent RQL injection — only allow expected characters
+        if (!System.Text.RegularExpressions.Regex.IsMatch(sessionId, @"^[a-zA-Z0-9/_-]+$"))
+        {
+            throw new ArgumentException("Invalid sessionId format", nameof(sessionId));
+        }
+
+        // Use DeleteByQuery with parameterized query to prevent RQL injection
         var operation = await _store.Operations.SendAsync(new Raven.Client.Documents.Operations.DeleteByQueryOperation(new Raven.Client.Documents.Queries.IndexQuery {
-            Query = $"from MongoOperations where SessionId = '{sessionId}'"
+            Query = "from MongoOperations where SessionId = $sessionId",
+            QueryParameters = new Raven.Client.Parameters { { "sessionId", sessionId } }
         }));
         await operation.WaitForCompletionAsync();
 
@@ -412,8 +419,28 @@ public class RavenStorageService(ILogger<RavenStorageService> logger) : IDisposa
     {
         if (_store == null) return Array.Empty<byte>();
 
+        // Validate sessionId to prevent JavaScript injection — allow alphanumerics, slashes, underscores, hyphens
+        if (!System.Text.RegularExpressions.Regex.IsMatch(sessionId, @"^[a-zA-Z0-9/_-]+$"))
+        {
+            throw new ArgumentException("Invalid sessionId format", nameof(sessionId));
+        }
+
         using var ms = new MemoryStream();
-        
+
+        // Build transform script with validated/formatted inputs to prevent injection
+        var dateFilterLines = "";
+        if (start.HasValue)
+        {
+            // Format as ISO 8601 for safe JavaScript date parsing
+            var startStr = start.Value.ToString("yyyy-MM-ddTHH:mm:ss");
+            dateFilterLines += $"if (ts < new Date('{startStr}')) return;{Environment.NewLine}                    ";
+        }
+        if (end.HasValue)
+        {
+            var endStr = end.Value.ToString("yyyy-MM-ddTHH:mm:ss");
+            dateFilterLines += $"if (ts > new Date('{endStr}')) return;{Environment.NewLine}                    ";
+        }
+
         // We'll export specific collections and filter using a transform script
         // Note: Smuggler export is usually for the whole DB, but we can filter by collection.
         var options = new Raven.Client.Documents.Smuggler.DatabaseSmugglerExportOptions
@@ -429,8 +456,7 @@ public class RavenStorageService(ILogger<RavenStorageService> logger) : IDisposa
 
                 if (this.Timestamp) {{
                     var ts = new Date(this.Timestamp);
-                    {(start.HasValue ? $"if (ts < new Date('{start.Value:yyyy-MM-ddTHH:mm:ss}')) return;" : "")}
-                    {(end.HasValue ? $"if (ts > new Date('{end.Value:yyyy-MM-ddTHH:mm:ss}')) return;" : "")}
+                    {dateFilterLines}
                 }}
             "
         };
