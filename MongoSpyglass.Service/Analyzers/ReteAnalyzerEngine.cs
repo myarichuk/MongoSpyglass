@@ -23,16 +23,21 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
     private readonly NRules.ISession _session;
     private readonly object _syncLock = new();
     private readonly ConcurrentQueue<Insight> _insights = new();
+    private readonly ConcurrentQueue<(string hash, string kind, string exampleJson, string ns, string command)> _queryExamplesToSave = new();
     private readonly TimeTick _tick = new();
     private readonly RavenStorageService _ravenService;
+    private readonly SettingsService _settingsService;
+    private SettingsSnapshotFact _settingsSnapshot;
     private bool _hydrated = false;
     private bool _healthy = true;
     private DateTime _lastHydrateAttempt = DateTime.MinValue;
     private long _droppedFactCount = 0;
 
-    public ReteAnalyzerEngine(RavenStorageService ravenService)
+    public ReteAnalyzerEngine(RavenStorageService ravenService, SettingsService settingsService)
     {
         _ravenService = ravenService;
+        _settingsService = settingsService;
+        _settingsSnapshot = new SettingsSnapshotFact { SlowQueryThresholdMs = settingsService.Current.SlowQueryThresholdMs };
         var repository = new RuleRepository();
         repository.Load(x => x.From(typeof(TrackRequestRule).Assembly));
         var factory = repository.Compile();
@@ -54,6 +59,14 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
                 _hydrated = false;
             }
         };
+
+        settingsService.OnSettingsChanged += () => {
+            _settingsSnapshot.SlowQueryThresholdMs = settingsService.Current.SlowQueryThresholdMs;
+            lock (_syncLock)
+            {
+                _session.Update(_settingsSnapshot);
+            }
+        };
     }
 
     public string Name => "Rete Analyzer Engine";
@@ -61,6 +74,11 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
     public long DroppedFactCount => _droppedFactCount;
 
     public IEnumerable<Insight> GetInsights() => _insights.ToArray();
+
+    public void QueueQueryExampleForSave(string hash, string kind, string exampleJson, string ns, string command)
+    {
+        _queryExamplesToSave.Enqueue((hash, kind, exampleJson, ns, command));
+    }
 
     public int ActiveCursorsCount
     {
@@ -470,6 +488,7 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
                 if ((now - lastSave).TotalMinutes >= 1)
                 {
                     await SaveStateAsync();
+                    await SaveQueryExamplesAsync();
                     lastSave = now;
                 }
 
@@ -501,6 +520,20 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
                             // Limit insights
                             while (_insights.Count > 100) _insights.TryDequeue(out _);
                         }
+
+                        // Harvest query examples to save
+                        var examples = _session.Query<QueryExampleToSaveFact>().ToList();
+                        foreach (var example in examples)
+                        {
+                            _queryExamplesToSave.Enqueue((
+                                example.Hash,
+                                example.Kind,
+                                example.ExampleJson,
+                                example.Namespace,
+                                example.Command
+                            ));
+                            _session.Retract(example);
+                        }
                     }
                 }
 
@@ -523,6 +556,7 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
             lock (_syncLock)
             {
                 _session.Insert(new CursorStatsFact());
+                _session.Insert(_settingsSnapshot);
             }
             return;
         }
@@ -534,6 +568,7 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
         {
             _session.Insert(new SessionFact { Id = sessionId });
             _session.Insert(stats ?? new CursorStatsFact { SessionId = sessionId });
+            _session.Insert(_settingsSnapshot);
 
             foreach (var c in cursors)
             {
@@ -564,6 +599,28 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
         {
             c.SessionId = sessionId;
             await _ravenService.StoreCursorAsync(c);
+        }
+    }
+
+    private async Task SaveQueryExamplesAsync()
+    {
+        // Drain all queued examples and save them
+        while (_queryExamplesToSave.TryDequeue(out var example))
+        {
+            try
+            {
+                await _ravenService.SaveQueryExampleAsync(
+                    example.hash,
+                    example.kind,
+                    example.exampleJson,
+                    example.ns,
+                    example.command
+                );
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Error saving query example: {ex.Message}");
+            }
         }
     }
 }

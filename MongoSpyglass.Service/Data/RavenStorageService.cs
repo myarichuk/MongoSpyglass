@@ -49,6 +49,20 @@ public class MongoInsight
     public bool IsRead { get; set; } = false;
 }
 
+public class QueryExample
+{
+    public string? Id { get; set; }
+    public string Hash { get; set; } = string.Empty;
+    public string Kind { get; set; } = string.Empty; // SlowQuery, N1Shape, DuplicateValue
+    public string Namespace { get; set; } = string.Empty;
+    public string Command { get; set; } = string.Empty;
+    public string ExampleJson { get; set; } = string.Empty;
+    public DateTime FirstSeenUtc { get; set; } = DateTime.UtcNow;
+    public DateTime LastSeenUtc { get; set; } = DateTime.UtcNow;
+    public long OccurrenceCount { get; set; } = 1;
+    public double? MaxDurationMs { get; set; } // For SlowQuery kind
+}
+
 public class RavenStorageService(ILogger<RavenStorageService> logger) : IDisposable
 {
     private IDocumentStore? _store;
@@ -434,6 +448,42 @@ public class RavenStorageService(ILogger<RavenStorageService> logger) : IDisposa
         return await session.Query<Operations_ByCommandAndCollection.Result, Operations_ByCommandAndCollection>()
             .Where(x => x.SessionId == sessionId)
             .ToListAsync();
+    }
+
+    public async Task SaveQueryExampleAsync(string hash, string kind, string exampleJson, string ns, string command)
+    {
+        if (_store == null) return;
+
+        using var session = _store.OpenAsyncSession();
+        var docId = $"QueryExample/{hash}";
+        var now = DateTime.UtcNow;
+
+        var example = await session.LoadAsync<QueryExample>(docId);
+        if (example == null)
+        {
+            // First occurrence: insert new example
+            example = new QueryExample
+            {
+                Id = docId,
+                Hash = hash,
+                Kind = kind,
+                Namespace = ns,
+                Command = command,
+                ExampleJson = exampleJson,
+                FirstSeenUtc = now,
+                LastSeenUtc = now,
+                OccurrenceCount = 1
+            };
+            await session.StoreAsync(example);
+        }
+        else
+        {
+            // Repeat occurrence: bump count/timestamp but keep original example
+            example.LastSeenUtc = now;
+            example.OccurrenceCount++;
+        }
+
+        await session.SaveChangesAsync();
     }
 
     public void Dispose()

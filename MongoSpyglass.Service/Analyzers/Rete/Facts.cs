@@ -134,3 +134,17 @@ public class SessionFact
 {
     public string Id { get; set; } = string.Empty;
 }
+
+public class SettingsSnapshotFact
+{
+    public double SlowQueryThresholdMs { get; set; } = 100;
+}
+
+public class QueryExampleToSaveFact
+{
+    public string Hash { get; set; } = string.Empty;
+    public string Kind { get; set; } = string.Empty;
+    public string ExampleJson { get; set; } = string.Empty;
+    public string Namespace { get; set; } = string.Empty;
+    public string Command { get; set; } = string.Empty;
+}

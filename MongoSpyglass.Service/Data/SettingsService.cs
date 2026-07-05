@@ -9,8 +9,8 @@ namespace MongoSpyglass.Service.Data;
 public class AppSettings
 {
     public string Id { get; set; } = "AppSettings/Default";
-    public int ProxyPort { get; set; } = 27017;
-    public string MongoDbUrl { get; set; } = "127.0.0.1:27018";
+    public int ProxyPort { get; set; } = 27018; // Listening port (proxy receives on this)
+    public string MongoDbUrl { get; set; } = "127.0.0.1:27017"; // Target MongoDB server
     public bool RavenEmbedded { get; set; } = true;
     public string? RavenRemoteUrl { get; set; }
     public string RavenDatabase { get; set; } = "MongoSpyglass";
@@ -71,18 +71,27 @@ public class SettingsService : IProxySettingsProvider
         var parts = _current.MongoDbUrl.Split(':');
         var host = parts[0];
         var port = parts.Length > 1 ? int.Parse(parts[1]) : 27017;
-        
+
+        IPAddress ipAddress;
+
         // Handle basic hostnames/IPs
-        if (!IPAddress.TryParse(host, out var ipAddress))
+        if (!IPAddress.TryParse(host, out ipAddress))
         {
-            try {
+            try
+            {
                 var ips = Dns.GetHostAddresses(host);
-                ipAddress = ips.Length > 0 ? ips[0] : IPAddress.Loopback;
-            } catch {
-                ipAddress = IPAddress.Loopback;
+                if (ips.Length == 0)
+                {
+                    throw new InvalidOperationException($"DNS resolution failed for '{host}': no addresses returned");
+                }
+                ipAddress = ips[0];
+            }
+            catch (System.Net.Sockets.SocketException ex)
+            {
+                throw new InvalidOperationException($"Failed to resolve MongoDB host '{host}': {ex.Message}", ex);
             }
         }
-        
+
         return (new IPEndPoint(ipAddress, port), _current.ProxyPort);
     }
 }

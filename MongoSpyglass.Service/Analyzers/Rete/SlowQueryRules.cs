@@ -38,27 +38,43 @@ public class DetectSlowQueryRule : Rule
     {
         ResponseObservedFact? resp = null;
         PendingRequestFact? pending = null;
+        RequestObservedFact? req = null;
+        SettingsSnapshotFact? settings = null;
 
         When()
-            .Match<ResponseObservedFact>(() => resp, r => r.DurationMs > 100)
+            .Match<SettingsSnapshotFact>(() => settings)
+            .Match<RequestObservedFact>(() => req)
+            .Match<ResponseObservedFact>(() => resp, r => r.DurationMs > settings!.SlowQueryThresholdMs)
             .Match<PendingRequestFact>(() => pending,
-                p => p.RequestId == resp!.RequestId && p.ConnectionId == resp!.ConnectionId);
+                p => p.RequestId == resp!.RequestId && p.ConnectionId == resp!.ConnectionId &&
+                     p.RequestId == req!.RequestId && p.ConnectionId == req!.ConnectionId);
 
         Then()
-            .Do(ctx => GenerateSlowQueryInsight(ctx, resp!, pending!));
+            .Do(ctx => GenerateSlowQueryInsight(ctx, resp!, pending!, req!));
     }
 
-    private void GenerateSlowQueryInsight(IContext ctx, ResponseObservedFact resp, PendingRequestFact req)
+    private void GenerateSlowQueryInsight(IContext ctx, ResponseObservedFact resp, PendingRequestFact pending, RequestObservedFact req)
     {
         var insight = new Insight(
             "Slow Query Detected",
-            $"Slow {req.Command} on {req.Collection} detected: {resp.DurationMs:F2}ms",
+            $"Slow {pending.Command} on {pending.Collection} detected: {resp.DurationMs:F2}ms",
             InsightLevel.Warning,
             $"Total Latency: {resp.DurationMs:F2}ms\nSize: {resp.MessageSizeBytes} bytes\nDocuments: {resp.DocumentCount}",
             Category: "Performance"
         );
         ctx.Insert(insight);
-        ctx.Retract(req);
+
+        // Queue example for persistence
+        ctx.Insert(new QueryExampleToSaveFact
+        {
+            Hash = req.ValueHash,
+            Kind = "SlowQuery",
+            ExampleJson = req.ExampleJson,
+            Namespace = pending.Collection,
+            Command = pending.Command
+        });
+
+        ctx.Retract(pending);
     }
 }
 

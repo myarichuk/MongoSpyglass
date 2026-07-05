@@ -16,6 +16,8 @@ public class CorrelationRingBuffer : IDisposable
         }
 
         _buffer = ArrayPool<OperationMetrics>.Shared.Rent(capacity);
+        // Clear stale data from prior tenant of the pooled buffer
+        Array.Clear(_buffer, 0, _buffer.Length);
         _mask = capacity - 1;
     }
 

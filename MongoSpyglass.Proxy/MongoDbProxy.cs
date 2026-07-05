@@ -440,6 +440,12 @@ public class MongoDbProxy : IHostedService
                 }
             }
 
+            // Validate duration: Stopwatch can drift or go backward in rare cases; clamp to valid range
+            if (durationMs.HasValue && durationMs.Value < 0)
+            {
+                durationMs = 0;
+            }
+
             var observed = new ObservedMessage(tag, connectionId, requestId, responseTo, opCode, doc, bodyPtr, bodyLength, tracker, durationMs, (int)message.Length, docCount);
 
             foreach (var listener in _listeners)
