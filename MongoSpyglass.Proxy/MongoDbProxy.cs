@@ -81,9 +81,10 @@ public class MongoDbProxy : IHostedService
             var settings = _settingsProvider.GetCurrentSettings();
             _mongoDbServer = settings.TargetServer;
             _port = settings.IncomingPort;
+            var bindAddress = _settingsProvider.GetBindAddress();
 
             _runCts = new CancellationTokenSource();
-            _listener = new TcpListener(IPAddress.Any, _port);
+            _listener = new TcpListener(bindAddress, _port);
             
             try 
             {

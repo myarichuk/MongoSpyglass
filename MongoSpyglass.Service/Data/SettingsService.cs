@@ -11,6 +11,7 @@ public class AppSettings
     public string Id { get; set; } = "AppSettings/Default";
     public int ProxyPort { get; set; } = 27018; // Listening port (proxy receives on this)
     public string MongoDbUrl { get; set; } = "127.0.0.1:27017"; // Target MongoDB server
+    public string BindAddress { get; set; } = "0.0.0.0"; // Bind address (0.0.0.0 = all interfaces, 127.0.0.1 = localhost only)
     public bool RavenEmbedded { get; set; } = true;
     public string? RavenRemoteUrl { get; set; }
     public string RavenDatabase { get; set; } = "MongoSpyglass";
@@ -96,5 +97,15 @@ public class SettingsService : IProxySettingsProvider
         }
 
         return (new IPEndPoint(ipAddress, port), _current.ProxyPort);
+    }
+
+    public IPAddress GetBindAddress()
+    {
+        if (IPAddress.TryParse(_current.BindAddress, out var ipAddress))
+        {
+            return ipAddress;
+        }
+
+        throw new InvalidOperationException($"Invalid BindAddress setting: '{_current.BindAddress}' is not a valid IP address");
     }
 }

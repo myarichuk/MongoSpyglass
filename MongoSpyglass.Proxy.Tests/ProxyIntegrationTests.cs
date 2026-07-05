@@ -18,6 +18,7 @@ public class ProxyIntegrationTests
         public event Action? OnSettingsChanged;
 
         public (IPEndPoint TargetServer, int IncomingPort) GetCurrentSettings() => (TargetServer, IncomingPort);
+        public IPAddress GetBindAddress() => IPAddress.Any;
         public void TriggerChange() => OnSettingsChanged?.Invoke();
     }
 
