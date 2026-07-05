@@ -16,6 +16,7 @@ using System.IO.Pipelines;
 using System.Buffers;
 using MongoSpyglass.Proxy.Bson;
 using MongoSpyglass.Proxy.Memory;
+using System.IO.Compression;
 
 namespace MongoSpyglass.Proxy;
 
@@ -319,6 +320,7 @@ public class MongoDbProxy : IHostedService
 
             var bodyPtr = bytes + headerSize;
             int bodyLength = (int)message.Length - headerSize;
+            int totalMessageLength = (int)message.Length;
 
             int docCount = 0;
             double? durationMs = null;
@@ -332,9 +334,21 @@ public class MongoDbProxy : IHostedService
                 correlationBuffer.RecordRequest(requestId, new OperationMetrics { TimestampStart = System.Diagnostics.Stopwatch.GetTimestamp(), OpCode = opCode, RequestId = requestId });
             }
 
+            // Handle OP_COMPRESSED decompression
+            byte* decompressedBodyPtr = bodyPtr;
+            int decompressedBodyLen = bodyLength;
+            if (opCode == OpCode.OP_COMPRESSED && TryDecompressMessage(bodyPtr, bodyLength, arena, out byte* decompPtr, out int decompLen, out OpCode originalOpCode))
+            {
+                bodyPtr = decompPtr;
+                bodyLength = decompLen;
+                decompressedBodyPtr = decompPtr;
+                decompressedBodyLen = decompLen;
+                opCode = originalOpCode;
+            }
+
             // Determine if parsing is needed
             bool needsParse = _listeners.Any(l => l.NeedsFullDocument) && ShouldParseBody(opCode, bodyLength);
-            
+
             // Pointer for metadata extraction
             byte* metadataPtr = bodyPtr;
             int metadataLen = bodyLength;
@@ -401,16 +415,6 @@ public class MongoDbProxy : IHostedService
                         metadataLen -= 20;
                     }
                 }
-                else if (opCode == OpCode.OP_COMPRESSED)
-                {
-                    // OP_COMPRESSED traffic is not yet decompressed; log a one-time warning
-                    if (!_compressedTrafficWarningLogged)
-                    {
-                        _logger.LogWarning("Compressed traffic detected (OP_COMPRESSED). Query visibility is degraded. Decompression will be enabled in a future version.");
-                        _compressedTrafficWarningLogged = true;
-                    }
-                    metadataLen = 0;
-                }
                 else
                 {
                     // For other opcodes (UPDATE, INSERT, DELETE etc), we don't have a standardized simple document start
@@ -446,7 +450,15 @@ public class MongoDbProxy : IHostedService
                 durationMs = 0;
             }
 
-            var observed = new ObservedMessage(tag, connectionId, requestId, responseTo, opCode, doc, bodyPtr, bodyLength, tracker, durationMs, (int)message.Length, docCount);
+            // Calculate message size: header + body. For decompressed messages, use header + decompressed body length.
+            int messageSize = (int)message.Length;
+            if (decompressedBodyLen > 0 && decompressedBodyLen != bodyLength)
+            {
+                // Message was decompressed, recalculate size (header is 16 bytes)
+                messageSize = 16 + decompressedBodyLen;
+            }
+
+            var observed = new ObservedMessage(tag, connectionId, requestId, responseTo, opCode, doc, bodyPtr, bodyLength, tracker, durationMs, messageSize, docCount);
 
             foreach (var listener in _listeners)
             {
@@ -460,6 +472,94 @@ public class MongoDbProxy : IHostedService
         {
             _logger.LogDebug(e, $"Error observing message (OpCode: {opCode}, Conn: {connectionId})");
             tracker.Release();
+        }
+    }
+
+    private unsafe bool TryDecompressMessage(
+        byte* compressedPtr,
+        int compressedLen,
+        ArenaAllocator arena,
+        out byte* decompressedPtr,
+        out int decompressedLen,
+        out OpCode originalOpCode)
+    {
+        decompressedPtr = null;
+        decompressedLen = 0;
+        originalOpCode = 0;
+
+        try
+        {
+            if (compressedLen < 9) return false; // min: 4 (opcode) + 4 (size) + 1 (compressor)
+
+            // Read original opcode (little-endian int32)
+            int origOpCodeInt = BinaryPrimitives.ReadInt32LittleEndian(new ReadOnlySpan<byte>(compressedPtr, 4));
+            originalOpCode = (OpCode)origOpCodeInt;
+
+            // Read uncompressed size (little-endian int32)
+            int uncompressedSize = BinaryPrimitives.ReadInt32LittleEndian(new ReadOnlySpan<byte>(compressedPtr + 4, 4));
+            if (uncompressedSize <= 0 || uncompressedSize > 48 * 1024 * 1024) return false;
+
+            // Read compressor ID (1 byte)
+            byte compressorId = *(compressedPtr + 8);
+
+            // Compressed payload starts at offset 9
+            byte* payloadPtr = compressedPtr + 9;
+            int payloadLen = compressedLen - 9;
+            if (payloadLen <= 0) return false;
+
+            // Allocate space for decompressed data
+            byte* outPtr = (byte*)arena.Alloc((nuint)uncompressedSize);
+
+            // Decompress based on compressor ID
+            Span<byte> compressedSpan = new(payloadPtr, payloadLen);
+            Span<byte> decompressedSpan = new(outPtr, uncompressedSize);
+
+            switch (compressorId)
+            {
+                case 0: // Snappy — requires external library
+                    _logger.LogDebug("Snappy decompression requested but not implemented; message visibility degraded");
+                    return false;
+
+                case 1: // Zlib (using built-in DeflateStream)
+                    {
+                        try
+                        {
+                            using (var compressedStream = new MemoryStream(compressedSpan.ToArray()))
+                            using (var decompressedStream = new MemoryStream(uncompressedSize))
+                            using (var deflate = new DeflateStream(compressedStream, CompressionMode.Decompress, leaveOpen: false))
+                            {
+                                deflate.CopyTo(decompressedStream);
+                                int zlibLen = (int)decompressedStream.Length;
+                                if (zlibLen != uncompressedSize) return false;
+                                decompressedStream.Position = 0;
+                                decompressedStream.Read(decompressedSpan);
+                                decompressedLen = zlibLen;
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogDebug($"Zlib decompression failed: {ex.Message}");
+                            return false;
+                        }
+                    }
+                    break;
+
+                case 2: // Zstd — requires external library
+                    _logger.LogDebug("Zstd decompression requested but not implemented; message visibility degraded");
+                    return false;
+
+                default:
+                    _logger.LogDebug($"Unknown compressor ID: {compressorId}");
+                    return false;
+            }
+
+            decompressedPtr = outPtr;
+            return decompressedLen > 0 && decompressedLen == uncompressedSize;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug($"Decompression failed: {ex.Message}");
+            return false;
         }
     }
 
