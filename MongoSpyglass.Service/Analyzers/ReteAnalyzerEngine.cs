@@ -1,5 +1,4 @@
 using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.ObjectPool;
 using MongoSpyglass.Proxy;
 using MongoSpyglass.Service.Analyzers.Rete;
 using MongoSpyglass.Service.Data;
@@ -8,6 +7,10 @@ using NRules.Fluent;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO.Hashing;
+using System.Linq;
+using System.Text;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
@@ -16,16 +19,16 @@ namespace MongoSpyglass.Service.Analyzers;
 
 public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
 {
-    private readonly Channel<MessageFact> _channel = Channel.CreateUnbounded<MessageFact>();
+    private readonly Channel<object> _channel;
     private readonly NRules.ISession _session;
     private readonly object _syncLock = new();
-    private readonly ObjectPool<MessageFact> _pool;
     private readonly ConcurrentQueue<Insight> _insights = new();
     private readonly TimeTick _tick = new();
     private readonly RavenStorageService _ravenService;
     private bool _hydrated = false;
     private bool _healthy = true;
     private DateTime _lastHydrateAttempt = DateTime.MinValue;
+    private long _droppedFactCount = 0;
 
     public ReteAnalyzerEngine(RavenStorageService ravenService)
     {
@@ -34,7 +37,11 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
         repository.Load(x => x.From(typeof(CleanupRule).Assembly));
         var factory = repository.Compile();
         _session = factory.CreateSession();
-        _pool = ObjectPool.Create(new DefaultPooledObjectPolicy<MessageFact>());
+        _channel = Channel.CreateBounded<object>(new BoundedChannelOptions(2048)
+        {
+            FullMode = BoundedChannelFullMode.DropWrite,
+            SingleReader = true
+        });
 
         ravenService.OnSessionChanged += (sessionId) => {
             _insights.Clear();
@@ -51,6 +58,7 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
 
     public string Name => "Rete Analyzer Engine";
     public bool IsHealthy => _healthy;
+    public long DroppedFactCount => _droppedFactCount;
 
     public IEnumerable<Insight> GetInsights() => _insights.ToArray();
 
@@ -75,22 +83,324 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
 
     public void OnMessage(in ObservedMessage msg)
     {
-        var fact = _pool.Get();
-        fact.Message = msg;
-        fact.Timestamp = DateTime.UtcNow;
-        
-        // AddRef to keep arena memory alive while in Rete
-        if (fact.Message.Tracker != null)
+        try
         {
-            fact.Message.AddRef();
-        }
+            var timestamp = DateTime.UtcNow;
 
+            if (msg.Tag == "to")
+            {
+                // Request message: extract command, collection, hashes, example
+                if (!msg.Document.IsDefault && msg.Document.KeysEnumerable.Any())
+                {
+                    var command = msg.Document.KeysEnumerable.First().ToString();
+                    var collection = ExtractCollection(msg.Document);
+
+                    // Compute hashes
+                    var (shapeHash, valueHash) = ComputeQueryHashes(msg.Document, collection, msg.Tracker);
+                    var exampleJson = BuildExampleJson(msg.Document, maxBytes: 4096);
+
+                    var fact = new RequestObservedFact
+                    {
+                        RequestId = msg.RequestId,
+                        ConnectionId = msg.ConnectionId,
+                        Timestamp = timestamp,
+                        Command = command,
+                        Collection = collection,
+                        ShapeHash = shapeHash,
+                        ValueHash = valueHash,
+                        ExampleJson = exampleJson
+                    };
+
+                    TryWrite(fact);
+
+                    // Check for getMore or killCursors
+                    if (command == "getMore" && msg.Document.TryGetElementOffset("getMore", out var getMoreOffset))
+                    {
+                        try
+                        {
+                            var cursorId = msg.Document.GetInt64(getMoreOffset);
+                            TryWrite(new GetMoreRequestedFact
+                            {
+                                RequestId = msg.RequestId,
+                                ConnectionId = msg.ConnectionId,
+                                CursorId = cursorId,
+                                Timestamp = timestamp
+                            });
+                        }
+                        catch { }
+                    }
+                    else if (command == "killCursors" && msg.Document.TryGetElementOffset("cursors", out var cursorsOffset))
+                    {
+                        try
+                        {
+                            var cursorsArray = msg.Document.GetArray(cursorsOffset, msg.Tracker.Arena);
+                            foreach (var el in cursorsArray)
+                            {
+                                try
+                                {
+                                    var cursorId = el.Get<long>();
+                                    TryWrite(new KillCursorsRequestedFact
+                                    {
+                                        CursorId = cursorId,
+                                        ConnectionId = msg.ConnectionId,
+                                        Timestamp = timestamp
+                                    });
+                                }
+                                catch { }
+                            }
+                        }
+                        catch { }
+                    }
+                }
+            }
+            else if (msg.Tag == "from")
+            {
+                // Response message: extract cursor, namespace, document count
+                long? cursorId = null;
+                string? ns = null;
+
+                if (!msg.Document.IsDefault)
+                {
+                    try
+                    {
+                        if (msg.Document.TryGetElementOffset("cursor", out var cursorOffset))
+                        {
+                            var cursorDoc = msg.Document.GetDocument(cursorOffset, msg.Tracker.Arena);
+                            if (cursorDoc.TryGetElementOffset("id", out var idOffset))
+                            {
+                                cursorId = cursorDoc.GetInt64(idOffset);
+                            }
+                            if (cursorDoc.TryGetElementOffset("ns", out var nsOffset))
+                            {
+                                ns = cursorDoc.GetString(nsOffset);
+                            }
+                        }
+                    }
+                    catch { }
+                }
+
+                var responseFact = new ResponseObservedFact
+                {
+                    RequestId = msg.ResponseTo,
+                    ConnectionId = msg.ConnectionId,
+                    Timestamp = timestamp,
+                    DurationMs = msg.DurationMs ?? 0,
+                    MessageSizeBytes = msg.MessageSizeBytes,
+                    DocumentCount = msg.DocumentCount,
+                    CursorId = cursorId,
+                    Namespace = ns
+                };
+
+                TryWrite(responseFact);
+            }
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Error in OnMessage: {ex.Message}");
+        }
+    }
+
+    private void TryWrite(object fact)
+    {
         if (!_channel.Writer.TryWrite(fact))
         {
-            if (fact.Message.Tracker != null) fact.Message.Release();
-            fact.Clear();
-            _pool.Return(fact);
+            Interlocked.Increment(ref _droppedFactCount);
         }
+    }
+
+    private string ExtractCollection(MongoSpyglass.Proxy.Bson.BlittableBsonDocument doc)
+    {
+        try
+        {
+            if (doc.TryGetElementOffset("collection", out var colOffset))
+                return doc.GetString(colOffset);
+
+            if (doc.KeysEnumerable.Any())
+            {
+                var firstKey = doc.KeysEnumerable.First().ToString();
+                if (doc.TryGetElementOffset(firstKey.AsSpan(), out var offset))
+                    return doc.GetString(offset);
+            }
+
+            if (doc.TryGetElementOffset("$db", out var dbOff))
+                return doc.GetString(dbOff);
+        }
+        catch { }
+
+        return "unknown";
+    }
+
+    private (string shapeHash, string valueHash) ComputeQueryHashes(MongoSpyglass.Proxy.Bson.BlittableBsonDocument doc, string collection, MongoSpyglass.Proxy.Memory.ArenaTracker? tracker)
+    {
+        try
+        {
+            var fieldNames = new List<string>();
+            var fieldOperators = new List<string>();
+            var fieldValues = new StringBuilder();
+
+            // Try to extract filter from query field if present
+            if (doc.KeysEnumerable.Any())
+            {
+                var firstKey = doc.KeysEnumerable.First().ToString();
+                if (firstKey == "find" && doc.TryGetElementOffset("filter", out var filterOffset))
+                {
+                    if (tracker != null)
+                    {
+                        var filterDoc = doc.GetDocument("filter", tracker.Arena);
+                        ExtractFilterInfo(filterDoc, fieldNames, fieldOperators, fieldValues);
+                    }
+                }
+                else if (doc.TryGetElementOffset(firstKey, out var queryOffset))
+                {
+                    // For OP_QUERY style
+                    ExtractFilterInfo(doc, fieldNames, fieldOperators, fieldValues);
+                }
+            }
+
+            // Sort field names for consistent hashing
+            fieldNames.Sort();
+
+            // Compute shape hash: namespace + field names/operators
+            var shapeBuilder = new StringBuilder();
+            shapeBuilder.Append(collection);
+            foreach (var name in fieldNames)
+                shapeBuilder.Append(name);
+            foreach (var op in fieldOperators)
+                shapeBuilder.Append(op);
+
+            var shapeBytes = Encoding.UTF8.GetBytes(shapeBuilder.ToString());
+            var shapeHashBytes = new byte[16];
+            XxHash128.TryHash(shapeBytes, shapeHashBytes, out _);
+            var shapeHash = Convert.ToHexString(shapeHashBytes);
+
+            // Compute value hash: shape + field values
+            var valueBuilder = new StringBuilder();
+            valueBuilder.Append(shapeBuilder.ToString());
+            valueBuilder.Append(fieldValues.ToString());
+
+            var valueBytes = Encoding.UTF8.GetBytes(valueBuilder.ToString());
+            var valueHashBytes = new byte[16];
+            XxHash128.TryHash(valueBytes, valueHashBytes, out _);
+            var valueHash = Convert.ToHexString(valueHashBytes);
+
+            return (shapeHash, valueHash);
+        }
+        catch
+        {
+            // Fallback: hash the entire collection name
+            var fallbackBytes = Encoding.UTF8.GetBytes(collection);
+            var hash = new byte[16];
+            XxHash128.TryHash(fallbackBytes, hash, out _);
+            var hashStr = Convert.ToHexString(hash);
+            return (hashStr, hashStr);
+        }
+    }
+
+    private void ExtractFilterInfo(MongoSpyglass.Proxy.Bson.BlittableBsonDocument doc, List<string> fieldNames, List<string> fieldOperators, StringBuilder fieldValues)
+    {
+        try
+        {
+            foreach (var key in doc.KeysEnumerable)
+            {
+                var keyStr = key.ToString();
+                fieldNames.Add(keyStr);
+
+                if (doc.TryGetElementOffset(keyStr, out var offset))
+                {
+                    try
+                    {
+                        // Try to extract string value for hashing
+                        fieldValues.Append(doc.GetString(offset));
+                    }
+                    catch { }
+                }
+            }
+        }
+        catch { }
+    }
+
+    private string BuildExampleJson(MongoSpyglass.Proxy.Bson.BlittableBsonDocument doc, int maxBytes)
+    {
+        try
+        {
+            var json = new StringBuilder("{");
+            bool first = true;
+            int keysAdded = 0;
+
+            foreach (var key in doc.KeysEnumerable.Take(10))
+            {
+                if (json.Length >= maxBytes - 10) break;
+
+                if (!first) json.Append(",");
+                first = false;
+                keysAdded++;
+
+                try
+                {
+                    var keyStr = key.ToString();
+                    json.Append("\"").Append(EscapeJsonString(keyStr)).Append("\":");
+
+                    if (doc.TryGetElementOffset(keyStr, out var offset))
+                    {
+                        json.Append(SerializeValueAtOffset(doc, offset, maxBytes - json.Length));
+                    }
+                    else
+                    {
+                        json.Append("null");
+                    }
+                }
+                catch { }
+            }
+
+            if (keysAdded == 10) json.Append(",\"...\":\"truncated\"");
+            json.Append("}");
+
+            var result = json.ToString();
+            if (result.Length > maxBytes)
+                return result.Substring(0, maxBytes - 3) + "...";
+            return result;
+        }
+        catch
+        {
+            return "{}";
+        }
+    }
+
+    private string SerializeValueAtOffset(MongoSpyglass.Proxy.Bson.BlittableBsonDocument doc, int offset, int maxBytes)
+    {
+        if (maxBytes < 5) return "...";
+
+        try
+        {
+            // Try to serialize as string first (most common case)
+            try { return "\"" + EscapeJsonString(doc.GetString(offset)) + "\""; }
+            catch { }
+
+            // Try to serialize as number
+            try { return doc.GetInt32(offset).ToString(); }
+            catch { }
+
+            try { return doc.GetInt64(offset).ToString(); }
+            catch { }
+
+            try { return doc.GetDouble(offset).ToString("G17"); }
+            catch { }
+
+            try { return doc.GetBoolean(offset).ToString().ToLower(); }
+            catch { }
+
+            // Default for complex types
+            return "{...}";
+        }
+        catch
+        {
+            return "null";
+        }
+    }
+
+    private string EscapeJsonString(string str)
+    {
+        return str.Replace("\"", "\\\"").Replace("\n", "\\n").Replace("\r", "\\r").Replace("\t", "\\t");
     }
 
     public void OnConnectionClosed(string connectionId)
@@ -133,11 +443,11 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
                 bool hasItems = false;
 
                 // Drain the channel and insert into session
-                while (_channel.Reader.TryRead(out var fact))
+                while (_channel.Reader.TryRead(out var factObj))
                 {
                     lock (_syncLock)
                     {
-                        _session.Insert(fact);
+                        _session.Insert(factObj);
                     }
                     hasItems = true;
                 }

@@ -33,7 +33,7 @@ public class ArenaPool
         // If pool is at capacity, dispose the arena instead of pooling it
         if (_currentPoolSize >= _maxPoolSize)
         {
-            tracker.Dispose();
+            tracker.Arena.Dispose();
             return;
         }
 

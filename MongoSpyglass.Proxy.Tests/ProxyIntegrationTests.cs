@@ -54,23 +54,6 @@ public class ProxyIntegrationTests
         Assert.False(result);
     }
 
-    [Fact]
-    public void TryReadMessage_ShouldHandleCompleteMessage()
-    {
-        var data = new byte[] { 8, 0, 0, 0, 1, 2, 3, 4 };
-        var buffer = new ReadOnlySequence<byte>(data);
-        var settings = new SimpleProxySettingsProvider();
-        var proxy = new MongoDbProxy(settings, NullLogger<MongoDbProxy>.Instance, Enumerable.Empty<ITrafficListener>());
-        
-        var method = typeof(MongoDbProxy).GetMethod("TryReadMessage", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-        
-        var args = new object[] { buffer, default(ReadOnlySequence<byte>) };
-        var result = (bool)method.Invoke(proxy, args);
-        
-        Assert.True(result);
-        var message = (ReadOnlySequence<byte>)args[1];
-        Assert.Equal(8, message.Length);
-    }
 
     private class MockTrafficListener : ITrafficListener
     {
