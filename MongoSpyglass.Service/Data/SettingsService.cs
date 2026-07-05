@@ -12,6 +12,7 @@ public class AppSettings
     public int ProxyPort { get; set; } = 27018; // Listening port (proxy receives on this)
     public string MongoDbUrl { get; set; } = "127.0.0.1:27017"; // Target MongoDB server
     public string BindAddress { get; set; } = "0.0.0.0"; // Bind address (0.0.0.0 = all interfaces, 127.0.0.1 = localhost only)
+    public bool HeadlessMode { get; set; } = false; // Headless mode: skip Blazor UI, only expose metrics and proxy
     public bool RavenEmbedded { get; set; } = true;
     public string? RavenRemoteUrl { get; set; }
     public string RavenDatabase { get; set; } = "MongoSpyglass";

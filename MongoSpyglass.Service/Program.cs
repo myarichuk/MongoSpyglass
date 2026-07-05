@@ -16,9 +16,16 @@ Log.Logger = new LoggerConfiguration()
 
 var builder = WebApplication.CreateBuilder(args);
 
-builder.Services.AddRazorPages();
-builder.Services.AddServerSideBlazor();
-builder.Services.AddRadzenComponents();
+// Check if headless mode is enabled (from config/env) before registering UI services
+bool headlessMode = builder.Configuration.GetValue<bool>("Blazor:HeadlessMode") ||
+                    (bool.TryParse(Environment.GetEnvironmentVariable("HEADLESS_MODE"), out var envHeadless) && envHeadless);
+
+if (!headlessMode)
+{
+    builder.Services.AddRazorPages();
+    builder.Services.AddServerSideBlazor();
+    builder.Services.AddRadzenComponents();
+}
 
 builder.Services.AddSingleton<TrafficMonitorService>();
 builder.Services.AddSingleton<ITrafficListener>(sp => sp.GetRequiredService<TrafficMonitorService>());
@@ -75,7 +82,10 @@ app.UseRouting();
 // Prometheus metrics endpoint
 app.UseOpenTelemetryPrometheusScrapingEndpoint();
 
-app.MapBlazorHub();
-app.MapFallbackToPage("/_Host");
+if (!headlessMode)
+{
+    app.MapBlazorHub();
+    app.MapFallbackToPage("/_Host");
+}
 
 app.Run();
