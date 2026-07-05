@@ -153,3 +153,21 @@ public class CursorLeakAlertThresholdFact
 {
     public double IdleHoursThreshold { get; set; } = 1;
 }
+
+public class N1DetectionThresholdFact
+{
+    public int WindowMs { get; set; } = 5000;
+    public int CountThreshold { get; set; } = 5;
+}
+
+public class RequestWindowFact
+{
+    public string Key { get; set; } = string.Empty; // Format: "namespace|connectionId|hash"
+    public string Namespace { get; set; } = string.Empty;
+    public string ConnectionId { get; set; } = string.Empty;
+    public string Hash { get; set; } = string.Empty; // ShapeHash for N+1, ValueHash for duplicates
+    public DateTime FirstSeen { get; set; } = DateTime.UtcNow;
+    public DateTime LastSeen { get; set; } = DateTime.UtcNow;
+    public int Count { get; set; } = 1;
+    public List<string> ExampleHashes { get; set; } = new(); // For N+1, track different ValueHashes
+}

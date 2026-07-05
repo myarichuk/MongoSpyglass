@@ -29,6 +29,7 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
     private readonly SettingsService _settingsService;
     private SettingsSnapshotFact _settingsSnapshot;
     private CursorLeakAlertThresholdFact _leakAlertThreshold;
+    private N1DetectionThresholdFact _n1DetectionThreshold;
     private bool _hydrated = false;
     private bool _healthy = true;
     private DateTime _lastHydrateAttempt = DateTime.MinValue;
@@ -40,6 +41,7 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
         _settingsService = settingsService;
         _settingsSnapshot = new SettingsSnapshotFact { SlowQueryThresholdMs = settingsService.Current.SlowQueryThresholdMs };
         _leakAlertThreshold = new CursorLeakAlertThresholdFact { IdleHoursThreshold = settingsService.Current.CursorLeakAlertThresholdHours };
+        _n1DetectionThreshold = new N1DetectionThresholdFact { WindowMs = settingsService.Current.N1DetectionWindowMs, CountThreshold = settingsService.Current.N1CountThreshold };
         var repository = new RuleRepository();
         repository.Load(x => x.From(typeof(TrackRequestRule).Assembly));
         var factory = repository.Compile();
@@ -65,10 +67,13 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
         settingsService.OnSettingsChanged += () => {
             _settingsSnapshot.SlowQueryThresholdMs = settingsService.Current.SlowQueryThresholdMs;
             _leakAlertThreshold.IdleHoursThreshold = settingsService.Current.CursorLeakAlertThresholdHours;
+            _n1DetectionThreshold.WindowMs = settingsService.Current.N1DetectionWindowMs;
+            _n1DetectionThreshold.CountThreshold = settingsService.Current.N1CountThreshold;
             lock (_syncLock)
             {
                 _session.Update(_settingsSnapshot);
                 _session.Update(_leakAlertThreshold);
+                _session.Update(_n1DetectionThreshold);
             }
         };
     }
@@ -562,6 +567,7 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
                 _session.Insert(new CursorStatsFact());
                 _session.Insert(_settingsSnapshot);
                 _session.Insert(_leakAlertThreshold);
+                _session.Insert(_n1DetectionThreshold);
             }
             return;
         }
@@ -575,6 +581,7 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
             _session.Insert(stats ?? new CursorStatsFact { SessionId = sessionId });
             _session.Insert(_settingsSnapshot);
             _session.Insert(_leakAlertThreshold);
+            _session.Insert(_n1DetectionThreshold);
 
             foreach (var c in cursors)
             {

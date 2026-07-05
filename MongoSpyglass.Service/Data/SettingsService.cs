@@ -16,6 +16,8 @@ public class AppSettings
     public string RavenDatabase { get; set; } = "MongoSpyglass";
     public int SlowQueryThresholdMs { get; set; } = 100;
     public int CursorLeakAlertThresholdHours { get; set; } = 1; // Alert on idle > 1 hour (cleanup at 24h)
+    public int N1DetectionWindowMs { get; set; } = 5000; // 5-second window for N+1 detection
+    public int N1CountThreshold { get; set; } = 5; // Alert if ≥5 similar queries in window
     public int RawDataRetentionHours { get; set; } = 24;
 }
 
