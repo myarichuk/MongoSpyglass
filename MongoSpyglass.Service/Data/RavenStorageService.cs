@@ -397,6 +397,32 @@ public class RavenStorageService(ILogger<RavenStorageService> logger) : IDisposa
             .ToListAsync();
     }
 
+    public async Task<List<CursorFact>> GetHistoricalCursorsAsync(string sessionId, string? @namespace = null, string? connectionId = null, bool? orphanedOnly = null, DateTime? startDate = null, DateTime? endDate = null)
+    {
+        if (_store == null) return new();
+        using var session = _store.OpenAsyncSession();
+
+        var query = session.Query<CursorFact>()
+            .Where(x => x.SessionId == sessionId && x.IsClosed);
+
+        if (!string.IsNullOrEmpty(@namespace))
+            query = query.Where(x => x.Namespace == @namespace);
+
+        if (!string.IsNullOrEmpty(connectionId))
+            query = query.Where(x => x.ConnectionId == connectionId);
+
+        if (orphanedOnly.HasValue && orphanedOnly.Value)
+            query = query.Where(x => x.OrphanedByDisconnect);
+
+        if (startDate.HasValue)
+            query = query.Where(x => x.StartTime >= startDate.Value);
+
+        if (endDate.HasValue)
+            query = query.Where(x => x.ClosedAt <= endDate.Value);
+
+        return await query.OrderByDescending(x => x.ClosedAt).ToListAsync();
+    }
+
     public async Task StoreCursorStatsAsync(CursorStatsFact stats)
     {
         if (_store == null) return;

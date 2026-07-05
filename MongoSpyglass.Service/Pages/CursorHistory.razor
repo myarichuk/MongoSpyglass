@@ -1,0 +1,195 @@
+@page "/cursors"
+@using MongoSpyglass.Service.Data
+@using MongoSpyglass.Service.Analyzers
+@using MongoSpyglass.Service.Analyzers.Rete
+@namespace MongoSpyglass.Service.Pages
+@inject RavenStorageService RavenService
+@inject IEnumerable<IAnalyzerPlugin> Analyzers
+@implements IDisposable
+
+<main class="flex-1 overflow-auto p-container-padding flex flex-col gap-gutter">
+    <div class="flex justify-between items-end mb-unit">
+        <div>
+            <h2 class="font-ui-header text-ui-header text-on-surface">Cursor History</h2>
+            <p class="text-on-surface-variant mt-1 text-xs">Historical view of closed and orphaned cursors with filtering and analysis.</p>
+        </div>
+    </div>
+
+    <!-- Cursor Stats Widget -->
+    <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-4">
+        <div class="bg-surface-container border border-outline-variant rounded p-4 flex flex-col items-center justify-center">
+            <div class="text-xs text-on-surface-variant font-ui-label-sm mb-1 uppercase tracking-wider">Active Cursors</div>
+            <div class="text-3xl font-display-mono text-primary">@(Analyzers.OfType<ReteAnalyzerEngine>().FirstOrDefault()?.ActiveCursorsCount)</div>
+        </div>
+        <div class="bg-surface-container border border-outline-variant rounded p-4 flex flex-col items-center justify-center">
+            <div class="text-xs text-on-surface-variant font-ui-label-sm mb-1 uppercase tracking-wider">Total Closed</div>
+            <div class="text-3xl font-display-mono text-secondary">@(Analyzers.OfType<ReteAnalyzerEngine>().FirstOrDefault()?.GetCursorStats().TotalClosedCount)</div>
+        </div>
+        <div class="bg-surface-container border border-outline-variant rounded p-4 flex flex-col items-center justify-center">
+            <div class="text-xs text-on-surface-variant font-ui-label-sm mb-1 uppercase tracking-wider">Orphaned</div>
+            <div class="text-3xl font-display-mono text-error">@_orphanedCount</div>
+        </div>
+        <div class="bg-surface-container border border-outline-variant rounded p-4 flex flex-col items-center justify-center">
+            <div class="text-xs text-on-surface-variant font-ui-label-sm mb-1 uppercase tracking-wider">Avg Open Duration</div>
+            <div class="text-3xl font-display-mono text-tertiary">@(Analyzers.OfType<ReteAnalyzerEngine>().FirstOrDefault()?.GetCursorStats().AverageOpenTimeMs.ToString("F0"))ms</div>
+        </div>
+    </div>
+
+    <!-- Filters -->
+    <div class="bg-surface-container border border-outline-variant rounded p-4 flex flex-col gap-3">
+        <h3 class="font-ui-label-sm text-ui-label-sm text-on-surface">Filters</h3>
+        <div class="grid grid-cols-1 md:grid-cols-4 gap-3">
+            <div class="flex flex-col gap-1">
+                <label class="text-xs font-ui-label-sm text-on-surface-variant">Namespace</label>
+                <input type="text" class="px-2 py-1.5 bg-surface-container-high border border-outline-variant rounded text-on-surface text-sm" placeholder="(all)" @bind="_filterNamespace" />
+            </div>
+            <div class="flex flex-col gap-1">
+                <label class="text-xs font-ui-label-sm text-on-surface-variant">Connection ID</label>
+                <input type="text" class="px-2 py-1.5 bg-surface-container-high border border-outline-variant rounded text-on-surface text-sm" placeholder="(all)" @bind="_filterConnectionId" />
+            </div>
+            <div class="flex flex-col gap-1">
+                <label class="text-xs font-ui-label-sm text-on-surface-variant">From Date</label>
+                <input type="date" class="px-2 py-1.5 bg-surface-container-high border border-outline-variant rounded text-on-surface text-sm" @bind="_filterStartDate" />
+            </div>
+            <div class="flex flex-col gap-1">
+                <label class="text-xs font-ui-label-sm text-on-surface-variant">To Date</label>
+                <input type="date" class="px-2 py-1.5 bg-surface-container-high border border-outline-variant rounded text-on-surface text-sm" @bind="_filterEndDate" />
+            </div>
+        </div>
+        <div class="flex gap-2">
+            <label class="flex items-center gap-2 cursor-pointer">
+                <input type="checkbox" @bind="_filterOrphanedOnly" class="cursor-pointer" />
+                <span class="text-sm text-on-surface">Orphaned only</span>
+            </label>
+            <button class="px-3 py-1.5 bg-primary text-on-primary rounded hover:bg-primary/90 transition-colors font-ui-label-sm text-ui-label-sm" @onclick="ApplyFilters">
+                Apply Filters
+            </button>
+        </div>
+    </div>
+
+    <!-- Cursor Grid -->
+    <div class="flex-1 bg-surface-container border border-outline-variant rounded shadow-sm overflow-hidden flex flex-col min-h-[400px]">
+        <div class="px-4 py-2 border-b border-outline-variant bg-surface-container-low flex justify-between items-center shrink-0">
+            <h3 class="font-ui-label-sm text-ui-label-sm text-on-surface flex items-center gap-2">
+                <span class="material-symbols-outlined text-[16px]">history</span>
+                Closed Cursors (@_cursors.Count)
+            </h3>
+            <span class="font-display-mono text-display-mono text-[10px] text-on-surface-variant">Sorted by close time (desc)</span>
+        </div>
+        <div class="flex-1 overflow-auto">
+            @if (_cursors.Count == 0)
+            {
+                <div class="flex items-center justify-center h-full text-on-surface-variant">
+                    <p>No closed cursors found. Active cursors will appear here when closed.</p>
+                </div>
+            }
+            else
+            {
+                <table class="w-full text-left border-collapse whitespace-nowrap">
+                    <thead class="sticky top-0 bg-surface-container-high z-10 shadow-sm border-b border-outline-variant">
+                        <tr>
+                            <th class="py-cell-padding-y px-cell-padding-x font-ui-label-sm text-ui-label-sm text-on-surface-variant font-semibold">Namespace</th>
+                            <th class="py-cell-padding-y px-cell-padding-x font-ui-label-sm text-ui-label-sm text-on-surface-variant font-semibold">Connection</th>
+                            <th class="py-cell-padding-y px-cell-padding-x font-ui-label-sm text-ui-label-sm text-on-surface-variant font-semibold text-right">Cursor ID</th>
+                            <th class="py-cell-padding-y px-cell-padding-x font-ui-label-sm text-ui-label-sm text-on-surface-variant font-semibold text-right">Duration (ms)</th>
+                            <th class="py-cell-padding-y px-cell-padding-x font-ui-label-sm text-ui-label-sm text-on-surface-variant font-semibold text-right">Docs</th>
+                            <th class="py-cell-padding-y px-cell-padding-x font-ui-label-sm text-ui-label-sm text-on-surface-variant font-semibold">Closed</th>
+                            <th class="py-cell-padding-y px-cell-padding-x font-ui-label-sm text-ui-label-sm text-on-surface-variant font-semibold">Status</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-outline-variant/50">
+                        @foreach (var cursor in _cursors)
+                        {
+                            var isOrphaned = cursor.OrphanedByDisconnect;
+                            var statusColor = isOrphaned ? "text-error" : "text-success";
+                            <tr class="hover:bg-surface-variant/30">
+                                <td class="py-cell-padding-y px-cell-padding-x">
+                                    <span class="font-code-block text-code-block text-secondary text-xs">@cursor.Namespace</span>
+                                </td>
+                                <td class="py-cell-padding-y px-cell-padding-x">
+                                    <span class="font-code-block text-code-block text-tertiary text-[10px] truncate max-w-[120px]" title="@cursor.ConnectionId">@cursor.ConnectionId</span>
+                                </td>
+                                <td class="py-cell-padding-y px-cell-padding-x text-right">
+                                    <span class="font-display-mono text-display-mono text-[11px]">@cursor.Id</span>
+                                </td>
+                                <td class="py-cell-padding-y px-cell-padding-x text-right">
+                                    <span class="font-display-mono text-display-mono text-on-surface-variant">@(cursor.ClosedAt.HasValue ? (cursor.ClosedAt.Value - cursor.StartTime).TotalMilliseconds.ToString("F0") : "—")ms</span>
+                                </td>
+                                <td class="py-cell-padding-y px-cell-padding-x text-right">
+                                    <span class="font-display-mono text-display-mono text-on-surface-variant">@cursor.TotalDocs</span>
+                                </td>
+                                <td class="py-cell-padding-y px-cell-padding-x text-xs">
+                                    <span class="text-on-surface-variant">@cursor.ClosedAt?.ToString("yyyy-MM-dd HH:mm:ss")</span>
+                                </td>
+                                <td class="py-cell-padding-y px-cell-padding-x">
+                                    @if (isOrphaned)
+                                    {
+                                        <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-semibold @statusColor bg-error/10">
+                                            <span class="material-symbols-outlined text-[12px]">warning</span>
+                                            Orphaned
+                                        </span>
+                                    }
+                                    else
+                                    {
+                                        <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-semibold @statusColor bg-success/10">
+                                            <span class="material-symbols-outlined text-[12px]">check</span>
+                                            Closed
+                                        </span>
+                                    }
+                                </td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            }
+        </div>
+    </div>
+</main>
+
+@code {
+    private List<CursorFact> _cursors = new();
+    private int _orphanedCount = 0;
+    private string? _filterNamespace;
+    private string? _filterConnectionId;
+    private DateTime? _filterStartDate;
+    private DateTime? _filterEndDate;
+    private bool _filterOrphanedOnly = false;
+    private string? _activeSessionId;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _activeSessionId = await GetActiveSessionIdAsync();
+        if (_activeSessionId != null)
+        {
+            await ApplyFilters();
+        }
+    }
+
+    private async Task ApplyFilters()
+    {
+        if (_activeSessionId == null) return;
+
+        _cursors = await RavenService.GetHistoricalCursorsAsync(
+            _activeSessionId,
+            string.IsNullOrWhiteSpace(_filterNamespace) ? null : _filterNamespace,
+            string.IsNullOrWhiteSpace(_filterConnectionId) ? null : _filterConnectionId,
+            _filterOrphanedOnly ? true : null,
+            _filterStartDate,
+            _filterEndDate
+        );
+
+        _orphanedCount = _cursors.Count(c => c.OrphanedByDisconnect);
+        StateHasChanged();
+    }
+
+    private async Task<string?> GetActiveSessionIdAsync()
+    {
+        var sessions = await RavenService.GetSessionsAsync();
+        return sessions.FirstOrDefault(x => x.IsActive)?.Id;
+    }
+
+    public void Dispose()
+    {
+        // Cleanup if needed
+    }
+}
