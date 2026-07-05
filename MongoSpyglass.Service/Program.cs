@@ -2,8 +2,10 @@ using System.Net;
 using Autofac.Extensions.DependencyInjection;
 using Autofac;
 using MongoSpyglass.Proxy;
+using MongoSpyglass.Proxy.Profiling;
 using MongoSpyglass.Service.Data;
 using MongoSpyglass.Service.Analyzers;
+using OpenTelemetry.Metrics;
 using Radzen;
 using Serilog;
 
@@ -30,6 +32,17 @@ builder.Services.AddSingleton<ReteAnalyzerEngine>();
 builder.Services.AddSingleton<IAnalyzerPlugin>(sp => sp.GetRequiredService<ReteAnalyzerEngine>());
 builder.Services.AddHostedService(sp => sp.GetRequiredService<ReteAnalyzerEngine>());
 builder.Services.AddSingleton<ITrafficListener>(sp => sp.GetRequiredService<ReteAnalyzerEngine>());
+
+builder.Services.AddSingleton<CorrelationRingBuffer>();
+builder.Services.AddSingleton<MetricsService>();
+
+builder.Services.AddOpenTelemetry()
+    .WithMetrics(meterBuilder =>
+    {
+        meterBuilder
+            .AddPrometheusExporter()
+            .AddMeter("MongoSpyglass");
+    });
 
 builder.Services.AddHostedService<MongoDbProxy>();
 
@@ -58,6 +71,9 @@ if (!app.Environment.IsDevelopment())
 app.UseStaticFiles();
 
 app.UseRouting();
+
+// Prometheus metrics endpoint
+app.UseOpenTelemetryPrometheusScrapingEndpoint();
 
 app.MapBlazorHub();
 app.MapFallbackToPage("/_Host");

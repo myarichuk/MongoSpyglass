@@ -25,7 +25,9 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
     private readonly System.Timers.Timer _uiUpdateTimer;
     private readonly RavenStorageService _ravenService;
     private readonly NotificationHubService _notificationHub;
+    private readonly MetricsService? _metricsService;
     private bool _needsUiUpdate = false;
+    private long _droppedMessageCount = 0;
 
     public event Action? OnTrafficReceived;
 
@@ -33,10 +35,11 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
     public int ThroughputOpsPerSec { get; private set; }
     public double? AverageLatencyMs { get; private set; }
 
-    public TrafficMonitorService(RavenStorageService ravenService, NotificationHubService notificationHub)
+    public TrafficMonitorService(RavenStorageService ravenService, NotificationHubService notificationHub, MetricsService? metricsService = null)
     {
         _ravenService = ravenService;
         _notificationHub = notificationHub;
+        _metricsService = metricsService;
         _incomingChannel = Channel.CreateBounded<ObservedMessage>(new BoundedChannelOptions(2048)
         {
             FullMode = BoundedChannelFullMode.DropWrite,
@@ -180,6 +183,8 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
         if (!_incomingChannel.Writer.TryWrite(msg))
         {
             msg.Release();
+            Interlocked.Increment(ref _droppedMessageCount);
+            _metricsService?.SetDroppedMessageCount(_droppedMessageCount);
         }
     }
 
@@ -203,6 +208,12 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
                                 SizeBytes = pending.Op.SizeBytes + msg.MessageSizeBytes,
                                 DocumentCount = msg.DocumentCount
                             };
+
+                            // Record metrics
+                            if (_metricsService != null && duration >= 0)
+                            {
+                                _metricsService.RecordOperation(duration);
+                            }
 
                             // Persist COMPLETED operation to RavenDB
                             _ = _ravenService.StoreOperationAsync(finalOp, pending.Bson);
