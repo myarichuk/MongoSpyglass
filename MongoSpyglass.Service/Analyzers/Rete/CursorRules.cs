@@ -243,3 +243,45 @@ public class CursorLeakAlertRule : Rule
         ctx.Insert(insight);
     }
 }
+
+public class AttributeAppNameRule : Rule
+{
+    public override void Define()
+    {
+        ConnectionAppInfoFact? appInfo = null;
+        CursorFact? cursor = null;
+
+        When()
+            .Match<ConnectionAppInfoFact>(() => appInfo)
+            .Match<CursorFact>(() => cursor, c => c.ConnectionId == appInfo!.ConnectionId && c.AppName == null);
+
+        Then()
+            .Do(ctx => AttributeAppName(ctx, cursor!, appInfo!));
+    }
+
+    private void AttributeAppName(IContext ctx, CursorFact cursor, ConnectionAppInfoFact appInfo)
+    {
+        // Create a new cursor fact with the app name set
+        var updatedCursor = new CursorFact
+        {
+            RavenId = cursor.RavenId,
+            SessionId = cursor.SessionId,
+            Id = cursor.Id,
+            Namespace = cursor.Namespace,
+            ConnectionId = cursor.ConnectionId,
+            AppName = appInfo.AppName,
+            StartTime = cursor.StartTime,
+            LastActivity = cursor.LastActivity,
+            TotalBytes = cursor.TotalBytes,
+            TotalDocs = cursor.TotalDocs,
+            IsClosed = cursor.IsClosed,
+            ClosureReason = cursor.ClosureReason,
+            ClosedAt = cursor.ClosedAt,
+            OrphanedByDisconnect = cursor.OrphanedByDisconnect
+        };
+
+        // Retract the old fact and insert the updated one
+        ctx.Retract(cursor);
+        ctx.Insert(updatedCursor);
+    }
+}

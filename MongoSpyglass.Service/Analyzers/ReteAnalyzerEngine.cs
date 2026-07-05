@@ -182,9 +182,10 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
             }
             else if (msg.Tag == "from")
             {
-                // Response message: extract cursor, namespace, document count
+                // Response message: extract cursor, namespace, document count, and app info (from hello/isMaster)
                 long? cursorId = null;
                 string? ns = null;
+                string? appName = null;
 
                 if (!msg.Document.IsDefault)
                 {
@@ -200,6 +201,20 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
                             if (cursorDoc.TryGetElementOffset("ns", out var nsOffset))
                             {
                                 ns = cursorDoc.GetString(nsOffset);
+                            }
+                        }
+
+                        // Extract client.application.name from hello/isMaster response
+                        if (msg.Document.TryGetElementOffset("client", out var clientOffset))
+                        {
+                            var clientDoc = msg.Document.GetDocument(clientOffset, msg.Tracker.Arena);
+                            if (clientDoc.TryGetElementOffset("application", out var appOffset))
+                            {
+                                var appDoc = clientDoc.GetDocument(appOffset, msg.Tracker.Arena);
+                                if (appDoc.TryGetElementOffset("name", out var nameOffset))
+                                {
+                                    appName = appDoc.GetString(nameOffset);
+                                }
                             }
                         }
                     }
@@ -219,6 +234,17 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
                 };
 
                 TryWrite(responseFact);
+
+                // If this is a hello/isMaster response with app info, save it
+                if (appName != null)
+                {
+                    TryWrite(new ConnectionAppInfoFact
+                    {
+                        ConnectionId = msg.ConnectionId,
+                        AppName = appName,
+                        Timestamp = timestamp
+                    });
+                }
             }
         }
         catch (Exception ex)

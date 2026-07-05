@@ -88,6 +88,7 @@
                 <table class="w-full text-left border-collapse whitespace-nowrap">
                     <thead class="sticky top-0 bg-surface-container-high z-10 shadow-sm border-b border-outline-variant">
                         <tr>
+                            <th class="py-cell-padding-y px-cell-padding-x font-ui-label-sm text-ui-label-sm text-on-surface-variant font-semibold">App</th>
                             <th class="py-cell-padding-y px-cell-padding-x font-ui-label-sm text-ui-label-sm text-on-surface-variant font-semibold">Namespace</th>
                             <th class="py-cell-padding-y px-cell-padding-x font-ui-label-sm text-ui-label-sm text-on-surface-variant font-semibold">Connection</th>
                             <th class="py-cell-padding-y px-cell-padding-x font-ui-label-sm text-ui-label-sm text-on-surface-variant font-semibold text-right">Cursor ID</th>
@@ -103,6 +104,16 @@
                             var isOrphaned = cursor.OrphanedByDisconnect;
                             var statusColor = isOrphaned ? "text-error" : "text-success";
                             <tr class="hover:bg-surface-variant/30">
+                                <td class="py-cell-padding-y px-cell-padding-x">
+                                    @if (!string.IsNullOrEmpty(cursor.AppName))
+                                    {
+                                        <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-semibold bg-primary/10 text-primary">@cursor.AppName</span>
+                                    }
+                                    else
+                                    {
+                                        <span class="text-on-surface-variant text-xs">—</span>
+                                    }
+                                </td>
                                 <td class="py-cell-padding-y px-cell-padding-x">
                                     <span class="font-code-block text-code-block text-secondary text-xs">@cursor.Namespace</span>
                                 </td>

@@ -11,6 +11,7 @@ public class CursorFact
     public long Id { get; set; }
     public string Namespace { get; set; } = string.Empty;
     public string ConnectionId { get; set; } = string.Empty;
+    public string? AppName { get; set; } // Client app name from hello/isMaster handshake
     public DateTime StartTime { get; set; } = DateTime.UtcNow;
     public DateTime LastActivity { get; set; } = DateTime.UtcNow; // For TTL
     public long TotalBytes { get; set; }
@@ -40,6 +41,13 @@ public class PendingKillFact
 {
     public long CursorId { get; set; }
     public string ConnectionId { get; set; } = string.Empty;
+}
+
+public class ConnectionAppInfoFact
+{
+    public string ConnectionId { get; set; } = string.Empty;
+    public string? AppName { get; set; }
+    public DateTime Timestamp { get; set; } = DateTime.UtcNow;
 }
 
 public class CursorStatsFact
