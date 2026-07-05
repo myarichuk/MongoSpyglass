@@ -23,20 +23,30 @@ public readonly unsafe struct BlittableBsonArray : IReadOnlyList<BlittableBsonAr
         _arena = arena;
 
         _index = new ArenaList<int>(arena, initialCapacity: 16);
-        
+
         int pos = 4;
+        byte* pEnd = bsonBytes + length;
         while (pos < length - 1)
         {
             var type = (BlittableBsonConstants.BsonType)bsonBytes[pos];
             int nameStart = pos + 1;
             int nameEnd = nameStart;
-            while (bsonBytes[nameEnd] != 0) nameEnd++;
+            // Scan for null terminator with bounds check
+            while (nameEnd < length && bsonBytes[nameEnd] != 0) nameEnd++;
+
+            if (nameEnd >= length)
+            {
+                break; // Malformed: no null terminator
+            }
 
             _index.Add(pos);
 
             var dataPtr = bsonBytes + nameEnd + 1;
             int dataPos = (int)(dataPtr - bsonBytes);
-            pos = ArenaBsonReader.SkipElement(bsonBytes, dataPos, type, length);
+            if (!ArenaBsonReader.TrySkipElement(bsonBytes, dataPos, type, length, out pos))
+            {
+                break; // Invalid element
+            }
         }
     }
 
@@ -48,14 +58,18 @@ public readonly unsafe struct BlittableBsonArray : IReadOnlyList<BlittableBsonAr
         {
             int pos = _index[index];
             var type = (BlittableBsonConstants.BsonType)_bsonBytes[pos];
-            
+
             int nameStart = pos + 1;
             int nameEnd = nameStart;
-            while (_bsonBytes[nameEnd] != 0) nameEnd++;
+            // Scan for null terminator with bounds check
+            while (nameEnd < _length && _bsonBytes[nameEnd] != 0) nameEnd++;
 
             var dataPtr = _bsonBytes + nameEnd + 1;
             int dataPos = (int)(dataPtr - _bsonBytes);
-            int endPos = ArenaBsonReader.SkipElement(_bsonBytes, dataPos, type, _length);
+            if (!ArenaBsonReader.TrySkipElement(_bsonBytes, dataPos, type, _length, out int endPos))
+            {
+                return new Element(dataPtr, type, 0, _arena); // Invalid element
+            }
 
             return new Element(dataPtr, type, endPos - dataPos, _arena);
         }
@@ -128,6 +142,11 @@ public readonly unsafe struct BlittableBsonArray : IReadOnlyList<BlittableBsonAr
             }
 
             int len = *(int*)_p;
+            // Validate string length is positive and within bounds (4 bytes for length prefix + string content)
+            if (len <= 0 || len - 1 > _length - 4)
+            {
+                throw new InvalidOperationException($"Invalid string length: {len} (max: {_length})");
+            }
             return System.Text.Encoding.UTF8.GetString(_p + 4, len - 1);
         }
 

@@ -24,6 +24,8 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
     private readonly TimeTick _tick = new();
     private readonly RavenStorageService _ravenService;
     private bool _hydrated = false;
+    private bool _healthy = true;
+    private DateTime _lastHydrateAttempt = DateTime.MinValue;
 
     public ReteAnalyzerEngine(RavenStorageService ravenService)
     {
@@ -48,6 +50,7 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
     }
 
     public string Name => "Rete Analyzer Engine";
+    public bool IsHealthy => _healthy;
 
     public IEnumerable<Insight> GetInsights() => _insights.ToArray();
 
@@ -105,78 +108,99 @@ public class ReteAnalyzerEngine : BackgroundService, IAnalyzerPlugin
         {
             _session.Insert(_tick);
         }
-        
+
         DateTime lastTick = DateTime.UtcNow;
         DateTime lastSave = DateTime.UtcNow;
-        
+
         while (!stoppingToken.IsCancellationRequested)
         {
-            if (!_hydrated)
+            try
             {
-                await HydrateAsync();
-                _hydrated = true;
-            }
-
-            bool hasItems = false;
-            
-            // Drain the channel and insert into session
-            while (_channel.Reader.TryRead(out var fact))
-            {
-                lock (_syncLock)
+                if (!_hydrated)
                 {
-                    _session.Insert(fact);
-                }
-                hasItems = true;
-            }
-
-            var now = DateTime.UtcNow;
-
-            // Periodic tick for TTL
-            if ((now - lastTick).TotalSeconds >= 1)
-            {
-                lock (_syncLock)
-                {
-                    _tick.CurrentTime = now;
-                    _session.Update(_tick);
-                }
-                hasItems = true;
-                lastTick = now;
-            }
-
-            // Periodic save
-            if ((now - lastSave).TotalMinutes >= 1)
-            {
-                await SaveStateAsync();
-                lastSave = now;
-            }
-
-            if (!hasItems && _channel.Reader.Count == 0)
-            {
-                try {
-                    using var cts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
-                    cts.CancelAfter(TimeSpan.FromSeconds(1));
-                    await _channel.Reader.WaitToReadAsync(cts.Token);
-                } catch (OperationCanceledException) { }
-                continue;
-            }
-
-            if (hasItems)
-            {
-                lock (_syncLock)
-                {
-                    _session.Fire();
-                    
-                    // Harvest insights produced by rules
-                    var insights = _session.Query<Insight>().ToList();
-                    foreach (var insight in insights)
+                    // Apply backoff if hydration keeps failing
+                    if ((DateTime.UtcNow - _lastHydrateAttempt).TotalSeconds < 1)
                     {
-                        _insights.Enqueue(insight);
-                        _session.Retract(insight);
-                        
-                        // Limit insights
-                        while (_insights.Count > 100) _insights.TryDequeue(out _);
+                        await Task.Delay(1000, stoppingToken);
+                        continue;
+                    }
+
+                    _lastHydrateAttempt = DateTime.UtcNow;
+                    await HydrateAsync();
+                    _hydrated = true;
+                }
+
+                bool hasItems = false;
+
+                // Drain the channel and insert into session
+                while (_channel.Reader.TryRead(out var fact))
+                {
+                    lock (_syncLock)
+                    {
+                        _session.Insert(fact);
+                    }
+                    hasItems = true;
+                }
+
+                var now = DateTime.UtcNow;
+
+                // Periodic tick for TTL
+                if ((now - lastTick).TotalSeconds >= 1)
+                {
+                    lock (_syncLock)
+                    {
+                        _tick.CurrentTime = now;
+                        _session.Update(_tick);
+                    }
+                    hasItems = true;
+                    lastTick = now;
+                }
+
+                // Periodic save
+                if ((now - lastSave).TotalMinutes >= 1)
+                {
+                    await SaveStateAsync();
+                    lastSave = now;
+                }
+
+                if (!hasItems && _channel.Reader.Count == 0)
+                {
+                    try
+                    {
+                        using var cts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+                        cts.CancelAfter(TimeSpan.FromSeconds(1));
+                        await _channel.Reader.WaitToReadAsync(cts.Token);
+                    }
+                    catch (OperationCanceledException) { }
+                    continue;
+                }
+
+                if (hasItems)
+                {
+                    lock (_syncLock)
+                    {
+                        _session.Fire();
+
+                        // Harvest insights produced by rules
+                        var insights = _session.Query<Insight>().ToList();
+                        foreach (var insight in insights)
+                        {
+                            _insights.Enqueue(insight);
+                            _session.Retract(insight);
+
+                            // Limit insights
+                            while (_insights.Count > 100) _insights.TryDequeue(out _);
+                        }
                     }
                 }
+
+                _healthy = true;
+            }
+            catch (Exception ex)
+            {
+                _healthy = false;
+                System.Diagnostics.Debug.WriteLine($"Error in ReteAnalyzerEngine loop: {ex.Message}");
+                await Task.Delay(1000, stoppingToken); // Back off before retrying
             }
         }
     }

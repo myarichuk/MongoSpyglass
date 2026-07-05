@@ -232,13 +232,18 @@ public readonly unsafe struct BlittableBsonDocument
 
     public ReadOnlySpan<byte> GetStringBytes(int offset)
     {
-        var p = GetDataPointerAtOffset(offset, out var type, out _);
+        var p = GetDataPointerAtOffset(offset, out var type, out var totalLength);
         if (type != BlittableBsonConstants.BsonType.String)
         {
             throw new InvalidCastException($"Cannot cast {type} to String");
         }
 
         int strLen = *(int*)p;
+        // Validate string length is positive and within bounds (4 bytes for length prefix + string content)
+        if (strLen <= 0 || strLen - 1 > totalLength - 4)
+        {
+            throw new InvalidOperationException($"Invalid string length: {strLen} (max: {totalLength})");
+        }
         return new ReadOnlySpan<byte>(p + 4, strLen - 1);
     }
 
@@ -402,10 +407,21 @@ public readonly unsafe struct BlittableBsonDocument
     {
         type = (BlittableBsonConstants.BsonType)_bsonBytes[offset];
         var ptr = _bsonBytes + offset + 1;
-        while (*ptr != 0) ptr++; 
+        // Scan for null terminator with bounds check
+        var ptrEnd = _bsonBytes + _length;
+        while (ptr < ptrEnd && *ptr != 0) ptr++;
+        if (ptr >= ptrEnd)
+        {
+            length = 0;
+            return null!; // Malformed: no null terminator found
+        }
         var dataPtr = ptr + 1;
         int dataPos = (int)(dataPtr - _bsonBytes);
-        int endPos = ArenaBsonReader.SkipElement(_bsonBytes, dataPos, type, _length);
+        if (!ArenaBsonReader.TrySkipElement(_bsonBytes, dataPos, type, _length, out int endPos))
+        {
+            length = 0;
+            return null!; // Invalid element
+        }
         length = endPos - dataPos;
         return dataPtr;
     }

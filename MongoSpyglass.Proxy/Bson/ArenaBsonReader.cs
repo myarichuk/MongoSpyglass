@@ -58,11 +58,9 @@ public static unsafe class ArenaBsonReader
                 }
 
                 index.Add(name, pos); // offset of the element (including type)
-                pos = SkipElement(pBuffer, nameEnd + 1, type, docLen);
-                
-                if (pos > docLen || pos < 0)
+                if (!TrySkipElement(pBuffer, nameEnd + 1, type, docLen, out pos))
                 {
-                    return default; // Out of bounds
+                    return default; // Out of bounds or invalid
                 }
             }
 
@@ -80,47 +78,114 @@ public static unsafe class ArenaBsonReader
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static int SafeReadInt32(byte* ptr, int offset, int totalLen)
+    private static bool TrySafeReadInt32(byte* ptr, int offset, int totalLen, out int value)
     {
         if (offset + 4 > totalLen)
-            return -1; // signal invalid
-        return *(int*)(ptr + offset);
+        {
+            value = 0;
+            return false;
+        }
+        value = *(int*)(ptr + offset);
+        return true;
     }
 
     /// <summary>
-    /// Skips over a BSON element. Returns the new position or -1 on invalid/truncated data.
+    /// Skips over a BSON element. Returns the new position or false on invalid/truncated data.
     /// This version is hardened against malicious or truncated documents.
+    /// </summary>
+    public static bool TrySkipElement(byte* ptr, int dataPos, BlittableBsonConstants.BsonType type, int totalLen, out int newPos)
+    {
+        return TrySkipElementInternal(ptr, dataPos, type, totalLen, out newPos);
+    }
+
+    /// <summary>
+    /// Backward-compat wrapper: returns position or -1 on error.
     /// </summary>
     public static int SkipElement(byte* ptr, int dataPos, BlittableBsonConstants.BsonType type, int totalLen)
     {
+        return TrySkipElementInternal(ptr, dataPos, type, totalLen, out var newPos) ? newPos : -1;
+    }
+
+    private static bool TrySkipElementInternal(byte* ptr, int dataPos, BlittableBsonConstants.BsonType type, int totalLen, out int newPos)
+    {
         if (dataPos >= totalLen)
         {
-            return -1;
+            newPos = 0;
+            return false;
         }
 
-        return type switch
+        switch (type)
         {
-            BlittableBsonConstants.BsonType.Double => dataPos + 8,
-            BlittableBsonConstants.BsonType.String or
-            (BlittableBsonConstants.BsonType)14 => // Symbol
-                dataPos + 4 + SafeReadInt32(ptr, dataPos, totalLen),
-            BlittableBsonConstants.BsonType.Document or
-            BlittableBsonConstants.BsonType.Array or
-            BlittableBsonConstants.BsonType.CodeWithScope => 
-                dataPos + SafeReadInt32(ptr, dataPos, totalLen),
-            BlittableBsonConstants.BsonType.Binary =>
-                dataPos + 4 + 1 + SafeReadInt32(ptr, dataPos, totalLen),
-            BlittableBsonConstants.BsonType.ObjectId => dataPos + 12,
-            BlittableBsonConstants.BsonType.Boolean => dataPos + 1,
-            BlittableBsonConstants.BsonType.DateTime => dataPos + 8,
-            BlittableBsonConstants.BsonType.Null => dataPos,
-            BlittableBsonConstants.BsonType.Int32 => dataPos + 4,
-            BlittableBsonConstants.BsonType.Int64 => dataPos + 8,
-            BlittableBsonConstants.BsonType.Decimal128 => dataPos + 16,
-            BlittableBsonConstants.BsonType.Timestamp => dataPos + 8,
-            BlittableBsonConstants.BsonType.MinKey or 
-            BlittableBsonConstants.BsonType.MaxKey => dataPos,
-            _ => -1 // Unsupported or invalid type
-        };
+            case BlittableBsonConstants.BsonType.Double:
+                newPos = dataPos + 8;
+                break;
+            case BlittableBsonConstants.BsonType.String:
+            case (BlittableBsonConstants.BsonType)14: // Symbol
+                if (!TrySafeReadInt32(ptr, dataPos, totalLen, out int strLen) || strLen < 0)
+                {
+                    newPos = 0;
+                    return false;
+                }
+                newPos = dataPos + 4 + strLen;
+                break;
+            case BlittableBsonConstants.BsonType.Document:
+            case BlittableBsonConstants.BsonType.Array:
+            case BlittableBsonConstants.BsonType.CodeWithScope:
+                if (!TrySafeReadInt32(ptr, dataPos, totalLen, out int len) || len < 0)
+                {
+                    newPos = 0;
+                    return false;
+                }
+                newPos = dataPos + len;
+                break;
+            case BlittableBsonConstants.BsonType.Binary:
+                if (!TrySafeReadInt32(ptr, dataPos, totalLen, out int binLen) || binLen < 0)
+                {
+                    newPos = 0;
+                    return false;
+                }
+                newPos = dataPos + 4 + 1 + binLen;
+                break;
+            case BlittableBsonConstants.BsonType.ObjectId:
+                newPos = dataPos + 12;
+                break;
+            case BlittableBsonConstants.BsonType.Boolean:
+                newPos = dataPos + 1;
+                break;
+            case BlittableBsonConstants.BsonType.DateTime:
+                newPos = dataPos + 8;
+                break;
+            case BlittableBsonConstants.BsonType.Null:
+                newPos = dataPos;
+                break;
+            case BlittableBsonConstants.BsonType.Int32:
+                newPos = dataPos + 4;
+                break;
+            case BlittableBsonConstants.BsonType.Int64:
+                newPos = dataPos + 8;
+                break;
+            case BlittableBsonConstants.BsonType.Decimal128:
+                newPos = dataPos + 16;
+                break;
+            case BlittableBsonConstants.BsonType.Timestamp:
+                newPos = dataPos + 8;
+                break;
+            case BlittableBsonConstants.BsonType.MinKey:
+            case BlittableBsonConstants.BsonType.MaxKey:
+                newPos = dataPos;
+                break;
+            default:
+                newPos = 0;
+                return false; // Unsupported or invalid type
+        }
+
+        // Validate the computed position
+        if (newPos < 0 || newPos > totalLen)
+        {
+            newPos = 0;
+            return false;
+        }
+
+        return true;
     }
 }

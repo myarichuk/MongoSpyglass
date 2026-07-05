@@ -49,6 +49,7 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
         _throughputTimer.Elapsed += (s, e) => {
             CalculateThroughput();
             CalculateAvgLatency();
+            PeriodicPendingRequestCleanup();
         };
         _throughputTimer.Start();
 
@@ -351,6 +352,11 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
                     _notificationHub.Refresh();
                     RequestUiUpdate();
                 }
+                catch (Exception ex)
+                {
+                    // Log the exception but don't crash the loop
+                    System.Diagnostics.Debug.WriteLine($"Error processing message: {ex.Message}");
+                }
                 finally
                 {
                     msg.Release();
@@ -397,6 +403,32 @@ public class TrafficMonitorService : ITrafficListener, IDisposable
             _lock.ExitReadLock();
         }
         RequestUiUpdate();
+    }
+
+    public void OnConnectionClosed(string connectionId)
+    {
+        // Purge all pending requests for this connection
+        var keysToRemove = _pendingRequests.Keys.Where(k => k.ConnectionId == connectionId).ToList();
+        foreach (var key in keysToRemove)
+        {
+            _pendingRequests.TryRemove(key, out _);
+        }
+    }
+
+    private void PeriodicPendingRequestCleanup()
+    {
+        // TTL for pending requests that never received a response (5 minutes)
+        const int PendingRequestTtlMs = 5 * 60 * 1000;
+        var now = DateTime.Now;
+        var keysToRemove = _pendingRequests
+            .Where(kvp => (now - kvp.Value.Op.Timestamp).TotalMilliseconds > PendingRequestTtlMs)
+            .Select(kvp => kvp.Key)
+            .ToList();
+
+        foreach (var key in keysToRemove)
+        {
+            _pendingRequests.TryRemove(key, out _);
+        }
     }
 
     public void Dispose()

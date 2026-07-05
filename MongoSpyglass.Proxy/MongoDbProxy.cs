@@ -33,6 +33,8 @@ public class MongoDbProxy : IHostedService
     private CancellationTokenSource? _runCts;
     private Task? _acceptTask;
 
+    private bool _compressedTrafficWarningLogged = false;
+
     public MongoDbProxy(IProxySettingsProvider settingsProvider, ILogger<MongoDbProxy> logger, IEnumerable<ITrafficListener> listeners)
     {
         _settingsProvider = settingsProvider;
@@ -269,6 +271,16 @@ public class MongoDbProxy : IHostedService
         buffer.Slice(0, 4).CopyTo(lengthBytes);
         int length = BinaryPrimitives.ReadInt32LittleEndian(lengthBytes);
 
+        // Validate frame length: must be at least 16 bytes (MsgHeader minimum) and at most 48 MB (MongoDB's max)
+        const int MinMessageSize = 16; // sizeof(MsgHeader)
+        const int MaxMessageSize = 48 * 1024 * 1024; // 48 MB
+        if (length < MinMessageSize || length > MaxMessageSize)
+        {
+            _logger.LogWarning($"Invalid frame length {length} (expected 16..{MaxMessageSize})");
+            message = default;
+            return false;
+        }
+
         if (buffer.Length < length)
         {
             message = default;
@@ -291,12 +303,20 @@ public class MongoDbProxy : IHostedService
             var bytes = (byte*)arena.Alloc((nuint)message.Length);
             message.CopyTo(new Span<byte>(bytes, (int)message.Length));
 
+            // Defense-in-depth: ensure message is at least MsgHeader-sized before dereferencing
+            int headerSize = Unsafe.SizeOf<MsgHeader>();
+            if (message.Length < headerSize)
+            {
+                _logger.LogWarning($"Message too small ({message.Length} bytes) for MsgHeader ({headerSize} bytes)");
+                tracker.Release();
+                return;
+            }
+
             var header = (MsgHeader*)bytes;
             int requestId = header->RequestID;
             int responseTo = header->ResponseTo;
             opCode = header->OpCode;
 
-            int headerSize = Unsafe.SizeOf<MsgHeader>();
             var bodyPtr = bytes + headerSize;
             int bodyLength = (int)message.Length - headerSize;
 
@@ -353,6 +373,11 @@ public class MongoDbProxy : IHostedService
                         {
                             if (p + 4 > metadataPtr + metadataLen) break;
                             int seqSize = BinaryPrimitives.ReadInt32LittleEndian(new ReadOnlySpan<byte>(p, 4));
+                            // Validate seqSize is positive and won't walk past buffer bounds
+                            if (seqSize <= 0 || p + seqSize > metadataPtr + metadataLen)
+                            {
+                                break;
+                            }
                             p += seqSize;
                         }
                         else break;
@@ -375,6 +400,16 @@ public class MongoDbProxy : IHostedService
                         metadataPtr += 20;
                         metadataLen -= 20;
                     }
+                }
+                else if (opCode == OpCode.OP_COMPRESSED)
+                {
+                    // OP_COMPRESSED traffic is not yet decompressed; log a one-time warning
+                    if (!_compressedTrafficWarningLogged)
+                    {
+                        _logger.LogWarning("Compressed traffic detected (OP_COMPRESSED). Query visibility is degraded. Decompression will be enabled in a future version.");
+                        _compressedTrafficWarningLogged = true;
+                    }
+                    metadataLen = 0;
                 }
                 else
                 {
