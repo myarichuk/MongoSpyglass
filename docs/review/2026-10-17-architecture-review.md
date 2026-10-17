@@ -506,6 +506,11 @@ live engine state. That's the split in §9.
 
 ## 9. Target architecture: proxy + collector/UI split
 
+> Superseded by the v1 specification in [`docs/spec/`](../spec/README.md). Main changes:
+> * the proxy is the primary product;
+> * driver exporters are optional context providers;
+> * the two are joined on `(proxyId, member, serverConnectionId, requestId)`.
+
 Goal: proxy overhead ≤ 5–10%, and **never** let observation slow down or break forwarding.
 
 ### 9.1 Be honest about the physics
