@@ -76,7 +76,7 @@ public static class BsonUtils
             {
                 doc = ParseLegacyOp(bytes, opCode);
             }
-            return doc.ToJson(new JsonWriterSettings { Indent = indent });
+            return doc.ToJson(new JsonWriterSettings { Indent = indent, OutputMode = JsonOutputMode.Shell });
         } 
         catch 
         {

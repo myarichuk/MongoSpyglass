@@ -10,6 +10,6 @@
   <ItemGroup>
     <ProjectReference Include="..\..\..\MongoSpyglass.Service\MongoSpyglass.Service.csproj" />
     <ProjectReference Include="..\..\..\MongoSpyglass.Proxy\MongoSpyglass.Proxy.csproj" />
-    <PackageReference Include="MongoDB.Driver" Version="3.8.0" />
+    <PackageReference Include="MongoDB.Driver" Version="3.12.0" />
   </ItemGroup>
 </Project>

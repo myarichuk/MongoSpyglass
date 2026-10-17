@@ -6,7 +6,7 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
   <ItemGroup>
-    <!-- Separate process: Mongo.Fakes uses MongoDB.Bson 3.x, Spyglass pins 2.19.1 -->
+    <!-- Separate process so the fake does not share the proxy process's thread pool/GC, like a real mongod -->
     <PackageReference Include="Mongo.Fakes.Server" Version="0.12.0" />
   </ItemGroup>
 </Project>

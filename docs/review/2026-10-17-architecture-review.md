@@ -40,8 +40,9 @@ code that has no business being on the forwarding path. §9 has a concrete desig
 ## 1. Measurements
 
 Setup: a real `MongoDB.Driver` 3.8 `MongoClient` talks to [Mongo.Fakes](https://github.com/myarichuk/Mongo.Fakes)
-0.12.0, a wire-compatible in-process fake that runs as a separate process because of the
-MongoDB.Bson 2.x/3.x split. Three variants:
+0.12.0, a wire-compatible fake, hosted in a separate process so it doesn't share the
+proxy's thread pool and GC (as a real mongod wouldn't). Appendix A lists where it diverges
+from mongod for this use case. Three variants:
 
 * `direct`: client → fake
 * `bare`: client → `MongoDbProxy` with no Service listeners → fake
@@ -217,7 +218,25 @@ and it appears twice ("Captured Events" too).
   such query is classified as "Repeated Identical Query — consider caching", and both rule
   families update the same window (A1b).
 * A nested BSON regex, JavaScript or undefined value makes `GetDocument("filter")` return
-  `default` (2.10). The filter then contributes nothing.
+  `default` (§5). The filter then contributes nothing.
+
+### 2.10 Cursors are keyed by connection, but cursors don't belong to connections [read]
+
+Every cursor rule matches on `c.Id == x.CursorId && c.ConnectionId == x.ConnectionId`
+(`CursorRules.cs`), and `ConnectionClosedRule` marks a connection's cursors "orphaned". Neither
+holds:
+
+* Outside load-balanced mode, drivers send `getMore` to the same **server** over **any**
+  pooled connection. The C# driver's cursor holds a channel *source* and checks out a
+  connection per `getMore`. A `getMore` arriving on a different connection matches nothing,
+  so the cursor looks idle and is eventually reported as a leak.
+* A server cursor survives its connection closing. It dies on exhaustion, `killCursors`,
+  `endSessions` (for session-owned cursors), or the server idle timeout (10 min unless
+  `noCursorTimeout`).
+
+Key cursors by `(server, cursorId)`. Cursor ids are unique per mongod. Track the owning
+`lsid` to model `endSessions`, and use the server idle timeout instead of connection close to
+model expiry.
 
 ---
 
@@ -360,8 +379,11 @@ Also:
   (`:597-618`), which relies on NRE plus a catch-all.
 * `EscapeJsonString` doesn't escape `\` or control characters, so it emits invalid JSON
   (`ReteAnalyzerEngine.cs:454-457`).
-* The proxy depends on `MongoDB.Bson` 2.19.1 (2023) just for `ObjectId`/`Decimal128` and a
-  fallback writer path. It also pulls in **Roslyn** (`Microsoft.CodeAnalysis.CSharp`),
+* The proxy depends on `MongoDB.Bson` just for `ObjectId`/`Decimal128` and a fallback writer
+  path. *(Upgraded 2.19.1 → 3.12.0 after this review was written: the writer now copies
+  `BsonBinaryData` verbatim instead of going through `IsGuid`/`AsGuid`, which throw for legacy
+  subtype-3 UUIDs under v3. UI JSON is pinned to `JsonOutputMode.Shell`, because v3 defaults
+  to relaxed Extended JSON.)* It also pulls in **Roslyn** (`Microsoft.CodeAnalysis.CSharp`),
   Autofac, Polly, Stateless and RecyclableMemoryStream, most of them unused there, and with
   floating `Version="*"` (non-reproducible builds). For a "lightweight sidecar" the proxy
   csproj should have roughly zero dependencies.
@@ -624,3 +646,88 @@ The proxy should never decompress on the forwarding path.
 4. **Collector/UI container:** aggregates + exemplars storage, HTTP API, UI as an API client.
 5. **Topology and TLS** (§9.4) before anyone points it at a real cluster.
 6. Promote `tools/ReviewHarness` into CI as the end-to-end and perf-budget gate.
+
+---
+
+## Appendix A — where Mongo.Fakes diverges from mongod for this use case
+
+Mongo.Fakes (0.12.0) is a good functional double for data-access tests. For *profiling*
+tests, the protocol and performance envelope matter more than query semantics, and that is
+where it differs from a real mongod. Ordered by how much each gap hides from Spyglass's tests.
+
+1. **Cursors are never real.** Every reply has `cursor.id: 0` with all results in
+   `firstBatch` (`BsonFileBackend.cs` `HandleFind`/`HandleAggregate`). `getMore` always
+   throws `CursorNotFound`, and `killCursors` is a no-op `{ok:1}` (`CommandRouter.cs`). mongod:
+   * the first batch defaults to 101 docs or `batchSize`, and every batch is capped at 16 MiB;
+   * a non-zero int64 `cursor.id` is held in a server-side registry;
+   * `getMore` returns `{cursor:{nextBatch, id, ns}, ok}`, with `id: 0` on exhaustion;
+   * `limit`/`singleBatch`/negative limit close the cursor early;
+   * `killCursors` returns `cursorsKilled/cursorsNotFound/cursorsAlive/cursorsUnknown`;
+   * cursors expire after 10 min idle unless `noCursorTimeout`;
+   * `endSessions` kills session-owned cursors;
+   * cursors are **not** tied to the connection, and `getMore` may arrive on another one
+     (see §2.10).
+
+   None of Spyglass's cursor tracking can be tested end-to-end without this.
+2. **No streaming hello.** The hello reply has no `topologyVersion`, and the `exhaustAllowed`
+   flag (OP_MSG bit 16) is ignored. Since MongoDB 4.4, a driver's monitor sends one awaitable
+   `hello` (`topologyVersion` + `maxAwaitTimeMS`, `exhaustAllowed`). The server answers with
+   `moreToCome` replies every `maxAwaitTimeMS`, forever, each with `responseTo` = the
+   previous *reply's* `requestId`. A separate RTT connection sends plain `hello`s. That's one
+   request with N responses on every monitored connection, which is exactly what breaks naive
+   request/response correlation in a proxy. Exhaust cursors (`getMore` with
+   `exhaustAllowed`) use the same mechanism.
+3. **Reply `requestId` is a per-connection counter starting at 0** (`ClientConnection.cs`).
+   mongod uses one process-wide increasing counter, so it never sends 0 or duplicates across
+   connections. This matters for exhaust chaining and for any proxy that treats
+   `responseTo == 0` as "not a reply".
+4. **No compression.** `compression` isn't echoed in hello, and OP_COMPRESSED is answered
+   with an error. mongod intersects the client's `compression` list with its own
+   (snappy/zstd/zlib), decompresses requests, and compresses replies with the negotiated
+   compressor. hello and auth are never compressed. Implementing zlib (`ZLibStream`),
+   snappy (Snappier) and zstd (ZstdSharp) would let Spyglass test §2.5 at all.
+5. **No latency or fault injection.** Profiler tests need deterministic slow queries, errors
+   and disconnects. Implement `configureFailPoint` → `failCommand` (`failCommands`,
+   `blockConnection`/`blockTimeMS`, `errorCode`, `closeConnection`, `times`/`skip`). That's
+   what the official driver spec tests use against a real mongod started with
+   `enableTestCommands`, so the same tests would run against the fake and the real thing.
+6. **The fake is slower than mongod and serialises on one lock.** We measured ~1.2 ms per
+   point lookup and a ~3.3K ops/s ceiling with 32 workers. mongod on loopback is
+   ~100–200 µs and scales with cores. Per query, the fake:
+   * materialises the whole collection under one global `_lock` (`GetCollection`);
+   * keys snapshots by `_id.ToJson()`;
+   * calls `Expression.Compile()` on the filter (`FilterCompiler.Compile`, no cache);
+   * scans instead of looking up `_id`;
+   * `DeepClone`s every result.
+
+   Fixes: cache compiled predicates by filter shape (or interpret small filters), add an
+   `_id` dictionary, use a `BsonValue` equality comparer instead of JSON keys, use
+   copy-on-write snapshots, and use per-collection reader/writer locks. Until then, any
+   "proxy overhead %" measured against it understates the real figure, because the
+   denominator is 5–10× too big.
+7. **Reply shapes differ in small ways that byte- or order-sensitive parsers notice.**
+   * mongod emits `ok` last (`{cursor:{firstBatch,id,ns}, ok:1}`); the fake puts it first
+     in handlers and in `HandshakeResponse`.
+   * Legacy `isMaster` gets `ismaster`, and `hello` gets `isWritablePrimary`; the fake
+     sends both always.
+   * `maxWireVersion: 17` (6.0) is hardcoded and should be configurable (21 = 7.0,
+     25 = 8.0) and consistent with `buildInfo.version`/`versionArray`.
+   * `whatsmyuri.you` should be the real peer endpoint.
+   * The max message size is 48 MiB in the fake but 48,000,000 bytes in mongod. Neither
+     16 MiB document limit (`BSONObjectTooLarge`, 10334) nor batch limits are enforced.
+8. **Handshake auth paths.** Since 4.4, drivers put `speculativeAuthenticate` (a SCRAM
+   client-first message) inside the initial `hello`. The fake ignores it, so the driver falls
+   back to `saslStart`, and the real "credentials inside hello" traffic shape never appears
+   in tests. That matters for Spyglass's redaction (§7). It also advertises only
+   SCRAM-SHA-256, while mongod advertises SHA-1 too.
+9. **OP_MSG checksums are stripped, not verified** (CRC-32C, flag bit 0). mongod rejects a
+   bad checksum.
+10. **Replica-set mode (optional, but needed for §9.4).** Several fake members on separate
+    ports, with `setName`, `hosts`, `primary`, `me`, `electionId`/`setVersion`,
+    `$clusterTime`/`operationTime`. That's how to test hello rewriting and the
+    "driver bypasses the proxy" problem without a real cluster.
+11. **`explain`** returns `CommandNotFound`. A profiler wants to issue
+    `explain` for slow shapes. Even a canned `queryPlanner`/`executionStats` with
+    `COLLSCAN`/`IXSCAN` chosen by whether an index matches the filter would be enough to
+    build the UI.
+
