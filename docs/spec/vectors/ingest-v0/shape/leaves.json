@@ -1,0 +1,502 @@
+{
+  "description": "03 §4.1: every leaf type, as a find equality.",
+  "cases": [
+    {
+      "name": "int32",
+      "rule": "§4.1 number",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "a": 5
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "a": "?number"
+          }
+        },
+        "shapeHash": "dbb79a036929a9d4",
+        "valueHash": "0e31d895cedf229d",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "int64",
+      "rule": "§4.1 number",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "a": {
+            "$numberLong": "5000000000"
+          }
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "a": "?number"
+          }
+        },
+        "shapeHash": "dbb79a036929a9d4",
+        "valueHash": "b3d4435ee8bbacb8",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "double",
+      "rule": "§4.1 number",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "a": 1.5
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "a": "?number"
+          }
+        },
+        "shapeHash": "dbb79a036929a9d4",
+        "valueHash": "b14c5806328aeb3c",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "decimal128",
+      "rule": "§4.1 number",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "a": {
+            "$numberDecimal": "1.50"
+          }
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "a": "?number"
+          }
+        },
+        "shapeHash": "dbb79a036929a9d4",
+        "valueHash": "e83f45136e39b20f",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "string",
+      "rule": "§4.1 string",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "a": "x"
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "a": "?string"
+          }
+        },
+        "shapeHash": "82bba2de19a504cf",
+        "valueHash": "fb2ed188f9b21d8b",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "objectId",
+      "rule": "§4.1 ObjectId",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "a": {
+            "$oid": "5f1d7a9e8b3c2d1e0f4a5b6c"
+          }
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "a": "?objectId"
+          }
+        },
+        "shapeHash": "8a73c1e4db3a04f7",
+        "valueHash": "4bc0e2c7f5b46414",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "date",
+      "rule": "§4.1 date",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "a": {
+            "$date": {
+              "$numberLong": "1700000000000"
+            }
+          }
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "a": "?date"
+          }
+        },
+        "shapeHash": "113cb22a163c7521",
+        "valueHash": "f3a604cb48c6270e",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "bool",
+      "rule": "§4.1 bool",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "a": true
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "a": "?bool"
+          }
+        },
+        "shapeHash": "174281214c1fc874",
+        "valueHash": "602f4bc18e7d12cb",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "null",
+      "rule": "§4.1 null",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "a": null
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "a": "?null"
+          }
+        },
+        "shapeHash": "025a0c19ee5fae9c",
+        "valueHash": "f516fe2be45368e4",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "binData",
+      "rule": "§4.1 BinData",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "a": {
+            "$binary": {
+              "base64": "AQID",
+              "subType": "00"
+            }
+          }
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "a": "?binData"
+          }
+        },
+        "shapeHash": "c2d84008c67badb9",
+        "valueHash": "969b421e3c709e58",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "uuid",
+      "rule": "§4.1 BinData subtype 4",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "a": {
+            "$binary": {
+              "base64": "AAECAwQFBgcICQoLDA0ODw==",
+              "subType": "04"
+            }
+          }
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "a": "?uuid"
+          }
+        },
+        "shapeHash": "ae915482b95ffdf2",
+        "valueHash": "bd37c781a8b2f211",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "regex",
+      "rule": "§4.1 regex",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "a": {
+            "$regularExpression": {
+              "pattern": "^ab",
+              "options": "i"
+            }
+          }
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "a": "?regex"
+          }
+        },
+        "shapeHash": "4b8d8dca26fcccce",
+        "valueHash": "fd965163d41fdc23",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "redacted",
+      "rule": "§4.1 \"$redacted\"",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "a": "$redacted"
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "a": "?redacted"
+          }
+        },
+        "shapeHash": "a4da2cdffb1ac7a9",
+        "valueHash": "80bf0b57536e758a",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "timestamp",
+      "rule": "beyond §4.1: tagged too",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "a": {
+            "$timestamp": {
+              "t": 1,
+              "i": 2
+            }
+          }
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "a": "?timestamp"
+          }
+        },
+        "shapeHash": "10091556bae1f882",
+        "valueHash": "3ceea4fd521b17af",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "minKey",
+      "rule": "beyond §4.1: other types are ?other",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "a": {
+            "$minKey": 1
+          }
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "a": "?other"
+          }
+        },
+        "shapeHash": "fdbcd680484f633f",
+        "valueHash": "7956f5cf07a011be",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "document-equality",
+      "rule": "§4.2 a document value with no $ keys is exact-match ?document",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "a": {
+            "x": 1,
+            "y": "z"
+          }
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "a": "?document"
+          }
+        },
+        "shapeHash": "636228e8370d5565",
+        "valueHash": "d0e4a6284754372a",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "array-equality",
+      "rule": "an array equality value",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "a": [
+            1,
+            2
+          ]
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "a": "?array"
+          }
+        },
+        "shapeHash": "719b02e3234fa501",
+        "valueHash": "65eea06b3ed0eb0a",
+        "inCardinality": 0
+      }
+    }
+  ]
+}

@@ -13,7 +13,7 @@ namespace Spyglass.Collector.Storage;
 /// key ranges. One write connection (behind a lock: the storage writer and the analysis flush both write),
 /// pooled read connections for the API.
 /// </summary>
-public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore, IDisposable
+public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore, ICallsiteStore, IDisposable
 {
     private static readonly JsonSerializerOptions JsonOptions = new() { IncludeFields = true };
     private const int PruneChunk = 5000;
@@ -40,7 +40,7 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
             CREATE TABLE IF NOT EXISTS ops (
               id TEXT PRIMARY KEY, ts INTEGER NOT NULL, command TEXT NOT NULL, coll TEXT, status TEXT NOT NULL,
               app TEXT, driver TEXT, latency INTEGER, shape TEXT NOT NULL, value_hash TEXT, reply_count INTEGER NOT NULL,
-              alerts TEXT, size INTEGER NOT NULL, raw BLOB NOT NULL) WITHOUT ROWID;
+              alerts TEXT, size INTEGER NOT NULL, raw BLOB NOT NULL, ctx BLOB, uow TEXT) WITHOUT ROWID;
             CREATE INDEX IF NOT EXISTS ops_shape ON ops(shape, id);
             CREATE INDEX IF NOT EXISTS ops_app ON ops(app, id);
             CREATE INDEX IF NOT EXISTS ops_coll ON ops(coll, id);
@@ -52,7 +52,12 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
             CREATE INDEX IF NOT EXISTS agg_hour_t ON agg_hour(hour);
             CREATE TABLE IF NOT EXISTS shapes (hash TEXT PRIMARY KEY, data TEXT NOT NULL) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS alerts (id TEXT PRIMARY KEY, data TEXT NOT NULL) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS callsites (hash TEXT PRIMARY KEY, data TEXT NOT NULL, last_used INTEGER NOT NULL) WITHOUT ROWID;
             """);
+        // files from before the join (M1): add its columns
+        if (Scalar("SELECT count(*) FROM pragma_table_info('ops') WHERE name = 'ctx'") == 0)
+            Exec("ALTER TABLE ops ADD COLUMN ctx BLOB; ALTER TABLE ops ADD COLUMN uow TEXT;");
+        Exec("CREATE INDEX IF NOT EXISTS ops_uow ON ops(uow, id) WHERE uow IS NOT NULL;");
         _count = Scalar("SELECT count(*) FROM ops");
         _bytes = Scalar("SELECT coalesce(sum(size), 0) FROM ops");
     }
@@ -89,17 +94,18 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
             using var tx = _write.BeginTransaction();
             using var cmd = _write.CreateCommand();
             cmd.CommandText = """
-                INSERT OR IGNORE INTO ops (id, ts, command, coll, status, app, driver, latency, shape, value_hash, reply_count, alerts, size, raw)
-                VALUES ($id, $ts, $command, $coll, $status, $app, $driver, $latency, $shape, $vh, $rc, $alerts, $size, $raw)
+                INSERT OR IGNORE INTO ops (id, ts, command, coll, status, app, driver, latency, shape, value_hash, reply_count, alerts, size, raw, ctx, uow)
+                VALUES ($id, $ts, $command, $coll, $status, $app, $driver, $latency, $shape, $vh, $rc, $alerts, $size, $raw, $ctx, $uow)
                 """;
             var p = new Dictionary<string, SqliteParameter>();
-            foreach (var n in (string[])["$id", "$ts", "$command", "$coll", "$status", "$app", "$driver", "$latency", "$shape", "$vh", "$rc", "$alerts", "$size", "$raw"])
+            foreach (var n in (string[])["$id", "$ts", "$command", "$coll", "$status", "$app", "$driver", "$latency", "$shape", "$vh", "$rc", "$alerts", "$size", "$raw", "$ctx", "$uow"])
                 p[n] = cmd.Parameters.Add(n, SqliteType.Text);
             cmd.Prepare();
             long inserted = 0, bytes = 0;
             foreach (var o in ops)
             {
-                var size = (o.Op.Raw?.Length ?? 0) + RowOverhead;
+                var ctx = Volatile.Read(ref o.Ctx);
+                var size = (o.Op.Raw?.Length ?? 0) + (ctx?.Raw?.Length ?? 0) + RowOverhead;
                 var r = o.Op;
                 p["$id"].Value = o.Id;
                 p["$ts"].Value = r.Ts;
@@ -115,6 +121,8 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
                 p["$alerts"].Value = o.Alerts is { Count: > 0 } ? string.Join(',', o.Alerts) : DBNull.Value;
                 p["$raw"].Value = (object?)r.Raw ?? DBNull.Value;
                 p["$size"].Value = size;
+                p["$ctx"].Value = (object?)ctx?.Raw ?? DBNull.Value;
+                p["$uow"].Value = (object?)ctx?.UowId ?? DBNull.Value;
                 var n = cmd.ExecuteNonQuery();
                 inserted += n;
                 bytes += n * size;
@@ -129,7 +137,7 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
     {
         using var c = Read();
         using var cmd = c.CreateCommand();
-        cmd.CommandText = "SELECT id, ts, app, driver, shape, value_hash, reply_count, alerts, raw FROM ops WHERE id = $id";
+        cmd.CommandText = $"SELECT {Columns} FROM ops WHERE id = $id";
         cmd.Parameters.AddWithValue("$id", id);
         using var rd = cmd.ExecuteReader();
         return rd.Read() ? Materialize(rd) : null;
@@ -150,8 +158,9 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
         if (q.Command != null) Add("command = $command", "$command", q.Command);
         if (q.Shape != null) Add("shape = $shape", "$shape", q.Shape);
         if (q.Status != null) Add("status = $status", "$status", q.Status);
+        if (q.Uow != null) Add("uow = $uow", "$uow", q.Uow);
         if (q.MinLatencyUs != null) Add("latency >= $lat", "$lat", q.MinLatencyUs);
-        cmd.CommandText = "SELECT id, ts, app, driver, shape, value_hash, reply_count, alerts, raw FROM ops" +
+        cmd.CommandText = $"SELECT {Columns} FROM ops" +
                           (where.Count > 0 ? " WHERE " + string.Join(" AND ", where) : "") + " ORDER BY id DESC LIMIT $limit";
         cmd.Parameters.AddWithValue("$limit", Math.Clamp(q.Limit, 1, 1000));
         var list = new List<Operation>();
@@ -161,11 +170,15 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
         return list;
     }
 
+    private const string Columns = "id, ts, app, driver, shape, value_hash, reply_count, alerts, raw, ctx";
+
     private static Operation? Materialize(SqliteDataReader rd)
     {
         var raw = (byte[])rd["raw"];
         if (RecordParser.Parse(raw, out var rec, out _) != ParseResult.Ok || rec is not OpRecord op) return null;
         op.Ts = rd.GetInt64(1); // the stored ts (clamped at ingest if it was in the future)
+        CmdRecord? ctx = null;
+        if (!rd.IsDBNull(9) && RecordParser.Parse((byte[])rd[9], out var c, out _) == ParseResult.Ok) ctx = c as CmdRecord;
         return new Operation
         {
             Id = rd.GetString(0),
@@ -176,19 +189,39 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
             ValueHash = rd.IsDBNull(5) ? null : rd.GetString(5),
             ReplyCount = rd.GetInt32(6),
             Alerts = rd.IsDBNull(7) ? null : [.. rd.GetString(7).Split(',')],
+            Ctx = ctx,
         };
     }
 
-    public void Update(string id, int replyCount, IReadOnlyList<string>? alerts)
+    public void Update(IReadOnlyList<OpUpdate> updates)
     {
+        if (updates.Count == 0) return;
         lock (_writeLock)
         {
+            using var tx = _write.BeginTransaction();
             using var cmd = _write.CreateCommand();
-            cmd.CommandText = "UPDATE ops SET reply_count = $rc, alerts = coalesce($alerts, alerts) WHERE id = $id";
-            cmd.Parameters.AddWithValue("$rc", replyCount);
-            cmd.Parameters.AddWithValue("$alerts", alerts is { Count: > 0 } ? string.Join(',', alerts) : DBNull.Value);
-            cmd.Parameters.AddWithValue("$id", id);
-            cmd.ExecuteNonQuery();
+            cmd.CommandText = """
+                UPDATE ops SET reply_count = coalesce($rc, reply_count), alerts = coalesce($alerts, alerts),
+                  ctx = coalesce($ctx, ctx), uow = coalesce($uow, uow), size = size + $grow
+                WHERE id = $id
+                """;
+            var p = new Dictionary<string, SqliteParameter>();
+            foreach (var n in (string[])["$rc", "$alerts", "$ctx", "$uow", "$grow", "$id"]) p[n] = cmd.Parameters.Add(n, SqliteType.Text);
+            cmd.Prepare();
+            long bytes = 0;
+            foreach (var u in updates)
+            {
+                var grow = u.Ctx?.Raw?.Length ?? 0;
+                p["$rc"].Value = (object?)u.ReplyCount ?? DBNull.Value;
+                p["$alerts"].Value = u.Alerts is { Count: > 0 } ? string.Join(',', u.Alerts) : DBNull.Value;
+                p["$ctx"].Value = (object?)u.Ctx?.Raw ?? DBNull.Value;
+                p["$uow"].Value = (object?)u.Ctx?.UowId ?? DBNull.Value;
+                p["$grow"].Value = grow;
+                p["$id"].Value = u.Id;
+                bytes += cmd.ExecuteNonQuery() * grow;
+            }
+            tx.Commit();
+            Interlocked.Add(ref _bytes, bytes);
         }
     }
 
@@ -400,6 +433,66 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
         using var rd = cmd.ExecuteReader();
         while (rd.Read()) list.Add(JsonSerializer.Deserialize<Alert>(rd.GetString(0), JsonOptions)!);
         return list;
+    }
+
+    // ---- callsites -------------------------------------------------------------------------
+
+    public void Upsert(IReadOnlyList<CallsiteRecord> callsites, long nowUs)
+    {
+        if (callsites.Count == 0) return;
+        lock (_writeLock)
+        {
+            using var tx = _write.BeginTransaction();
+            foreach (var c in callsites)
+            {
+                using var cmd = _write.CreateCommand();
+                cmd.CommandText = "INSERT OR REPLACE INTO callsites (hash, data, last_used) VALUES ($h, $d, $t)";
+                cmd.Parameters.AddWithValue("$h", c.Callsite);
+                cmd.Parameters.AddWithValue("$d", JsonSerializer.Serialize(new StoredCallsite(c.Lang, c.Frames.Select(f => new StoredFrame(f.Fn, f.File, f.Line)).ToList())));
+                cmd.Parameters.AddWithValue("$t", nowUs);
+                cmd.ExecuteNonQuery();
+            }
+            tx.Commit();
+        }
+    }
+
+    private sealed record StoredFrame(string Fn, string? File, int? Line);
+    private sealed record StoredCallsite(string? Lang, List<StoredFrame> Frames);
+
+    public void Touch(IReadOnlyCollection<string> hashes, long nowUs)
+    {
+        if (hashes.Count == 0) return;
+        lock (_writeLock)
+        {
+            using var tx = _write.BeginTransaction();
+            using var cmd = _write.CreateCommand();
+            cmd.CommandText = "UPDATE callsites SET last_used = $t WHERE hash = $h";
+            var h = cmd.Parameters.Add("$h", SqliteType.Text);
+            cmd.Parameters.AddWithValue("$t", nowUs);
+            foreach (var x in hashes) { h.Value = x; cmd.ExecuteNonQuery(); }
+            tx.Commit();
+        }
+    }
+
+    public CallsiteRecord? Callsite(string hash)
+    {
+        using var c = Read();
+        using var cmd = c.CreateCommand();
+        cmd.CommandText = "SELECT data FROM callsites WHERE hash = $h";
+        cmd.Parameters.AddWithValue("$h", hash);
+        if (cmd.ExecuteScalar() is not string json || JsonSerializer.Deserialize<StoredCallsite>(json) is not { } s) return null;
+        return new CallsiteRecord { Callsite = hash, Lang = s.Lang, Frames = s.Frames.Select(f => (f.Fn, f.File, f.Line)).ToList() };
+    }
+
+    public int PruneCallsites(long unusedSinceUs)
+    {
+        lock (_writeLock)
+        {
+            using var cmd = _write.CreateCommand();
+            cmd.CommandText = "DELETE FROM callsites WHERE last_used < $t";
+            cmd.Parameters.AddWithValue("$t", unusedSinceUs);
+            return cmd.ExecuteNonQuery();
+        }
     }
 
     public void Dispose()

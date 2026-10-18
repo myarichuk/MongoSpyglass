@@ -1,0 +1,194 @@
+{
+  "description": "requestId alone is not a key: the same requestId on two server connections joins each to its own cmd.",
+  "input": [
+    {
+      "at_ms": 0,
+      "record": {
+        "type": "hello",
+        "ts": 1700000000000000,
+        "src": "3b6a9d20-0000-4000-8000-0000000000e1",
+        "exporter": "spyglass-dotnet",
+        "version": "0.1.0",
+        "schema": 1,
+        "runtime": "dotnet 10.0.1",
+        "driver": "mongo-csharp-driver 3.12.0",
+        "host": "orders-api-1",
+        "pid": 4121,
+        "app": "orders-api"
+      }
+    },
+    {
+      "at_ms": 0,
+      "record": {
+        "type": "conn",
+        "ts": 1700000000000000,
+        "src": "8f0c2c1e-0000-4000-8000-0000000000a1",
+        "event": "open",
+        "member": "localhost:27017",
+        "connSeq": 1,
+        "serverConnectionId": 5512,
+        "client": "10.1.2.3:51122",
+        "app": "orders-api",
+        "driver": "mongo-csharp-driver|spyglass-dotnet",
+        "driverVersion": "3.12.0|0.1.0",
+        "exporter": "spyglass-dotnet"
+      }
+    },
+    {
+      "at_ms": 0,
+      "record": {
+        "type": "conn",
+        "ts": 1700000000000000,
+        "src": "8f0c2c1e-0000-4000-8000-0000000000a1",
+        "event": "open",
+        "member": "localhost:27017",
+        "connSeq": 2,
+        "serverConnectionId": 5513,
+        "client": "10.1.2.3:51122",
+        "app": "orders-api",
+        "driver": "mongo-csharp-driver|spyglass-dotnet",
+        "driverVersion": "3.12.0|0.1.0",
+        "exporter": "spyglass-dotnet"
+      }
+    },
+    {
+      "at_ms": 10,
+      "record": {
+        "type": "op",
+        "ts": 1700000000009000,
+        "src": "8f0c2c1e-0000-4000-8000-0000000000a1",
+        "member": "localhost:27017",
+        "serverConnectionId": 5512,
+        "requestId": 9,
+        "connSeq": 1,
+        "command": "find",
+        "db": "orders",
+        "coll": "orders",
+        "status": "ok",
+        "reqBytes": 120,
+        "respBytes": 300,
+        "t": {
+          "reqLast_us": 3,
+          "respFirst_us": 812,
+          "respLast_us": 845
+        },
+        "reply": {
+          "ok": 1,
+          "nReturned": 1
+        }
+      }
+    },
+    {
+      "at_ms": 10,
+      "record": {
+        "type": "op",
+        "ts": 1700000000009000,
+        "src": "8f0c2c1e-0000-4000-8000-0000000000a1",
+        "member": "localhost:27017",
+        "serverConnectionId": 5513,
+        "requestId": 9,
+        "connSeq": 2,
+        "command": "find",
+        "db": "orders",
+        "coll": "orders",
+        "status": "ok",
+        "reqBytes": 120,
+        "respBytes": 300,
+        "t": {
+          "reqLast_us": 3,
+          "respFirst_us": 812,
+          "respLast_us": 845
+        },
+        "reply": {
+          "ok": 1,
+          "nReturned": 1
+        }
+      }
+    },
+    {
+      "at_ms": 20,
+      "record": {
+        "type": "cmd",
+        "ts": 1700000000008850,
+        "src": "3b6a9d20-0000-4000-8000-0000000000e1",
+        "proxyId": "8f0c2c1e-0000-4000-8000-0000000000a1",
+        "member": "localhost:27017",
+        "serverConnectionId": 5513,
+        "requestId": 9,
+        "operationId": "b",
+        "command": "find",
+        "db": "orders",
+        "status": "ok",
+        "client_us": 1210,
+        "poolWait_us": 40,
+        "attempt": 1,
+        "uow": {
+          "id": "4bf92f3577b34da6a3ce929d0e0e4736",
+          "name": "GET /orders/{id}",
+          "kind": "http"
+        },
+        "trace": null,
+        "callsite": "9c1e33a70b2f44d1",
+        "cursorId": null,
+        "errorCode": null,
+        "errorLabels": null
+      }
+    },
+    {
+      "at_ms": 21,
+      "record": {
+        "type": "cmd",
+        "ts": 1700000000008850,
+        "src": "3b6a9d20-0000-4000-8000-0000000000e1",
+        "proxyId": "8f0c2c1e-0000-4000-8000-0000000000a1",
+        "member": "localhost:27017",
+        "serverConnectionId": 5512,
+        "requestId": 9,
+        "operationId": "a",
+        "command": "find",
+        "db": "orders",
+        "status": "ok",
+        "client_us": 1210,
+        "poolWait_us": 40,
+        "attempt": 1,
+        "uow": {
+          "id": "4bf92f3577b34da6a3ce929d0e0e4736",
+          "name": "GET /orders/{id}",
+          "kind": "http"
+        },
+        "trace": null,
+        "callsite": "9c1e33a70b2f44d1",
+        "cursorId": null,
+        "errorCode": null,
+        "errorLabels": null
+      }
+    }
+  ],
+  "expected": {
+    "ops": [
+      {
+        "proxyId": "8f0c2c1e-0000-4000-8000-0000000000a1",
+        "member": "localhost:27017",
+        "serverConnectionId": 5512,
+        "requestId": 9,
+        "joined": {
+          "src": "3b6a9d20-0000-4000-8000-0000000000e1",
+          "operationId": "a"
+        }
+      },
+      {
+        "proxyId": "8f0c2c1e-0000-4000-8000-0000000000a1",
+        "member": "localhost:27017",
+        "serverConnectionId": 5513,
+        "requestId": 9,
+        "joined": {
+          "src": "3b6a9d20-0000-4000-8000-0000000000e1",
+          "operationId": "b"
+        }
+      }
+    ],
+    "counters": {
+      "joined": 2
+    }
+  }
+}

@@ -1,0 +1,97 @@
+{
+  "description": "No exporter: the op is stored at once; replies on its stream that come later update the stored op (replyCount).",
+  "input": [
+    {
+      "at_ms": 0,
+      "record": {
+        "type": "conn",
+        "ts": 1700000000000000,
+        "src": "8f0c2c1e-0000-4000-8000-0000000000a1",
+        "event": "open",
+        "member": "localhost:27017",
+        "connSeq": 1,
+        "serverConnectionId": 5512,
+        "client": "10.1.2.3:51122",
+        "app": "orders-api",
+        "driver": "mongo-csharp-driver|spyglass-dotnet",
+        "driverVersion": "3.12.0|0.1.0"
+      }
+    },
+    {
+      "at_ms": 10,
+      "record": {
+        "type": "op",
+        "ts": 1700000000005000,
+        "src": "8f0c2c1e-0000-4000-8000-0000000000a1",
+        "member": "localhost:27017",
+        "serverConnectionId": 5512,
+        "requestId": 5,
+        "connSeq": 1,
+        "command": "getMore",
+        "db": "orders",
+        "coll": "orders",
+        "status": "ok",
+        "reqBytes": 120,
+        "respBytes": 300,
+        "t": {
+          "reqLast_us": 3,
+          "respFirst_us": 812,
+          "respLast_us": 845
+        },
+        "reply": {
+          "ok": 1,
+          "nReturned": 1
+        },
+        "stream": true
+      }
+    },
+    {
+      "at_ms": 3000,
+      "record": {
+        "type": "stream",
+        "ts": 1700000000005200,
+        "src": "8f0c2c1e-0000-4000-8000-0000000000a1",
+        "member": "localhost:27017",
+        "serverConnectionId": 5512,
+        "requestId": 5,
+        "seq": 2,
+        "respBytes": 200,
+        "reply": {
+          "cursorId": "123",
+          "nReturned": 10,
+          "ok": 1
+        }
+      }
+    },
+    {
+      "at_ms": 3001,
+      "record": {
+        "type": "stream",
+        "ts": 1700000000005300,
+        "src": "8f0c2c1e-0000-4000-8000-0000000000a1",
+        "member": "localhost:27017",
+        "serverConnectionId": 5512,
+        "requestId": 5,
+        "seq": 3,
+        "respBytes": 200,
+        "reply": {
+          "cursorId": "0",
+          "nReturned": 10,
+          "ok": 1
+        }
+      }
+    }
+  ],
+  "expected": {
+    "ops": [
+      {
+        "proxyId": "8f0c2c1e-0000-4000-8000-0000000000a1",
+        "member": "localhost:27017",
+        "serverConnectionId": 5512,
+        "requestId": 5,
+        "joined": null,
+        "replyCount": 3
+      }
+    ]
+  }
+}

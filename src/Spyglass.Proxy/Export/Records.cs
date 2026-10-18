@@ -133,40 +133,4 @@ internal static class JsonExtensions
     {
         if (value) w.WriteBoolean(name, true);
     }
-
-    public static void WriteStringOrNull(this Utf8JsonWriter w, JsonEncodedText name, string? value)
-    {
-        if (value == null) w.WriteNull(name);
-        else w.WriteString(name, value);
-    }
-
-    public static void WriteNumberOrNull(this Utf8JsonWriter w, JsonEncodedText name, long? value)
-    {
-        if (value is { } v) w.WriteNumber(name, v);
-        else w.WriteNull(name);
-    }
-
-    public static void WriteNumberOrNull(this Utf8JsonWriter w, JsonEncodedText name, double? value)
-    {
-        if (value is { } v) w.WriteNumber(name, v);
-        else w.WriteNull(name);
-    }
-
-    public static void WriteStringOrNull(this Utf8JsonWriter w, string name, string? value)
-    {
-        if (value == null) w.WriteNull(name);
-        else w.WriteString(name, value);
-    }
-
-    public static void WriteNumberOrNull(this Utf8JsonWriter w, string name, long? value)
-    {
-        if (value is { } v) w.WriteNumber(name, v);
-        else w.WriteNull(name);
-    }
-
-    public static void WriteNumberOrNull(this Utf8JsonWriter w, string name, double? value)
-    {
-        if (value is { } v) w.WriteNumber(name, v);
-        else w.WriteNull(name);
-    }
 }

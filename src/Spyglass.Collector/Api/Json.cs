@@ -47,11 +47,67 @@ public static class Json
             foreach (var a in o.Alerts) w.WriteStringValue(a);
             w.WriteEndArray();
         }
+        if (Volatile.Read(ref o.Ctx) is { } c)
+        {
+            w.WriteBoolean("joined", true);
+            if (c.ClientUs is { } cu) w.WriteNumber("client_us", cu);
+            if (c.PoolWaitUs is { } pw) w.WriteNumber("poolWait_us", pw);
+            Opt(w, "uowId", c.UowId);
+            Opt(w, "uowName", c.UowName);
+        }
+        w.WriteEndObject();
+    }
+
+    /// <summary>The joined <c>cmd</c> (03 §3.3 "from cmd"), with the callsite's frames when known.</summary>
+    public static void Context(Utf8JsonWriter w, Operation o, CmdRecord c, CallsiteRecord? callsite)
+    {
+        w.WriteStartObject();
+        w.WriteString("src", c.Src);
+        w.WriteNumber("ts", c.Ts);
+        Opt(w, "operationId", c.OperationId);
+        w.WriteString("status", c.Status);
+        if (c.ClientUs is { } cu) w.WriteNumber("client_us", cu);
+        if (c.PoolWaitUs is { } pw) w.WriteNumber("poolWait_us", pw);
+        if (o.ClientOverheadUs is { } co) w.WriteNumber("clientOverhead_us", co);
+        if (c.Attempt is { } at) w.WriteNumber("attempt", at);
+        if (c.UowId != null || c.UowName != null)
+        {
+            w.WriteStartObject("uow");
+            Opt(w, "id", c.UowId);
+            Opt(w, "name", c.UowName);
+            Opt(w, "kind", c.UowKind);
+            w.WriteEndObject();
+        }
+        Opt(w, "traceparent", c.Traceparent);
+        Opt(w, "callsite", c.Callsite);
+        if (callsite != null)
+        {
+            Opt(w, "lang", callsite.Lang);
+            w.WriteStartArray("frames");
+            foreach (var (fn, file, line) in callsite.Frames)
+            {
+                w.WriteStartObject();
+                w.WriteString("fn", fn);
+                Opt(w, "file", file);
+                if (line is { } l) w.WriteNumber("line", l);
+                w.WriteEndObject();
+            }
+            w.WriteEndArray();
+        }
+        if (c.CursorId is { } cid) w.WriteString("cursorId", cid.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        Opt(w, "errorCode", c.ErrorCode);
+        if (c.ErrorLabels is { Count: > 0 })
+        {
+            w.WriteStartArray("errorLabels");
+            foreach (var l in c.ErrorLabels) w.WriteStringValue(l);
+            w.WriteEndArray();
+        }
+        if (c.Extra != null) { w.WritePropertyName("extra"); w.WriteRawValue(c.Extra); }
         w.WriteEndObject();
     }
 
     /// <summary><c>/ops/{id}</c>: everything, the command as shell-syntax EJSON, the timing waterfall.</summary>
-    public static void OpDetail(Utf8JsonWriter w, Operation o, CursorInfo? cursor)
+    public static void OpDetail(Utf8JsonWriter w, Operation o, CursorInfo? cursor, CallsiteRecord? callsite = null)
     {
         var r = o.Op;
         w.WriteStartObject();
@@ -126,6 +182,7 @@ public static class Json
             w.WriteEndArray();
         }
         if (cursor != null) { w.WritePropertyName("cursor"); Cursor(w, cursor); }
+        if (Volatile.Read(ref o.Ctx) is { } ctx) { w.WritePropertyName("context"); Context(w, o, ctx, callsite); }
         if (r.Extra != null) { w.WritePropertyName("extra"); w.WriteRawValue(r.Extra); }
         w.WriteEndObject();
     }

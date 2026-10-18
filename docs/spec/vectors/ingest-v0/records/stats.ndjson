@@ -1,0 +1,2 @@
+{"type":"stats","ts":1700000000000000,"src":"8f0c2c1e-0000-4000-8000-0000000000a1","dropped":{"no_slot":1,"queue_full":2,"export":3},"sent":{"records":12001,"batches":7}}
+{"type":"stats","ts":1700000000000000,"src":"8f0c2c1e-0000-4000-8000-0000000000a1"}

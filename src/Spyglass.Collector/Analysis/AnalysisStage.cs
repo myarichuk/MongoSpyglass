@@ -10,11 +10,16 @@ namespace Spyglass.Collector.Analysis;
 /// Stage 2 (03 §1, §5, §6): one thread owns everything that crosses connections, so it needs no locks:
 /// cursors (getMore arrives on any pooled connection), shape aggregates, the global rules and alerts,
 /// live fan-out and the hand-off to storage. Each step is O(1) per op.
+/// <para>
+/// With the join (02 §6) an op comes through up to twice: on arrival (wire analysis, aggregates, live feed:
+/// visible at once, 03 §3.2) and, if it waited for context, when it is final (context applied, then stored).
+/// Context for an op already stored goes to storage as an update.
+/// </para>
 /// </summary>
 internal sealed class AnalysisStage
 {
     private abstract record Item;
-    private sealed record BatchItem(List<(Operation Op, List<RuleHit>? Hits)> Ops, List<StreamRecord>? Streams) : Item;
+    private sealed record BatchItem(PartitionOutput Output) : Item;
     /// <summary>Work from another thread (the API) that must run where the state lives.</summary>
     private sealed record CommandItem(Action Run) : Item;
 
@@ -30,6 +35,13 @@ internal sealed class AnalysisStage
     private readonly IAlertStore _alertStore;
     private readonly IOperationStore _ops;
     private readonly LiveHub _live;
+    private readonly ProducerRegistry _producers;
+    /// <summary>Ops analysed but waiting for context (not stored yet): what <c>/ops/{id}</c> falls back to.</summary>
+    private readonly ConcurrentDictionary<string, Operation> _waiting = new();
+    /// <summary>Per exporter src: recent <c>cmd.ts − op.ts</c> samples, for the exporter-skew rule.</summary>
+    private readonly Dictionary<string, SkewWindow> _skew = [];
+    private readonly HashSet<string> _touchedCallsites = [];
+    private long _nextCallsiteTouchUs;
     private readonly BlockingCollection<Item> _queue = new(new ConcurrentQueue<Item>());
     private readonly Dictionary<(string, string, long, int), Operation> _streams = [];
     private readonly Queue<(string, string, long, int)> _streamOrder = new();
@@ -47,8 +59,9 @@ internal sealed class AnalysisStage
     public long Processed;
 
     public AnalysisStage(CollectorOptions options, StorageWriter writer, IAggregateStore aggregates, IAlertStore alertStore,
-        IOperationStore ops, LiveHub live, Action<Record> release, Func<long> nowUs)
+        IOperationStore ops, LiveHub live, ProducerRegistry producers, Action<Record> release, Func<long> nowUs)
     {
+        _producers = producers;
         _options = options;
         _writer = writer;
         _aggregates = aggregates;
@@ -72,11 +85,19 @@ internal sealed class AnalysisStage
         _thread.Start();
     }
 
-    /// <summary>One partition batch: its ops (in order), then its stream records.</summary>
-    public void Post(List<(Operation, List<RuleHit>?)> ops, List<StreamRecord>? streams) => _queue.Add(new BatchItem(ops, streams));
+    /// <summary>One partition pass: new ops (in order), stream records, then join outcomes.</summary>
+    public void Post(PartitionOutput output) => _queue.Add(new BatchItem(output));
 
-    /// <summary>A single op (tests).</summary>
-    internal void Post(Operation op, List<RuleHit>? hits) => Post([(op, hits)], null);
+    /// <summary>A single final op (tests).</summary>
+    internal void Post(Operation op, List<RuleHit>? hits)
+    {
+        var o = new PartitionOutput();
+        o.Ops.Add((op, hits, true));
+        Post(o);
+    }
+
+    /// <summary>An op that is analysed and live but not stored yet (it is waiting for context).</summary>
+    public Operation? Waiting(string id) => _waiting.GetValueOrDefault(id);
 
     /// <summary>Runs <paramref name="f"/> on the analysis thread (the state is single-threaded) and returns its result.</summary>
     public Task<T> Invoke<T>(Func<T> f)
@@ -104,11 +125,16 @@ internal sealed class AnalysisStage
         {
             if (_queue.TryTake(out var item, 100))
             {
-                if (item is BatchItem b)
+                if (item is BatchItem { Output: var b })
                 {
-                    foreach (var (op, hits) in b.Ops)
+                    foreach (var (op, hits, final) in b.Ops)
                     {
-                        try { OnOp(op, hits); }
+                        try
+                        {
+                            OnOp(op, hits);
+                            if (final) Finalize(op);
+                            else _waiting[op.Id] = op;
+                        }
                         catch (Exception e) { Console.Error.WriteLine($"analysis: {e.GetType().Name}: {e.Message}"); }
                         finally { _release(op.Op); }
                     }
@@ -119,6 +145,8 @@ internal sealed class AnalysisStage
                             catch (Exception e) { Console.Error.WriteLine($"analysis: {e.GetType().Name}: {e.Message}"); }
                             finally { _release(s); }
                         }
+                    try { OnJoins(b); }
+                    catch (Exception e) { Console.Error.WriteLine($"analysis: {e.GetType().Name}: {e.Message}"); }
                     Interlocked.Add(ref Processed, b.Ops.Count);
                 }
                 else if (item is CommandItem(var run))
@@ -216,9 +244,88 @@ internal sealed class AnalysisStage
                 Hit(h.Rule, h.ScopeKey, Scope(op, shape: true, app: true), op, h.Summary);
             }
 
+        if (op.Ctx != null) Context(op);
         if (_live.Subscribers > 0) // nobody watching: no JSON per op
             _live.Publish(new LiveEvent("op.created", Json.Write(w => Json.OpSummary(w, op)), op));
+    }
+
+    /// <summary>Nothing more will join this op: store it.</summary>
+    private void Finalize(Operation op)
+    {
+        op.Stored = true;
         _writer.Enqueue(op);
+    }
+
+    private void OnJoins(PartitionOutput b)
+    {
+        if (b.Finals != null)
+            foreach (var (op, ctx) in b.Finals)
+            {
+                _waiting.TryRemove(op.Id, out _);
+                if (ctx != null)
+                {
+                    Volatile.Write(ref op.Ctx, ctx);
+                    Context(op);
+                    if (_live.Subscribers > 0) // 03 §3.2: the live row is patched in place
+                        _live.Publish(new LiveEvent("op.updated", Json.Write(w => Json.OpSummary(w, op)), op));
+                }
+                Finalize(op);
+            }
+        if (b.LateJoins != null)
+            foreach (var j in b.LateJoins)
+            {
+                _writer.Enqueue(new OpUpdate(j.OpId, Ctx: j.Cmd)); // the writer publishes op.updated once it is applied
+                Skew(j.Cmd, j.OpTs, j.OpId);
+                if (j.Cmd.Callsite is { } cs) _touchedCallsites.Add(cs);
+            }
+        if (b.Conflicts != null)
+            foreach (var c in b.Conflicts)
+                Hit("exporter-skew", c.Cmd.Src, new Dictionary<string, string?> { ["src"] = c.Cmd.Src }, null,
+                    $"join conflict: exporter {c.Cmd.Src} reported {c.Cmd.Command} on {c.Cmd.Db} for request {c.Cmd.RequestId}, " +
+                    $"the proxy saw {c.OpCommand} on {c.OpDb} (02 §6.3)", tsOverride: c.Cmd.Ts);
+    }
+
+    /// <summary>A joined op (on arrival or after waiting): the context-side checks M2 has (03 §5.2 exporter-skew).</summary>
+    private void Context(Operation op)
+    {
+        var c = op.Ctx!;
+        Skew(c, op.Ts, op.Id);
+        if (c.Callsite is { } cs) _touchedCallsites.Add(cs);
+    }
+
+    /// <summary>
+    /// 03 §5.2 exporter-skew: the exporter stamps a command when the driver starts it, the proxy when its first
+    /// byte arrives, so on one clock <c>cmd.ts − op.ts</c> is minus the client→proxy latency: well under a
+    /// millisecond on a LAN. The median over the last 64 joins against ±1 s.
+    /// </summary>
+    private void Skew(CmdRecord c, long opTs, string opId)
+    {
+        if (!_skew.TryGetValue(c.Src, out var w)) _skew[c.Src] = w = new SkewWindow();
+        if (w.Add(c.Ts - opTs) is not { } median) return;
+        if (_producers.Get(c.Src) is { } p) p.SkewUs = median;
+        if (Math.Abs(median) > 1_000_000)
+            Hit("exporter-skew", c.Src, new Dictionary<string, string?> { ["src"] = c.Src }, null,
+                $"exporter {c.Src} clock is {median / 1000.0:F0} ms {(median > 0 ? "ahead of" : "behind")} the proxy's (median of the last {SkewWindow.Size} joins)",
+                tsOverride: c.Ts);
+    }
+
+    private sealed class SkewWindow
+    {
+        public const int Size = 64;
+        private readonly long[] _samples = new long[Size];
+        private readonly long[] _sorted = new long[Size];
+        private int _n;
+
+        /// <summary>Adds a sample; every 16th returns the median of the window.</summary>
+        public long? Add(long v)
+        {
+            _samples[_n++ % Size] = v;
+            if (_n % 16 != 0) return null;
+            var count = Math.Min(_n, Size);
+            Array.Copy(_samples, _sorted, count);
+            Array.Sort(_sorted, 0, count);
+            return _sorted[count / 2];
+        }
     }
 
     private void LargeCollection(string? db, string? coll, long returned)
@@ -289,7 +396,7 @@ internal sealed class AnalysisStage
         op.ReplyCount++;
         if (s.CursorId == 0 && op.Op.Reply?.CursorId is { } opened and not 0)
             Cursors.Close(s.Src, s.Member, opened, "exhausted", s.Ts);
-        _ops.Update(op.Id, op.ReplyCount, op.Alerts);
+        if (op.Stored) _writer.Enqueue(new OpUpdate(op.Id, op.ReplyCount, op.Alerts?.ToList()));
         if (_live.Subscribers > 0)
             _live.Publish(new LiveEvent("op.updated", Json.Write(w => Json.OpSummary(w, op)), op));
     }
@@ -307,8 +414,14 @@ internal sealed class AnalysisStage
         Alerts.Publish();
     }
 
-    private void Housekeeping(long nowUs)
+    internal void Housekeeping(long nowUs)
     {
+        if (_touchedCallsites.Count > 0 && nowUs >= _nextCallsiteTouchUs) // 03 §7: callsites live while ops use them
+        {
+            _writer.Touch([.. _touchedCallsites]);
+            _touchedCallsites.Clear();
+            _nextCallsiteTouchUs = nowUs + 3_600_000_000;
+        }
         Flush(); // the store must hold every delta before a minute closes
         foreach (var (shape, p95, basis) in Aggregates.CloseBefore(nowUs / 60_000_000 - 1))
         {

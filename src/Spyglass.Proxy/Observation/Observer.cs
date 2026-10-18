@@ -108,7 +108,7 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
             TopologyKind.Sharded => "sharded",
             _ => "standalone"
         });
-        j.WriteStringOrNull("setName", t.SetName);
+        if (t.SetName != null) j.WriteString("setName", t.SetName); // absent means null (02 §4)
         j.WriteStartArray("members");
         foreach (var mem in t.Members)
         {

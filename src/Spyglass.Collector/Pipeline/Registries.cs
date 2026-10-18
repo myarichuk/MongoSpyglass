@@ -84,6 +84,14 @@ public sealed class ProducerInfo
     public long Records, Rejected, ClockSkewed;
     public Dictionary<string, long> Dropped = [];
     public long SentRecords;
+    // exporters (02 §4.3 hello)
+    public string? Runtime, Driver, Host, App, AppVersion;
+    public long? Pid;
+    // 02 §6 per exporter: cmd records with a key, joined (in time or late), orphaned, in conflict
+    public long Cmds, Joined, Orphans, Conflicts;
+    /// <summary>Median of <c>cmd.ts − op.ts</c> over recent joins (analysis stage): the exporter's clock against the proxy's.</summary>
+    public long? SkewUs;
+    public double? JoinRate => Cmds > 0 ? (double)Joined / Cmds : null;
     /// <summary>The proxy's <c>capture.values</c> is not <c>shape</c>: valueHash can be computed (03 §4).</summary>
     public bool ValuesPreserved => Values != "shape";
 }
@@ -117,6 +125,23 @@ public sealed class ProducerRegistry
             p.Members = r.Members;
             p.Compression = r.Compression;
             p.Values = r.Values;
+        }
+    }
+
+    public void Apply(HelloRecord r)
+    {
+        var p = _producers.GetOrAdd(r.Src, s => new ProducerInfo { Src = s });
+        lock (p)
+        {
+            p.Kind = r.Exporter;
+            p.Version = r.Version;
+            p.Schema = r.Schema;
+            p.Runtime = r.Runtime;
+            p.Driver = r.Driver;
+            p.Host = r.Host;
+            p.Pid = r.Pid;
+            p.App = r.App;
+            p.AppVersion = r.AppVersion;
         }
     }
 

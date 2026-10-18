@@ -26,9 +26,14 @@ public static class ShapeNormalizer
         ["?number", "?string", "?objectId", "?date", "?bool", "?null", "?binData", "?uuid", "?regex", "?redacted", "?timestamp", "?other", "?document", "?array"];
 
 
+    /// <summary>01 §9.1: the proxy sends these as exactly <c>{$redacted: name}</c>; their shape is the command name.</summary>
+    public static bool IsRedactedCommand(string command) => command is "authenticate" or "saslStart" or "saslContinue" or "getnonce" or
+        "createUser" or "updateUser" or "copydbgetnonce" or "copydbsaslstart" or "copydb";
+
     /// <param name="valuesPreserved">false when the proxy ran <c>values: shape</c>: no valueHash (03 §4).</param>
     public static ShapeResult Normalize(string command, string? db, string? coll, BsonDocument? cmd, bool cmdTruncated, bool valuesPreserved)
     {
+        if (IsRedactedCommand(command)) cmd = null;
         var ctx = new Ctx(Mode.Shape);
         var shape = Build(ctx, command, db, coll, cmd);
         var canonical = CanonicalJson.Bytes(shape);
@@ -48,11 +53,11 @@ public static class ShapeNormalizer
         {
             case "find":
                 if (Get(cmd, "filter") is BsonDocument f) s["filter"] = NormFilter(c, f);
-                if (Get(cmd, "sort") is BsonDocument sort) s["sort"] = sort;
+                if (Get(cmd, "sort") is BsonDocument sort) s["sort"] = Ordered(sort);
                 if (Get(cmd, "projection") is BsonDocument proj) s["projection"] = proj;
                 foreach (var k in (string[])["limit", "skip", "batchSize"])
                     if (cmd.Contains(k)) s[k] = c.Mode == Mode.Shape ? "?" : cmd[k];
-                if (Get(cmd, "hint") is { } hint) s["hint"] = hint;
+                if (Get(cmd, "hint") is { } hint) s["hint"] = hint is BsonDocument keys ? Ordered(keys) : hint; // a key pattern, or an index name
                 if (Get(cmd, "collation") is BsonDocument col && col.Contains("locale")) s["collation"] = new BsonDocument("locale", col["locale"]);
                 break;
             case "aggregate":
@@ -73,7 +78,7 @@ public static class ShapeNormalizer
                 break;
             case "findAndModify" or "findandmodify":
                 if (Get(cmd, "query") is BsonDocument fq) s["query"] = NormFilter(c, fq);
-                if (Get(cmd, "sort") is BsonDocument fs) s["sort"] = fs;
+                if (Get(cmd, "sort") is BsonDocument fs) s["sort"] = Ordered(fs);
                 if (Get(cmd, "update") is { } fu) s["update"] = NormUpdate(c, fu);
                 foreach (var k in (string[])["remove", "new", "upsert"])
                     if (cmd.Contains(k)) s[k] = cmd[k];
@@ -211,14 +216,40 @@ public static class ShapeNormalizer
             {
                 "$match" when body is BsonDocument m => NormFilter(c, m),
                 "$limit" or "$skip" => c.Mode == Mode.Shape ? "?" : body,
-                "$sort" => body,
+                "$sort" when body is BsonDocument sd => Ordered(sd),
                 "$lookup" when body is BsonDocument l => NormLookup(c, l),
                 "$group" when body is BsonDocument g => NormGroup(c, g),
-                "$project" or "$addFields" or "$set" or "$unset" => TagTree(c, body),
+                "$project" when body is BsonDocument pd => NormProjection(c, pd),
+                "$addFields" or "$set" or "$unset" => TagTree(c, body),
                 _ => TagTree(c, body),
             };
             r.Add(new BsonDocument(name, norm));
         }
+        return r;
+    }
+
+    /// <summary>
+    /// Key order that matters (sort keys, index key patterns): the canonical form sorts document keys, so these
+    /// are written as <c>[[key, value], …]</c> to keep it.
+    /// </summary>
+    private static BsonArray Ordered(BsonDocument d)
+    {
+        var r = new BsonArray(d.ElementCount);
+        foreach (var e in d) r.Add(new BsonArray { e.Name, e.Value });
+        return r;
+    }
+
+    /// <summary><c>$project</c>: inclusion flags are structure (kept, like a find projection); expressions have their leaves tagged.</summary>
+    private static BsonDocument NormProjection(Ctx c, BsonDocument p)
+    {
+        var r = new BsonDocument();
+        foreach (var e in p)
+            r[e.Name] = e.Value switch
+            {
+                BsonBoolean or BsonInt32 or BsonInt64 or BsonDouble => e.Value,
+                BsonDocument sub when sub.ElementCount > 0 && !sub.GetElement(0).Name.StartsWith('$') => NormProjection(c, sub),
+                _ => TagTree(c, e.Value),
+            };
         return r;
     }
 

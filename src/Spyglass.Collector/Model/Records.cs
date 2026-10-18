@@ -112,7 +112,58 @@ public sealed class StatsRecord : Record
     public long SentRecords, SentBatches;
 }
 
-/// <summary>An exporter record (02 §4.3). M1 is wire-only: these are accepted and counted, joined in M2.</summary>
+/// <summary>
+/// 02 §4.3 <c>cmd</c>: what the application's driver knew about one command attempt. Joined onto the proxy's
+/// <c>op</c> by <see cref="JoinKey"/> (02 §6). No collection, filter, values or reply content (I6).
+/// </summary>
+public sealed class CmdRecord : Record
+{
+    /// <summary>The NDJSON line as received: stored with the op it joins, re-read through the parser.</summary>
+    public byte[]? Raw;
+    public string? ProxyId;
+    public string? Member;
+    public long? ServerConnectionId;
+    public int RequestId;
+    public string? OperationId;
+    public string Command = "";
+    public string? Db;
+    public string Status = "";
+    public long? ClientUs;
+    public long? PoolWaitUs;
+    public int? Attempt;
+    public string? UowId, UowName, UowKind;
+    public string? Traceparent;
+    public string? Callsite;
+    public long? CursorId;
+    /// <summary>A server code (number) or a client-side code name: kept as text.</summary>
+    public string? ErrorCode;
+    public List<string>? ErrorLabels;
+
+    /// <summary>Null when the exporter could not build the key (02 §3.3): an orphan from the start.</summary>
+    public JoinKey? Key => ProxyId != null && Member != null && ServerConnectionId is { } sid ? new JoinKey(ProxyId, Member, sid, RequestId) : null;
+}
+
+/// <summary>02 §3.1 <c>(proxyId, member, serverConnectionId, requestId)</c>.</summary>
+public readonly record struct JoinKey(string ProxyId, string Member, long ServerConnectionId, int RequestId);
+
+/// <summary>02 §4.3 <c>hello</c>: one per exporter start.</summary>
+public sealed class HelloRecord : Record
+{
+    public string Exporter = "";
+    public string? Version, Runtime, Driver, Host, App, AppVersion;
+    public int Schema;
+    public long? Pid;
+}
+
+/// <summary>02 §4.3 <c>callsite</c>: the frames behind a callsite hash, once per hash per exporter process.</summary>
+public sealed class CallsiteRecord : Record
+{
+    public string Callsite = "";
+    public string? Lang;
+    public List<(string Fn, string? File, int? Line)> Frames = [];
+}
+
+/// <summary>02 §4.3 <c>uow</c> and <c>pool</c>: accepted and counted; the analyzers that read them are M3 (03 §5.3).</summary>
 public sealed class ContextRecord : Record
 {
     public string Type = "";

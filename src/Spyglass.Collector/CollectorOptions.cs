@@ -31,6 +31,15 @@ public sealed class CollectorOptions
     public TimeSpan MaxFutureSkew { get; set; } = TimeSpan.FromMinutes(5);
     public int LiveBuffer { get; set; } = 1000;
 
+    // 02 §6.2 join windows and the bounds on join state (03 §11)
+    public long JoinWaitUs { get; set; } = 2_000_000;
+    public long JoinWaitExporterUs { get; set; } = 10_000_000;
+    /// <summary>Ops waiting for context, over all partitions; past it the oldest is finalized early (counted).</summary>
+    public int JoinMaxWaitingOps { get; set; } = 200_000;
+    public int JoinMaxWaitingCmds { get; set; } = 200_000;
+    /// <summary>Finalized ops a late cmd can still merge into, per partition (02 §6.2, bounded like dedup).</summary>
+    public int JoinFinalizedCapacity { get; set; } = 1 << 17;
+
     // 03 §5.2 thresholds
     public long SlowShapeUs { get; set; } = 100_000;
     public int NPlusOneCount { get; set; } = 10;

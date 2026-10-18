@@ -3,8 +3,8 @@ using System.Security.Cryptography;
 namespace Spyglass.Collector.Model;
 
 /// <summary>
-/// The stored entity (03 §3.3). M1 is wire-only: built from an <c>op</c> record plus its connection's
-/// <c>conn</c> metadata; the exporter fields arrive with the M2 join.
+/// The stored entity (03 §3.3): an <c>op</c> record, its connection's <c>conn</c> metadata, and, when an
+/// exporter reported the same command, its <c>cmd</c> record (the join, 02 §6).
 /// </summary>
 public sealed class Operation
 {
@@ -32,6 +32,16 @@ public sealed class Operation
     public int ReplyCount;
     /// <summary>Alert rules this op raised (03 §8 op detail "linked alerts").</summary>
     public List<string>? Alerts;
+
+    /// <summary>The joined <c>cmd</c> (02 §6), or null for a wire-only op. Written once, by the thread that joins it.</summary>
+    public CmdRecord? Ctx;
+    /// <summary>Handed to the storage writer (analysis thread only): later changes go as updates.</summary>
+    internal bool Stored;
+
+    /// <summary>03 §3.3: <c>client_us − (respLast − reqFirst)</c>, clamped ≥ 0.</summary>
+    public long? ClientOverheadUs => Ctx?.ClientUs is { } c ? Math.Max(0, c - (Op.RespLastUs ?? Op.ReqLastUs)) : null;
+
+    public JoinKey? Key => Op.ServerConnectionId is { } sid ? new JoinKey(Op.Src, Op.Member, sid, Op.RequestId) : null;
 
     public long Ts => Op.Ts;
     public long? ServerLatencyUs => Op.ServerLatencyUs;

@@ -1,0 +1,286 @@
+{
+  "description": "The proxy's reductions (01 §9.2) read as what they stand for.",
+  "cases": [
+    {
+      "name": "values-shape",
+      "rule": "values: shape: the proxy sent tags already (arrays element by element); no valueHash (03 §4)",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "a": "?number",
+          "b": "?string",
+          "c": {
+            "$in": [
+              "?number",
+              "?number",
+              "?number"
+            ]
+          }
+        },
+        "$db": "shop"
+      },
+      "values": "shape",
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "a": "?number",
+            "b": "?string",
+            "c": {
+              "$in": [
+                "?"
+              ]
+            }
+          }
+        },
+        "shapeHash": "4ac59bfecaac5d23",
+        "valueHash": null,
+        "inCardinality": 3
+      }
+    },
+    {
+      "name": "values-shape-literals",
+      "rule": "values: shape tags every leaf, the ones the shape keeps too (sort direction, $exists, limit): shapes group more coarsely",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "a": {
+            "$exists": "?bool"
+          }
+        },
+        "sort": {
+          "ts": "?number"
+        },
+        "limit": "?number",
+        "$db": "shop"
+      },
+      "values": "shape",
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "a": {
+              "$exists": "?bool"
+            }
+          },
+          "limit": "?",
+          "sort": [
+            [
+              "ts",
+              "?number"
+            ]
+          ]
+        },
+        "shapeHash": "789e2af36fc3cf9f",
+        "valueHash": null,
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "truncated-string",
+      "rule": "a string the proxy truncated is still ?string",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "note": "a long comment that was cut…"
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "note": "?string"
+          }
+        },
+        "shapeHash": "739b660172dfbb1d",
+        "valueHash": "3bcde95f5205147e",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "binData-stub",
+      "rule": "{$binData:{subtype,length}} → ?binData",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "blob": {
+            "$binData": {
+              "subtype": 0,
+              "length": 2048
+            }
+          }
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "blob": "?binData"
+          }
+        },
+        "shapeHash": "0016d07c9eb87a1b",
+        "valueHash": "617d8274de99e91e",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "uuid-stub",
+      "rule": "{$binData:{subtype:4,…}} → ?uuid",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "id": {
+            "$binData": {
+              "subtype": 4,
+              "length": 16
+            }
+          }
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "id": "?uuid"
+          }
+        },
+        "shapeHash": "a7f27fed870abc27",
+        "valueHash": "186ae8a95d4af2aa",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "capped-in",
+      "rule": "an array capped at 20 with {$more:n}: inCardinality counts what was cut",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "_id": {
+            "$in": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17,
+              18,
+              19,
+              {
+                "$more": 980
+              }
+            ]
+          }
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "_id": {
+              "$in": [
+                "?"
+              ]
+            }
+          }
+        },
+        "shapeHash": "ad8e62370844ae2b",
+        "valueHash": "b5c0ad39c610dd58",
+        "inCardinality": 1000
+      }
+    },
+    {
+      "name": "cmd-truncated",
+      "rule": "cmdTruncated: no valueHash",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "a": 1
+        },
+        "$db": "shop"
+      },
+      "cmdTruncated": true,
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "a": "?number"
+          }
+        },
+        "shapeHash": "dbb79a036929a9d4",
+        "valueHash": null,
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "redacted-command",
+      "rule": "an auth command is exactly {$redacted: name} (01 §9.1): command name only",
+      "command": "saslStart",
+      "db": "admin",
+      "coll": null,
+      "cmd": {
+        "$redacted": "saslStart"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "saslStart",
+          "coll": null,
+          "db": "admin"
+        },
+        "shapeHash": "9ac5bb1f551ee017",
+        "valueHash": null,
+        "inCardinality": 0
+      }
+    }
+  ]
+}

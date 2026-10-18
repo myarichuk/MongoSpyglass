@@ -1,0 +1,770 @@
+{
+  "description": "03 §4.3: every per-command row.",
+  "cases": [
+    {
+      "name": "find-full",
+      "rule": "§4.3 find: filter, sort, projection, limit/skip/batchSize presence, hint, collation.locale",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "status": "A"
+        },
+        "sort": {
+          "ts": -1,
+          "_id": 1
+        },
+        "projection": {
+          "a": 1,
+          "_id": 0
+        },
+        "limit": 10,
+        "skip": 20,
+        "batchSize": 5,
+        "hint": {
+          "status": 1
+        },
+        "collation": {
+          "locale": "fr",
+          "strength": 2
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "batchSize": "?",
+          "cmd": "find",
+          "coll": "orders",
+          "collation": {
+            "locale": "fr"
+          },
+          "db": "shop",
+          "filter": {
+            "status": "?string"
+          },
+          "hint": [
+            [
+              "status",
+              1
+            ]
+          ],
+          "limit": "?",
+          "projection": {
+            "_id": 0,
+            "a": 1
+          },
+          "skip": "?",
+          "sort": [
+            [
+              "ts",
+              -1
+            ],
+            [
+              "_id",
+              1
+            ]
+          ]
+        },
+        "shapeHash": "d41d966aec954a2d",
+        "valueHash": "d74565ca09ead045",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "aggregate",
+      "rule": "§4.3 aggregate: $match → normFilter, $sort kept, $group/_id structure with tags, accumulators kept, $limit/$skip → ?, unknown stages tagged",
+      "command": "aggregate",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "aggregate": "orders",
+        "pipeline": [
+          {
+            "$match": {
+              "status": "A",
+              "qty": {
+                "$gt": 5
+              }
+            }
+          },
+          {
+            "$sort": {
+              "ts": -1
+            }
+          },
+          {
+            "$group": {
+              "_id": {
+                "c": "$customer",
+                "y": {
+                  "$year": "$ts"
+                }
+              },
+              "total": {
+                "$sum": "$amount"
+              },
+              "n": {
+                "$sum": 1
+              }
+            }
+          },
+          {
+            "$project": {
+              "total": 1,
+              "big": {
+                "$gt": [
+                  "$total",
+                  100
+                ]
+              }
+            }
+          },
+          {
+            "$skip": 5
+          },
+          {
+            "$limit": 10
+          },
+          {
+            "$unwind": "$items"
+          },
+          {
+            "$addFields": {
+              "k": "constant"
+            }
+          }
+        ],
+        "cursor": {},
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "aggregate",
+          "coll": "orders",
+          "db": "shop",
+          "pipeline": [
+            {
+              "$match": {
+                "qty": {
+                  "$gt": "?number"
+                },
+                "status": "?string"
+              }
+            },
+            {
+              "$sort": [
+                [
+                  "ts",
+                  -1
+                ]
+              ]
+            },
+            {
+              "$group": {
+                "_id": {
+                  "c": "$customer",
+                  "y": {
+                    "$year": "$ts"
+                  }
+                },
+                "n": {
+                  "$sum": "?number"
+                },
+                "total": {
+                  "$sum": "$amount"
+                }
+              }
+            },
+            {
+              "$project": {
+                "big": {
+                  "$gt": [
+                    "$total",
+                    "?number"
+                  ]
+                },
+                "total": 1
+              }
+            },
+            {
+              "$skip": "?"
+            },
+            {
+              "$limit": "?"
+            },
+            {
+              "$unwind": "$items"
+            },
+            {
+              "$addFields": {
+                "k": "?string"
+              }
+            }
+          ]
+        },
+        "shapeHash": "3d19afab9a1f2244",
+        "valueHash": "e2664df6b3f869e1",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "aggregate-lookup",
+      "rule": "§4.3 $lookup keeps from/localField/foreignField/as, its sub-pipeline normalized",
+      "command": "aggregate",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "aggregate": "orders",
+        "pipeline": [
+          {
+            "$lookup": {
+              "from": "customers",
+              "localField": "cid",
+              "foreignField": "_id",
+              "as": "c"
+            }
+          },
+          {
+            "$lookup": {
+              "from": "items",
+              "let": {
+                "o": "$_id"
+              },
+              "pipeline": [
+                {
+                  "$match": {
+                    "sku": "x"
+                  }
+                },
+                {
+                  "$limit": 3
+                }
+              ],
+              "as": "i"
+            }
+          }
+        ],
+        "cursor": {},
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "aggregate",
+          "coll": "orders",
+          "db": "shop",
+          "pipeline": [
+            {
+              "$lookup": {
+                "as": "c",
+                "foreignField": "_id",
+                "from": "customers",
+                "localField": "cid"
+              }
+            },
+            {
+              "$lookup": {
+                "as": "i",
+                "from": "items",
+                "let": {
+                  "o": "$_id"
+                },
+                "pipeline": [
+                  {
+                    "$match": {
+                      "sku": "?string"
+                    }
+                  },
+                  {
+                    "$limit": "?"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "shapeHash": "0a7778cc259818d5",
+        "valueHash": "719885d43efb0e56",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "update",
+      "rule": "§4.3 update: per statement q, u (operator → field → tag), upsert, multi; statements deduplicated",
+      "command": "update",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "update": "orders",
+        "updates": [
+          {
+            "q": {
+              "_id": 1
+            },
+            "u": {
+              "$set": {
+                "status": "B",
+                "n": 2
+              },
+              "$inc": {
+                "v": 1
+              }
+            }
+          },
+          {
+            "q": {
+              "_id": 2
+            },
+            "u": {
+              "$set": {
+                "status": "C",
+                "n": 3
+              },
+              "$inc": {
+                "v": 1
+              }
+            }
+          },
+          {
+            "q": {
+              "status": "A"
+            },
+            "u": {
+              "$unset": {
+                "x": ""
+              }
+            },
+            "upsert": true,
+            "multi": true
+          }
+        ],
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "update",
+          "coll": "orders",
+          "db": "shop",
+          "updates": [
+            {
+              "q": {
+                "_id": "?number"
+              },
+              "u": {
+                "$inc": {
+                  "v": "?number"
+                },
+                "$set": {
+                  "n": "?number",
+                  "status": "?string"
+                }
+              }
+            },
+            {
+              "multi": true,
+              "q": {
+                "status": "?string"
+              },
+              "u": {
+                "$unset": {
+                  "x": "?string"
+                }
+              },
+              "upsert": true
+            }
+          ]
+        },
+        "shapeHash": "a2ba928428a56007",
+        "valueHash": "babfba04dc3c43a1",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "update-pipeline",
+      "rule": "§4.3 a pipeline-style u is normalized like an aggregate pipeline",
+      "command": "update",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "update": "orders",
+        "updates": [
+          {
+            "q": {
+              "_id": 1
+            },
+            "u": [
+              {
+                "$set": {
+                  "total": {
+                    "$add": [
+                      "$a",
+                      5
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        ],
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "update",
+          "coll": "orders",
+          "db": "shop",
+          "updates": [
+            {
+              "q": {
+                "_id": "?number"
+              },
+              "u": [
+                {
+                  "$set": {
+                    "total": {
+                      "$add": [
+                        "$a",
+                        "?number"
+                      ]
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        "shapeHash": "e84e85e88e49ed91",
+        "valueHash": "784be53c9ce0b106",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "update-replacement",
+      "rule": "a replacement document: its leaves tagged",
+      "command": "update",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "update": "orders",
+        "updates": [
+          {
+            "q": {
+              "_id": 1
+            },
+            "u": {
+              "status": "A",
+              "qty": 3
+            }
+          }
+        ],
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "update",
+          "coll": "orders",
+          "db": "shop",
+          "updates": [
+            {
+              "q": {
+                "_id": "?number"
+              },
+              "u": {
+                "qty": "?number",
+                "status": "?string"
+              }
+            }
+          ]
+        },
+        "shapeHash": "e413037ab5ba4392",
+        "valueHash": "ea738305471c45fe",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "delete",
+      "rule": "§4.3 delete: per statement q and limit",
+      "command": "delete",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "delete": "orders",
+        "deletes": [
+          {
+            "q": {
+              "_id": 7
+            },
+            "limit": 1
+          },
+          {
+            "q": {
+              "status": "X"
+            },
+            "limit": 0
+          }
+        ],
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "delete",
+          "coll": "orders",
+          "db": "shop",
+          "deletes": [
+            {
+              "limit": 1,
+              "q": {
+                "_id": "?number"
+              }
+            },
+            {
+              "limit": 0,
+              "q": {
+                "status": "?string"
+              }
+            }
+          ]
+        },
+        "shapeHash": "18a513473bd13787",
+        "valueHash": "9100feb2f830bd5e",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "findAndModify",
+      "rule": "§4.3 findAndModify: query, sort, update, new/upsert/remove flags",
+      "command": "findAndModify",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "findAndModify": "orders",
+        "query": {
+          "_id": 1
+        },
+        "sort": {
+          "ts": 1
+        },
+        "update": {
+          "$set": {
+            "s": "B"
+          }
+        },
+        "new": true,
+        "upsert": false,
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "findAndModify",
+          "coll": "orders",
+          "db": "shop",
+          "new": true,
+          "query": {
+            "_id": "?number"
+          },
+          "sort": [
+            [
+              "ts",
+              1
+            ]
+          ],
+          "update": {
+            "$set": {
+              "s": "?string"
+            }
+          },
+          "upsert": false
+        },
+        "shapeHash": "4533507406e6cbfe",
+        "valueHash": "ca2bcaa2ab21524b",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "findAndModify-remove",
+      "rule": "§4.3 findAndModify with remove",
+      "command": "findAndModify",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "findAndModify": "orders",
+        "query": {
+          "status": "A"
+        },
+        "remove": true,
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "findAndModify",
+          "coll": "orders",
+          "db": "shop",
+          "query": {
+            "status": "?string"
+          },
+          "remove": true
+        },
+        "shapeHash": "3df294336552975b",
+        "valueHash": "adbb92a2537457c4",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "count",
+      "rule": "§4.3 count: query",
+      "command": "count",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "count": "orders",
+        "query": {
+          "status": "A"
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "count",
+          "coll": "orders",
+          "db": "shop",
+          "query": {
+            "status": "?string"
+          }
+        },
+        "shapeHash": "443cd49785a693a6",
+        "valueHash": "466e929facc97b2b",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "distinct",
+      "rule": "§4.3 distinct: query and key",
+      "command": "distinct",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "distinct": "orders",
+        "key": "customer",
+        "query": {
+          "qty": {
+            "$gt": 1
+          }
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "distinct",
+          "coll": "orders",
+          "db": "shop",
+          "key": "customer",
+          "query": {
+            "qty": {
+              "$gt": "?number"
+            }
+          }
+        },
+        "shapeHash": "9ef22e528319c962",
+        "valueHash": "e33406f4467f8d2e",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "insert",
+      "rule": "§4.3 insert: nothing beyond coll (the documents are a metric)",
+      "command": "insert",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "insert": "orders",
+        "documents": [
+          {
+            "_id": 1,
+            "a": "x"
+          }
+        ],
+        "ordered": true,
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "insert",
+          "coll": "orders",
+          "db": "shop"
+        },
+        "shapeHash": "b18bb7936b01c476",
+        "valueHash": "b18bb7936b01c476",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "getMore",
+      "rule": "§4.3 getMore: standalone it is command-only; it takes the shape of the op that opened its cursor (§5.4) in the analysis stage",
+      "command": "getMore",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "getMore": {
+          "$numberLong": "8000000000000000017"
+        },
+        "collection": "orders",
+        "batchSize": 101,
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "getMore",
+          "coll": "orders",
+          "db": "shop"
+        },
+        "shapeHash": "fe061be2bed1c692",
+        "valueHash": "fe061be2bed1c692",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "other",
+      "rule": "§4.3 others: command name only",
+      "command": "listIndexes",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "listIndexes": "orders",
+        "cursor": {},
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "listIndexes",
+          "coll": "orders",
+          "db": "shop"
+        },
+        "shapeHash": "539cce93984d40c2",
+        "valueHash": "539cce93984d40c2",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "other-no-coll",
+      "rule": "§4.3 others: command name only (no collection)",
+      "command": "ping",
+      "db": "admin",
+      "coll": null,
+      "cmd": {
+        "ping": 1,
+        "$db": "admin"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "ping",
+          "coll": null,
+          "db": "admin"
+        },
+        "shapeHash": "e997ff24690156a5",
+        "valueHash": "e997ff24690156a5",
+        "inCardinality": 0
+      }
+    }
+  ]
+}

@@ -39,21 +39,29 @@ public sealed class Collector : IAsyncDisposable
 
     // self-telemetry (03 §8 /metrics)
     public long RecordsAccepted, RecordsRejected, RecordsIgnored, RedactionRejected, ClockSkewed, ContextRecords;
+    public JoinCounters Join { get; } = new();
+    /// <summary>When an exporter last sent anything (µs): ops wait for context only while one is reporting (02 §6.2).</summary>
+    private long _lastContextUs = long.MinValue / 2;
+    private static readonly long ExporterIdleUs = 600_000_000;
     public long Batches2xx, Batches400, Batches413, Batches429;
 
-    public Collector(CollectorOptions options, IOperationStore ops, IAggregateStore aggregates, IAlertStore alerts, Func<long>? nowUs = null)
+    public ICallsiteStore Callsites { get; }
+
+    public Collector(CollectorOptions options, IOperationStore ops, IAggregateStore aggregates, IAlertStore alerts, Func<long>? nowUs = null,
+        ICallsiteStore? callsites = null)
     {
         Options = options;
         Ops = ops;
         Aggregates = aggregates;
         AlertStore = alerts;
+        Callsites = callsites ?? ops as ICallsiteStore ?? new MemoryStore();
         NowUs = nowUs ?? (() => (DateTime.UtcNow - DateTime.UnixEpoch).Ticks / 10);
         Live = new LiveHub(options.LiveBuffer);
-        _writer = new StorageWriter(ops, aggregates, options, NowUs);
-        _analysis = new AnalysisStage(options, _writer, aggregates, alerts, ops, Live, Release, NowUs);
+        _writer = new StorageWriter(ops, aggregates, Callsites, options, NowUs, Live);
+        _analysis = new AnalysisStage(options, _writer, aggregates, alerts, ops, Live, Producers, Release, NowUs);
         _partitions = new Partition[options.Workers];
         for (var i = 0; i < _partitions.Length; i++)
-            _partitions[i] = new Partition(options, Connections, Producers, _analysis.Post, Release);
+            _partitions[i] = new Partition(options, Connections, Producers, Join, _analysis.Post, Release, NowUs, ExportersActive);
         _sweep = new Timer(_ => Connections.Sweep(), null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
     }
 
@@ -70,6 +78,8 @@ public sealed class Collector : IAsyncDisposable
     }
 
     private void Release(Record r) => Interlocked.Add(ref _charged, -r.Size);
+
+    private bool ExportersActive(long nowUs) => nowUs - Volatile.Read(ref _lastContextUs) < ExporterIdleUs;
 
     /// <summary>Handles one POSTed batch. Never blocks on the pipeline (03 §1: answer within 50 ms).</summary>
     public IngestResult Ingest(ReadOnlySpan<byte> body, string? contentEncoding, string? producerHeader)
@@ -118,7 +128,7 @@ public sealed class Collector : IAsyncDisposable
                 Interlocked.Increment(ref RedactionRejected);
                 continue;
             }
-            Route(r, perPartition);
+            Route(r, perPartition, now);
             accepted++;
         }
         for (var i = 0; i < perPartition.Length; i++)
@@ -135,14 +145,37 @@ public sealed class Collector : IAsyncDisposable
         return new IngestResult(204, accepted, rejected, ignored);
     }
 
-    private void Route(Record r, List<Record>?[] perPartition)
+    private void Route(Record r, List<Record>?[] perPartition, long now)
     {
         switch (r)
         {
             case ConnRecord c: Connections.Apply(c); return;
             case ProxyRecord p: Producers.Apply(p); return;
             case StatsRecord s: Producers.Apply(s); return;
-            case ContextRecord: Interlocked.Increment(ref ContextRecords); return; // M2: the join
+            case CmdRecord c:
+            {
+                Volatile.Write(ref _lastContextUs, now);
+                var p = Producers.Get(c.Src)!;
+                Interlocked.Increment(ref p.Cmds);
+                if (c.Key is not { } key) // 02 §3.3, §6.5: counted, never joinable
+                {
+                    Interlocked.Increment(ref Join.OrphanNoKey);
+                    Interlocked.Increment(ref p.Orphans);
+                    return;
+                }
+                Charge(c);
+                (perPartition[PartitionFor(key.ProxyId, key.Member, key.ServerConnectionId)] ??= []).Add(c);
+                return;
+            }
+            case HelloRecord h:
+                Volatile.Write(ref _lastContextUs, now);
+                Producers.Apply(h);
+                return;
+            case CallsiteRecord cs:
+                Volatile.Write(ref _lastContextUs, now);
+                _writer.Enqueue(cs);
+                return;
+            case ContextRecord: Interlocked.Increment(ref ContextRecords); return; // uow, pool: M3 (03 §5.3)
             case OpRecord op:
                 Charge(op);
                 (perPartition[PartitionFor(op.Src, op.Member, op.ServerConnectionId ?? -op.ConnSeq)] ??= []).Add(op);
@@ -162,8 +195,7 @@ public sealed class Collector : IAsyncDisposable
     /// <summary>03 §9 defence in depth: an auth command's body must be exactly the proxy's <c>{$redacted: name}</c>.</summary>
     private static bool RedactionHolds(OpRecord op)
     {
-        if (op.Command is not ("authenticate" or "saslStart" or "saslContinue" or "getnonce" or "createUser" or "updateUser" or "copydbgetnonce" or "copydbsaslstart" or "copydb"))
-            return true;
+        if (!Shapes.ShapeNormalizer.IsRedactedCommand(op.Command)) return true;
         if (op.Cmd == null) return true;
         try
         {
@@ -183,14 +215,16 @@ public sealed class Collector : IAsyncDisposable
         return n > MaxBatchBytes ? null : buf.AsSpan(0, n).ToArray();
     }
 
-    /// <summary>Waits until everything ingested so far has been analysed (tests, shutdown).</summary>
+    /// <summary>
+    /// Waits until everything ingested so far has gone through every stage, storage included, with join expiry and
+    /// the analysis housekeeping run at the current clock. Each stage is FIFO, so a barrier per stage is exact.
+    /// </summary>
     public async Task DrainAsync(TimeSpan timeout)
     {
-        var deadline = DateTime.UtcNow + timeout;
-        while (QueuedBytes > 0 && DateTime.UtcNow < deadline)
-            await Task.Delay(5).ConfigureAwait(false);
-        _analysis.Tick();
-        await Task.Delay(20).ConfigureAwait(false);
+        var all = Task.WhenAll(_partitions.Select(p => p.Barrier()));
+        if (await Task.WhenAny(all, Task.Delay(timeout)).ConfigureAwait(false) != all) return;
+        await _analysis.Invoke(() => { _analysis.Housekeeping(NowUs()); return 0; }).ConfigureAwait(false);
+        await _writer.Barrier().ConfigureAwait(false);
     }
 
     public string RenderMetrics()
@@ -212,7 +246,16 @@ public sealed class Collector : IAsyncDisposable
         M("spyglass_collector_clock_skew_total", "counter", "Records whose ts was more than 5 min ahead and was clamped.", ("", ClockSkewed));
         M("spyglass_collector_duplicates_total", "counter", "Records suppressed as duplicates (02 §6.4).", ("", _partitions.Sum(p => p.Duplicates)));
         M("spyglass_collector_decode_failures_total", "counter", "op records whose cmd was not decodable BSON.", ("", _partitions.Sum(p => p.DecodeFailures)));
-        M("spyglass_collector_join_conflicts_total", "counter", "02 §6.3 join conflicts (M2).", ("", 0));
+        var j = Join;
+        M("spyglass_collector_join_total", "counter", "cmd records by 02 §6 outcome.",
+            ("result=\"joined\"", j.Joined), ("result=\"joined_late\"", j.JoinedLate), ("result=\"conflict\"", j.Conflicts),
+            ("result=\"orphan_no_key\"", j.OrphanNoKey), ("result=\"orphan_expired\"", j.OrphanExpired),
+            ("result=\"late_discarded\"", j.LateDiscarded), ("result=\"already_joined\"", j.AlreadyJoined), ("result=\"duplicate\"", j.Duplicates));
+        M("spyglass_collector_join_conflicts_total", "counter", "02 §6.3 join conflicts: same key, different command or db.", ("", j.Conflicts));
+        M("spyglass_collector_join_waited_wire_only_total", "counter", "Ops stored without context after waiting for it.", ("", j.WaitedWireOnly));
+        M("spyglass_collector_join_evicted_total", "counter", "Ops finalized early because the waiting set was full.", ("", j.EvictedOps));
+        M("spyglass_collector_join_waiting", "gauge", "Records waiting for their counterpart.",
+            ("record=\"op\"", Volatile.Read(ref j.PendingOps)), ("record=\"cmd\"", Volatile.Read(ref j.PendingCmds)));
         M("spyglass_collector_ops_analysed_total", "counter", "Operations through the analysis stage.", ("", _analysis.Processed));
         M("spyglass_collector_ops_stored_total", "counter", "Operations written to the store.", ("", _writer.Written));
         M("spyglass_collector_ops_sampled_out_total", "counter", "Operations not stored under write backpressure (03 §7).", ("", _writer.Sampled));
@@ -228,7 +271,7 @@ public sealed class Collector : IAsyncDisposable
     {
         await _sweep.DisposeAsync().ConfigureAwait(false);
         foreach (var p in _partitions) p.Complete();
-        foreach (var p in _partitions) p.Join();
+        foreach (var p in _partitions) p.JoinThread();
         _analysis.Complete();
         _analysis.Join();
         _writer.Complete();

@@ -1,0 +1,2 @@
+{"type":"conn","ts":1700000000000000,"src":"8f0c2c1e-0000-4000-8000-0000000000a1","event":"close","member":"localhost:27017","connSeq":1234,"serverConnectionId":5512,"client":"10.1.2.3:51122","tls":true,"app":"orders-api","driver":"nodejs|spyglass-node","driverVersion":"7.7.0|0.1.0","exporter":"spyglass-node","os":"linux","platform":"Node.js v22.4.0, LE","closeReason":"client_closed","bytesIn":4096,"bytesOut":81920}
+{"type":"conn","ts":1700000000000000,"src":"8f0c2c1e-0000-4000-8000-0000000000a1","event":"open","member":"localhost:27017","connSeq":1234}

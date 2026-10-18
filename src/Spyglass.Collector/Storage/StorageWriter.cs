@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using Spyglass.Collector.Analysis;
+using Spyglass.Collector.Api;
 using Spyglass.Collector.Model;
 
 namespace Spyglass.Collector.Storage;
@@ -7,6 +9,7 @@ namespace Spyglass.Collector.Storage;
 /// 03 §7 write path: one thread, transactions of ≥ 500 rows or every 250 ms. Under backpressure the raw
 /// operations are sampled (every slow, errored or alerted op kept, plus 1/<see cref="SampleEvery"/> of the
 /// rest); aggregates never pass through here, so they are never what gets dropped. Retention runs here too.
+/// Appends, updates and callsites share one FIFO: an update can never overtake the append of its op.
 /// </summary>
 internal sealed class StorageWriter
 {
@@ -15,23 +18,29 @@ internal sealed class StorageWriter
 
     private readonly IOperationStore _store;
     private readonly IAggregateStore _aggregates;
+    private readonly ICallsiteStore _callsites;
     private readonly CollectorOptions _options;
-    private readonly BlockingCollection<Operation> _queue = new(new ConcurrentQueue<Operation>());
+    private readonly LiveHub _live;
+    /// <summary>An <see cref="Operation"/>, <see cref="OpUpdate"/>, <see cref="CallsiteRecord"/>, callsite touches, or a barrier.</summary>
+    private readonly BlockingCollection<object> _queue = new(new ConcurrentQueue<object>());
     private readonly Func<long> _nowUs;
     private Thread? _thread;
     private long _seq;
+    private int _ops;
 
-    public long Written, Sampled, Pruned;
+    public long Written, Sampled, Pruned, Updated;
 
-    public StorageWriter(IOperationStore store, IAggregateStore aggregates, CollectorOptions options, Func<long> nowUs)
+    public StorageWriter(IOperationStore store, IAggregateStore aggregates, ICallsiteStore callsites, CollectorOptions options, Func<long> nowUs, LiveHub live)
     {
         _store = store;
         _aggregates = aggregates;
+        _callsites = callsites;
         _options = options;
         _nowUs = nowUs;
+        _live = live;
     }
 
-    public int Backlog => _queue.Count;
+    public int Backlog => Volatile.Read(ref _ops);
 
     public void Start()
     {
@@ -42,7 +51,7 @@ internal sealed class StorageWriter
     /// <summary>Analysis thread. Never blocks.</summary>
     public void Enqueue(Operation op)
     {
-        var backlog = _queue.Count;
+        var backlog = Volatile.Read(ref _ops);
         if (backlog > Capacity / 2 && !Keep(op))
         {
             // half full: sample; full: keep only what matters
@@ -52,7 +61,23 @@ internal sealed class StorageWriter
                 return;
             }
         }
+        Interlocked.Increment(ref _ops);
         _queue.Add(op);
+    }
+
+    /// <summary>Never sampled: an update is small, and its op may be the one that mattered.</summary>
+    public void Enqueue(OpUpdate update) => _queue.Add(update);
+
+    public void Enqueue(CallsiteRecord callsite) => _queue.Add(callsite);
+
+    public void Touch(List<string> callsites) => _queue.Add(callsites);
+
+    /// <summary>Completes once everything enqueued before it is written.</summary>
+    public Task Barrier()
+    {
+        var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _queue.Add(tcs);
+        return tcs.Task;
     }
 
     private bool Keep(Operation op) =>
@@ -61,22 +86,27 @@ internal sealed class StorageWriter
     public void Complete() => _queue.CompleteAdding();
     public void Join() => _thread?.Join();
 
+    private readonly List<Operation> _batch = new(BatchRows);
+    private readonly List<OpUpdate> _updates = [];
+    private readonly List<CallsiteRecord> _newCallsites = [];
+    private readonly HashSet<string> _touched = [];
+    private readonly List<TaskCompletionSource> _barriers = [];
+
     private void Loop()
     {
-        var batch = new List<Operation>(BatchRows);
         var nextRetention = Environment.TickCount64 + 10_000;
         var deadline = Environment.TickCount64 + (long)BatchInterval.TotalMilliseconds;
         while (!_queue.IsCompleted)
         {
             var wait = (int)Math.Max(0, deadline - Environment.TickCount64);
-            if (_queue.TryTake(out var op, wait))
+            if (_queue.TryTake(out var item, wait))
             {
-                batch.Add(op);
-                while (batch.Count < BatchRows * 4 && _queue.TryTake(out var more)) batch.Add(more);
+                Add(item);
+                while (_batch.Count < BatchRows * 4 && _barriers.Count == 0 && _queue.TryTake(out var more)) Add(more);
             }
-            if (batch.Count >= BatchRows || Environment.TickCount64 >= deadline)
+            if (_batch.Count >= BatchRows || _barriers.Count > 0 || Environment.TickCount64 >= deadline)
             {
-                Write(batch);
+                Write();
                 deadline = Environment.TickCount64 + (long)BatchInterval.TotalMilliseconds;
             }
             if (Environment.TickCount64 >= nextRetention)
@@ -85,23 +115,55 @@ internal sealed class StorageWriter
                 nextRetention = Environment.TickCount64 + 60_000;
             }
         }
-        while (_queue.TryTake(out var rest)) batch.Add(rest);
-        Write(batch);
+        while (_queue.TryTake(out var rest)) Add(rest);
+        Write();
     }
 
-    private void Write(List<Operation> batch)
+    private void Add(object item)
     {
-        if (batch.Count == 0) return;
+        switch (item)
+        {
+            case Operation op: _batch.Add(op); Interlocked.Decrement(ref _ops); break;
+            case OpUpdate u: _updates.Add(u); break;
+            case CallsiteRecord c: _newCallsites.Add(c); break;
+            case List<string> touched: _touched.UnionWith(touched); break;
+            case TaskCompletionSource b: _barriers.Add(b); break;
+        }
+    }
+
+    private void Write()
+    {
         try
         {
-            _store.Append(batch);
-            Interlocked.Add(ref Written, batch.Count);
+            // appends first: every update in this batch names an op appended in this batch or before
+            if (_batch.Count > 0)
+            {
+                _store.Append(_batch);
+                Interlocked.Add(ref Written, _batch.Count);
+            }
+            if (_updates.Count > 0)
+            {
+                _store.Update(_updates);
+                Interlocked.Add(ref Updated, _updates.Count);
+                if (_live.Subscribers > 0)
+                    foreach (var u in _updates)
+                        if (u.Ctx != null && _store.Get(u.Id) is { } op) // late context: the op left memory when it was stored
+                            _live.Publish(new LiveEvent("op.updated", Json.Write(w => Json.OpSummary(w, op)), op));
+            }
+            var now = _nowUs();
+            if (_newCallsites.Count > 0) _callsites.Upsert(_newCallsites, now);
+            if (_touched.Count > 0) _callsites.Touch(_touched, now);
         }
         catch (Exception e)
         {
-            Console.Error.WriteLine($"storage: {e.GetType().Name}: {e.Message} ({batch.Count} ops lost)");
+            Console.Error.WriteLine($"storage: {e.GetType().Name}: {e.Message} ({_batch.Count} ops, {_updates.Count} updates lost)");
         }
-        batch.Clear();
+        _batch.Clear();
+        _updates.Clear();
+        _newCallsites.Clear();
+        _touched.Clear();
+        foreach (var b in _barriers) b.TrySetResult();
+        _barriers.Clear();
     }
 
     private void Retention()
@@ -111,6 +173,7 @@ internal sealed class StorageWriter
             var now = _nowUs();
             Interlocked.Add(ref Pruned, _store.Prune(now - (long)_options.OpRetention.TotalMicroseconds, _options.OpStoreBytes));
             _aggregates.Rollup(now);
+            _callsites.PruneCallsites(now - (long)TimeSpan.FromDays(30).TotalMicroseconds);
         }
         catch (Exception e)
         {

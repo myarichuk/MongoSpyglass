@@ -1,0 +1,2 @@
+{"type":"pool","ts":1700000000000000,"src":"3b6a9d20-0000-4000-8000-0000000000e1","member":"localhost:27017","proxyId":"8f0c2c1e-0000-4000-8000-0000000000a1","maxSize":100,"total":100,"inUse":100,"available":0,"waitQueue":37,"checkouts":4310,"checkoutFailed":{"timeout":12,"poolClosed":0,"connectionError":0},"poolWait_us":{"p50":2100,"p95":48000,"max":30001000}}
+{"type":"pool","ts":1700000000000000,"src":"3b6a9d20-0000-4000-8000-0000000000e1","member":"localhost:27017","proxyId":null}

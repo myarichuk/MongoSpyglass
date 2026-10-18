@@ -8,10 +8,27 @@ namespace Spyglass.Collector.Pipeline;
 /// <summary>A per-connection rule hit (03 §5.2), handed with its op to the analysis stage that owns alerts.</summary>
 public readonly record struct RuleHit(string Rule, string ScopeKey, string Summary);
 
+/// <summary>What one partition pass hands the analysis stage: one hand-off per ingested batch, not per record.</summary>
+internal sealed class PartitionOutput
+{
+    /// <summary>New ops in arrival order. <c>Final</c>: nothing more will join it (store it now).</summary>
+    public readonly List<(Operation Op, List<RuleHit>? Hits, bool Final)> Ops = [];
+    public List<StreamRecord>? Streams;
+    /// <summary>Ops that were waiting for context: joined (<c>Ctx</c> set) or not.</summary>
+    public List<(Operation Op, CmdRecord? Ctx)>? Finals;
+    public List<LateJoin>? LateJoins;
+    public List<JoinConflict>? Conflicts;
+
+    public bool IsEmpty => Ops.Count == 0 && Streams == null && Finals == null && LateJoins == null && Conflicts == null;
+    public void Final(Operation op, CmdRecord? ctx) => (Finals ??= []).Add((op, ctx));
+    public void Late(LateJoin j) => (LateJoins ??= []).Add(j);
+    public void Conflict(JoinConflict c) => (Conflicts ??= []).Add(c);
+}
+
 /// <summary>
 /// Stage 1 (03 §1): one worker per partition of <c>(proxyId, member, serverConnectionId)</c>, so per-connection
-/// order holds and per-connection state needs no locks. Here: dedup (02 §6.4), enrichment, BSON decode, shape
-/// normalization (the CPU-heavy part, hence parallel), and the per-connection rules. The M2 join slots in here.
+/// order holds and per-connection state needs no locks. Here: dedup (02 §6.4), the join (02 §6), enrichment,
+/// BSON decode, shape normalization (the CPU-heavy part, hence parallel), and the per-connection rules.
 /// </summary>
 internal sealed class Partition
 {
@@ -32,9 +49,14 @@ internal sealed class Partition
     private readonly ConnectionRegistry _conns;
     private readonly ProducerRegistry _producers;
     /// <summary>One hand-off per ingested batch, not per record: a per-item blocking queue cost a lock round trip per record.</summary>
-    private readonly Action<List<(Operation, List<RuleHit>?)>, List<StreamRecord>?> _toAnalysis;
+    private readonly Action<PartitionOutput> _toAnalysis;
     private readonly Action<Record> _release;
-    private readonly BlockingCollection<List<Record>> _queue = new(new ConcurrentQueue<List<Record>>());
+    private readonly Func<long> _nowUs;
+    private readonly Func<long, bool> _exportersActive;
+    private readonly JoinCounters _joinCounters;
+    private readonly JoinEngine _join;
+    /// <summary>A batch (<c>List&lt;Record&gt;</c>) or a barrier (<c>TaskCompletionSource</c>).</summary>
+    private readonly BlockingCollection<object> _queue = new(new ConcurrentQueue<object>());
     private readonly Dedup _dedup = new(1 << 18);
     private readonly Dictionary<(string, long), ConnState> _state = [];
     private readonly Queue<(string, long)> _stateOrder = new();
@@ -43,15 +65,22 @@ internal sealed class Partition
 
     public long Duplicates, DecodeFailures, Processed;
 
-    public Partition(CollectorOptions options, ConnectionRegistry conns, ProducerRegistry producers,
-        Action<List<(Operation, List<RuleHit>?)>, List<StreamRecord>?> toAnalysis, Action<Record> release)
+    public Partition(CollectorOptions options, ConnectionRegistry conns, ProducerRegistry producers, JoinCounters joinCounters,
+        Action<PartitionOutput> toAnalysis, Action<Record> release, Func<long> nowUs, Func<long, bool> exportersActive)
     {
         _options = options;
         _conns = conns;
         _producers = producers;
+        _joinCounters = joinCounters;
         _toAnalysis = toAnalysis;
         _release = release;
+        _nowUs = nowUs;
+        _exportersActive = exportersActive;
+        _join = new JoinEngine(joinCounters, producers, Math.Max(1, options.JoinMaxWaitingOps / options.Workers),
+            Math.Max(1, options.JoinMaxWaitingCmds / options.Workers), options.JoinFinalizedCapacity);
     }
+
+    internal JoinEngine Join => _join;
 
     public void Start(int index)
     {
@@ -62,51 +91,106 @@ internal sealed class Partition
     /// <summary>This partition's share of one ingested batch, in arrival order.</summary>
     public void Post(List<Record> batch) => _queue.Add(batch);
 
+    /// <summary>Completes once everything posted before it is processed and handed on, and expiry has run at the current clock.</summary>
+    public Task Barrier()
+    {
+        var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _queue.Add(tcs);
+        return tcs.Task;
+    }
+
     public void Complete() => _queue.CompleteAdding();
 
-    public void Join() => _thread?.Join();
+    public void JoinThread() => _thread?.Join();
 
     private void Loop()
     {
-        foreach (var batch in _queue.GetConsumingEnumerable())
+        while (!_queue.IsCompleted)
         {
-            var ops = new List<(Operation, List<RuleHit>?)>(batch.Count);
-            List<StreamRecord>? streams = null;
-            foreach (var r in batch)
+            // wake at least every 100 ms: waiting ops and cmds expire on the clock, not on traffic
+            _queue.TryTake(out var item, 100);
+            var output = new PartitionOutput();
+            var now = _nowUs();
+            // expiry first: whatever ran out by now is final before records arriving now are matched against it
+            _join.Expire(now, output);
+            if (item is List<Record> batch)
             {
-                var forwarded = false; // a forwarded record keeps its queue charge until the analysis stage is done with it
-                try
+                foreach (var r in batch)
                 {
-                    switch (r)
+                    var forwarded = false; // a forwarded record keeps its queue charge until the analysis stage is done with it
+                    try
                     {
-                        case OpRecord op:
-                            if (OnOp(op) is { } done) { ops.Add(done); forwarded = true; }
-                            break;
-                        case StreamRecord s:
-                            if (!_dedup.Seen(Dedup.Key(s.Src, "stream", s.Member, s.ServerConnectionId ?? -1, s.RequestId, s.Ts)))
-                            {
-                                (streams ??= []).Add(s);
-                                forwarded = true;
-                            }
-                            break;
+                        switch (r)
+                        {
+                            case OpRecord op:
+                                forwarded = OnOp(op, now, output);
+                                break;
+                            case CmdRecord c:
+                                OnCmd(c, now, output);
+                                break;
+                            case StreamRecord s:
+                                if (!_dedup.Seen(Dedup.Key(s.Src, "stream", s.Member, s.ServerConnectionId ?? -1, s.RequestId, s.Ts)))
+                                {
+                                    (output.Streams ??= []).Add(s);
+                                    forwarded = true;
+                                }
+                                break;
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        Console.Error.WriteLine($"partition: {e.GetType().Name}: {e.Message}");
+                    }
+                    finally
+                    {
+                        if (!forwarded) _release(r);
                     }
                 }
-                catch (Exception e)
-                {
-                    Console.Error.WriteLine($"partition: {e.GetType().Name}: {e.Message}");
-                }
-                finally
-                {
-                    if (!forwarded) _release(r);
-                }
+                Interlocked.Add(ref Processed, batch.Count);
             }
-            Interlocked.Add(ref Processed, batch.Count);
             // ops first: a stream record never precedes its op in a proxy's output, so this keeps causality
-            if (ops.Count > 0 || streams != null) _toAnalysis(ops, streams);
+            if (!output.IsEmpty) _toAnalysis(output);
+            (item as TaskCompletionSource)?.TrySetResult();
         }
+        var last = new PartitionOutput();
+        _join.FlushAll(last);
+        if (!last.IsEmpty) _toAnalysis(last);
     }
 
-    private (Operation, List<RuleHit>?)? OnOp(OpRecord r)
+    private void OnCmd(CmdRecord c, long now, PartitionOutput output)
+    {
+        var key = c.Key!.Value; // keyless cmds are orphans at ingest and never routed here
+        if (_dedup.Seen(Dedup.Key(c.Src, "cmd", key.Member, key.ServerConnectionId, key.RequestId, c.Ts)))
+        {
+            Interlocked.Increment(ref _joinCounters.Duplicates);
+            return;
+        }
+        _join.OnCmd(c, key, now, output);
+    }
+
+    /// <summary>Returns whether the op went to the analysis stage (it then keeps its queue charge until analysed).</summary>
+    private bool OnOp(OpRecord r, long now, PartitionOutput output)
+    {
+        if (Enrich(r) is not { } enriched) return false;
+        var (op, hits) = enriched;
+        // 02 §6.2: wait for context while some exporter is reporting at all; with none, nothing can join in the
+        // wait, and a cmd that comes later still merges into the stored op. Exporters never report the
+        // handshake and monitoring hellos (02 §3.3).
+        long wait = 0;
+        var longWait = false;
+        if (_exportersActive(now) && !IsHello(r.Command))
+        {
+            longWait = _conns.Get(r.Src, r.ConnSeq)?.Exporter != null;
+            wait = longWait ? _options.JoinWaitExporterUs : _options.JoinWaitUs;
+        }
+        var final = _join.OnOp(op, now, wait, longWait, output);
+        output.Ops.Add((op, hits, final));
+        return true;
+    }
+
+    private static bool IsHello(string command) => command is "hello" or "isMaster" or "ismaster";
+
+    private (Operation, List<RuleHit>?)? Enrich(OpRecord r)
     {
         if (_dedup.Seen(Dedup.Key(r.Src, "op", r.Member, r.ServerConnectionId ?? -r.ConnSeq, r.RequestId, r.Ts)))
         {
@@ -134,7 +218,7 @@ internal sealed class Partition
         }
 
         var valuesPreserved = _producers.Get(r.Src)?.ValuesPreserved ?? true;
-        var shape = ShapeNormalizer.Normalize(r.Command, r.Db, r.Coll, IsRedacted(r.Command) ? null : cmd, r.CmdTruncated, valuesPreserved);
+        var shape = ShapeNormalizer.Normalize(r.Command, r.Db, r.Coll, cmd, r.CmdTruncated, valuesPreserved);
         op.ShapeHash = shape.ShapeHash;
         op.ValueHash = shape.ValueHash;
         op.ShapeJson = shape.ShapeJson;
@@ -144,8 +228,6 @@ internal sealed class Partition
 
         return (op, DataCommands.Contains(r.Command) ? ConnectionRules(op) : null);
     }
-
-    private static bool IsRedacted(string command) => command is "authenticate" or "saslStart" or "saslContinue" or "getnonce" or "createUser" or "updateUser" or "copydbgetnonce" or "copydbsaslstart" or "copydb";
 
     internal static bool AwaitsByDesign(string command, BsonDocument? cmd)
     {

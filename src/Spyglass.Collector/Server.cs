@@ -41,7 +41,7 @@ public sealed class Server : IAsyncDisposable
     {
         CollectorOptions.Validate(options);
         object store = options.Data == null ? new MemoryStore() : new SqliteStore(options.Data);
-        var collector = new Collector(options, (IOperationStore)store, (IAggregateStore)store, (IAlertStore)store);
+        var collector = new Collector(options, (IOperationStore)store, (IAggregateStore)store, (IAlertStore)store, callsites: (ICallsiteStore)store);
 
         var builder = WebApplication.CreateSlimBuilder();
         builder.Logging.ClearProviders();
@@ -88,7 +88,7 @@ public sealed class Server : IAsyncDisposable
         api.MapGet("/live", Live);
         api.MapPost("/export", Export);
         api.MapGet("/metrics", () => Results.Text(Collector.RenderMetrics(), "text/plain; version=0.0.4"));
-        api.MapGet("/uows", () => Results.Json(new { items = Array.Empty<object>(), note = "units of work need an exporter (M3)" }));
+        api.MapGet("/uows", () => Results.Json(new { items = Array.Empty<object>(), note = "units of work are M3 (03 §5.3); joined ops carry uowId and filter with /ops?uow=" }));
 
         if (uiRoot != null && File.Exists(Path.Combine(uiRoot, "index.html")))
         {
@@ -226,7 +226,7 @@ public sealed class Server : IAsyncDisposable
         var q = new OpQuery
         {
             From = L(req, "from"), To = L(req, "to"), App = S(req, "app"), Coll = S(req, "coll"), Command = S(req, "command"),
-            Shape = S(req, "shape"), Status = S(req, "status"), MinLatencyUs = L(req, "minLatencyUs"),
+            Shape = S(req, "shape"), Status = S(req, "status"), MinLatencyUs = L(req, "minLatencyUs"), Uow = S(req, "uow"),
             Limit = (int)Math.Clamp(L(req, "limit") ?? 100, 1, 1000), Cursor = S(req, "cursor"),
         };
         var ops = Collector.Ops.Query(q);
@@ -243,8 +243,9 @@ public sealed class Server : IAsyncDisposable
 
     private IResult Op(string id)
     {
-        var o = Collector.Ops.Get(id);
+        var o = Collector.Ops.Get(id) ?? Collector.Analysis.Waiting(id); // live but still waiting for context (02 §6.2)
         if (o == null) return Results.NotFound();
+        var callsite = o.Ctx?.Callsite is { } cs ? Collector.Callsites.Callsite(cs) : null;
         o.ShapeJson = Collector.Aggregates.Shape(o.ShapeHash)?.ShapeJson;
         var a = Collector.Analysis;
         var cursorId = o.Op.Command == "getMore" ? CursorIdOf(o) : o.Op.Reply?.CursorId;
@@ -256,7 +257,7 @@ public sealed class Server : IAsyncDisposable
         {
             w.WriteStartObject();
             w.WritePropertyName("op");
-            Json.OpDetail(w, o, cursor);
+            Json.OpDetail(w, o, cursor, callsite);
             w.WriteStartArray("alerts");
             foreach (var x in alerts) Json.Alert(w, x);
             w.WriteEndArray();
@@ -525,7 +526,20 @@ public sealed class Server : IAsyncDisposable
             w.WriteStartObject("dropped");
             foreach (var (k, v) in p.Dropped) w.WriteNumber(k, v);
             w.WriteEndObject();
-            w.WriteNumber("joinRate", 0); // M2
+            foreach (var (k, v) in new[] { ("runtime", p.Runtime), ("driver", p.Driver), ("host", p.Host), ("app", p.App), ("appVersion", p.AppVersion) })
+                if (v != null) w.WriteString(k, v);
+            if (p.Pid is { } pid) w.WriteNumber("pid", pid);
+            if (p.Kind != "proxy" && Volatile.Read(ref p.Cmds) > 0)
+            {
+                w.WriteStartObject("join");
+                w.WriteNumber("cmds", Volatile.Read(ref p.Cmds));
+                w.WriteNumber("joined", Volatile.Read(ref p.Joined));
+                w.WriteNumber("orphans", Volatile.Read(ref p.Orphans));
+                w.WriteNumber("conflicts", Volatile.Read(ref p.Conflicts));
+                if (p.JoinRate is { } jr) w.WriteNumber("rate", Math.Round(jr, 5));
+                if (p.SkewUs is { } sk) w.WriteNumber("skew_us", sk);
+                w.WriteEndObject();
+            }
             w.WriteEndObject();
         }
         w.WriteEndArray();
