@@ -152,6 +152,19 @@ public sealed class ProxyServer : IAsyncDisposable
         }
     }
 
+    /// <summary>Resets live client connections matching <paramref name="filter"/>; returns how many.</summary>
+    internal int ResetConnections(Func<ConnectionContext, bool>? filter = null)
+    {
+        var n = 0;
+        foreach (var c in _live.Values)
+        {
+            if (filter != null && !filter(c.Context)) continue;
+            c.Reset();
+            n++;
+        }
+        return n;
+    }
+
     /// <summary>The <c>$spyglass</c> discovery document for a listener (02 §2.2), encoded once.</summary>
     internal byte[] BuildSpyglassDocument(string advertised)
     {

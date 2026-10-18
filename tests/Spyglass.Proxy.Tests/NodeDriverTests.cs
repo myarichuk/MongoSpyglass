@@ -93,6 +93,11 @@ public sealed class NodeDriverTests(ObservationFixture f) : IClassFixture<Observ
         }
         Assert.Empty(misses);
 
+        // streaming hello (moreToCome) on the driver's monitoring connections: one op with stream=true, then
+        // `stream` records for each further reply (01 §7, 06 §2.5)
+        await ReplicaSetTests.WaitUntil(() => f.Proxy.RecordsOf("stream").Any(), TimeSpan.FromSeconds(10));
+        Assert.Contains(f.Proxy.RecordsOf("op"), o => o.GetProperty("stream").GetBoolean() && o.GetProperty("command").GetString() == "hello");
+
         // handshake marker (02 §2.4) where the driver has appendMetadata
         var conns = f.Proxy.RecordsOf("conn").Where(r => r.GetProperty("app").ValueKind == JsonValueKind.String && r.GetProperty("app").GetString() == app).ToList();
         Assert.NotEmpty(conns);

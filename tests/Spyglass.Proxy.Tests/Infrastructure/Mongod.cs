@@ -88,26 +88,33 @@ public sealed class MongodProcess : IAsyncDisposable
         DbPath = dbPath;
     }
 
-    public static MongodProcess Start(int port, string root, IEnumerable<string> extraArgs)
+    public static MongodProcess Start(int port, string root, IEnumerable<string> extraArgs) =>
+        Launch(MongodBinaries.Mongod, port, root, ["--wiredTigerCacheSizeGB", "0.25", .. extraArgs], dbPath: true);
+
+    public static MongodProcess StartMongos(int port, string root, string configDb) =>
+        Launch(Path.Combine(Path.GetDirectoryName(MongodBinaries.Mongod)!, "mongos"), port, root, ["--configdb", configDb], dbPath: false);
+
+    private static MongodProcess Launch(string binary, int port, string root, IEnumerable<string> extraArgs, bool dbPath)
     {
-        var dbPath = Path.Combine(root, $"db-{port}");
-        Directory.CreateDirectory(dbPath);
-        var psi = new ProcessStartInfo(MongodBinaries.Mongod)
+        var dir = Path.Combine(root, $"db-{port}");
+        Directory.CreateDirectory(dir);
+        var psi = new ProcessStartInfo(binary)
         {
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
         };
-        foreach (var a in new[] { "--port", port.ToString(), "--bind_ip", "127.0.0.1", "--dbpath", dbPath,
-                     "--logpath", Path.Combine(dbPath, "mongod.log"), "--setParameter", "diagnosticDataCollectionEnabled=false",
-                     "--wiredTigerCacheSizeGB", "0.25" }.Concat(extraArgs))
+        IEnumerable<string> args = ["--port", port.ToString(), "--bind_ip", "127.0.0.1", "--logpath", Path.Combine(dir, "mongod.log"),
+            "--setParameter", "diagnosticDataCollectionEnabled=false"];
+        if (dbPath) args = args.Concat(["--dbpath", dir]);
+        foreach (var a in args.Concat(extraArgs))
             psi.ArgumentList.Add(a);
         var p = Process.Start(psi) ?? throw new InvalidOperationException("mongod did not start");
         p.OutputDataReceived += (_, _) => { };
         p.ErrorDataReceived += (_, _) => { };
         p.BeginOutputReadLine();
         p.BeginErrorReadLine();
-        return new MongodProcess(p, port, dbPath);
+        return new MongodProcess(p, port, dir);
     }
 
     public async Task WaitListeningAsync(TimeSpan timeout)
@@ -239,6 +246,47 @@ public sealed class Deployment : IAsyncDisposable
         throw new TimeoutException("no primary elected");
     }
 
+    /// <summary>1-node config replica set, 1-node shard replica set, <paramref name="routers"/> mongos (06 §1).</summary>
+    public static async Task<Deployment> StartShardedAsync(int routers = 2)
+    {
+        MongodBinaries.SkipIfMissing();
+        var root = NewRoot();
+        var ports = Ports.FreeRange(2 + routers);
+        var cfg = MongodProcess.Start(ports, root, ["--configsvr", "--replSet", "cfg"]);
+        var shard = MongodProcess.Start(ports + 1, root, ["--shardsvr", "--replSet", "sh0"]);
+        await cfg.WaitListeningAsync(TimeSpan.FromSeconds(30));
+        await shard.WaitListeningAsync(TimeSpan.FromSeconds(30));
+        foreach (var (p, name) in new[] { (cfg, "cfg"), (shard, "sh0") })
+        {
+            var c = new MongoClient($"mongodb://localhost:{p.Port}/?directConnection=true");
+            var conf = new BsonDocument { ["_id"] = name, ["members"] = new BsonArray { new BsonDocument { ["_id"] = 0, ["host"] = $"localhost:{p.Port}" } } };
+            if (name == "cfg") conf["configsvr"] = true;
+            await c.GetDatabase("admin").RunCommandAsync<BsonDocument>(new BsonDocument("replSetInitiate", conf));
+            await WaitWritable(c);
+        }
+        var mongos = Enumerable.Range(0, routers).Select(i => MongodProcess.StartMongos(ports + 2 + i, root, $"cfg/localhost:{cfg.Port}")).ToList();
+        foreach (var m in mongos)
+            await m.WaitListeningAsync(TimeSpan.FromSeconds(60));
+        var router = new MongoClient($"mongodb://localhost:{mongos[0].Port}/");
+        await router.GetDatabase("admin").RunCommandAsync<BsonDocument>(new BsonDocument("addShard", $"sh0/localhost:{shard.Port}"));
+        return new Deployment { Kind = "sharded", Members = mongos, Root = root, Backing = [cfg, shard] };
+    }
+
+    private static async Task WaitWritable(MongoClient c)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(60);
+        while (DateTime.UtcNow < deadline)
+        {
+            var hello = await c.GetDatabase("admin").RunCommandAsync<BsonDocument>(new BsonDocument("hello", 1));
+            if (hello.GetValue("isWritablePrimary", false).ToBoolean()) return;
+            await Task.Delay(200);
+        }
+        throw new TimeoutException("replica set did not elect");
+    }
+
+    /// <summary>Processes behind <see cref="Members"/> (config and shard servers of a sharded deployment).</summary>
+    public IReadOnlyList<MongodProcess> Backing { get; init; } = [];
+
     private static IEnumerable<string> TlsArgs(TestCertificates? tls) => tls == null
         ? []
         : ["--tlsMode", "requireTLS", "--tlsCertificateKeyFile", tls.ServerPemFile, "--tlsCAFile", tls.CaFile, "--tlsAllowConnectionsWithoutCertificates"];
@@ -252,7 +300,7 @@ public sealed class Deployment : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        foreach (var m in Members)
+        foreach (var m in Members.Concat(Backing))
             await m.DisposeAsync();
         try { Directory.Delete(Root, recursive: true); }
         catch (IOException) { }

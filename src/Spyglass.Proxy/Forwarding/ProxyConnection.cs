@@ -24,6 +24,15 @@ internal sealed class ProxyConnection
 
     public ConnectionContext Context => _ctx;
 
+    private CancellationTokenSource? _cts;
+
+    /// <summary>Drops both sockets now, as a network reset would (test hook for 06 §2.1 resume/retry cases).</summary>
+    internal void Reset()
+    {
+        try { _cts?.Cancel(); }
+        catch (ObjectDisposedException) { }
+    }
+
     public async Task RunAsync(CancellationToken shutdown)
     {
         Stream? clientStream = null;
@@ -78,6 +87,7 @@ internal sealed class ProxyConnection
             observer.Opened(_ctx);
 
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(shutdown);
+            _cts = cts;
             var config = _server.Config;
             var c2s = new Pump(clientStream, upStream, isRequest: true, _ctx, observer.CreateTap(_ctx, true), config,
                 _member.BytesFromClient, _member.FramesFromClient, _member.AddedLatency);
