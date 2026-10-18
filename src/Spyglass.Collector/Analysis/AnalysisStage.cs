@@ -16,6 +16,8 @@ internal sealed class AnalysisStage
     private abstract record Item;
     private sealed record OpItem(Operation Op, List<RuleHit>? Hits) : Item;
     private sealed record StreamItem(StreamRecord Record) : Item;
+    /// <summary>Work from another thread (the API) that must run where the state lives.</summary>
+    private sealed record CommandItem(Action Run) : Item;
 
     /// <summary>Releases an item's ingest-queue charge (03 §1): held from ingest until this stage is done with it.</summary>
     private readonly Action<Record> _release;
@@ -73,6 +75,18 @@ internal sealed class AnalysisStage
 
     public void Post(Operation op, List<RuleHit>? hits) => _queue.Add(new OpItem(op, hits));
     public void Post(StreamRecord s) => _queue.Add(new StreamItem(s));
+
+    /// <summary>Runs <paramref name="f"/> on the analysis thread (the state is single-threaded) and returns its result.</summary>
+    public Task<T> Invoke<T>(Func<T> f)
+    {
+        var tcs = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _queue.Add(new CommandItem(() =>
+        {
+            try { tcs.SetResult(f()); }
+            catch (Exception e) { tcs.SetException(e); }
+        }));
+        return tcs.Task;
+    }
     public void Complete() => _queue.CompleteAdding();
     public void Join() => _thread?.Join();
 
@@ -90,7 +104,11 @@ internal sealed class AnalysisStage
             {
                 try { Handle(item); }
                 catch (Exception e) { Console.Error.WriteLine($"analysis: {e.GetType().Name}: {e.Message}"); }
-                finally { _release(item is OpItem oi ? oi.Op.Op : ((StreamItem)item).Record); }
+                finally
+                {
+                    if (item is OpItem oi) _release(oi.Op.Op);
+                    else if (item is StreamItem si) _release(si.Record);
+                }
                 Interlocked.Increment(ref Processed);
             }
             var now = Environment.TickCount64;
@@ -115,6 +133,7 @@ internal sealed class AnalysisStage
         {
             case OpItem(var op, var hits): OnOp(op, hits); break;
             case StreamItem(var s): OnStream(s); break;
+            case CommandItem(var run): run(); Flush(); break;
         }
     }
 

@@ -281,7 +281,7 @@ public class PipelineTests : IAsyncLifetime
         Assert.True(reopened.Open);
         Assert.Equal(2, reopened.Occurrences);
 
-        Assert.True(_c.Analysis.Alerts.SetMuted(reopened.Id, true)); // (single-threaded book: tests poke it between batches)
+        Assert.True(await _c.Analysis.Invoke(() => _c.Analysis.Alerts.SetMuted(reopened.Id, true))); // the book is single-threaded
         await Send(Op(3, "find", latencyUs: 200_000, ts: _now));
         Assert.Equal(2, Assert.Single(Alerts("slow-shape")).Occurrences);
     }
