@@ -78,8 +78,8 @@ The exporter never reads `event.command`. From `commandSucceeded.reply` it reads
 
 | Key part | Source |
 |---|---|
-| `member` | `event.address` normalized per 02 §3.2 |
-| `proxyId` | latest `$spyglass.proxyId` from a heartbeat reply whose address normalizes to the same `member`; else `null` |
+| `member` | the `$spyglass.member` of the listener, found **by port**: `event.address` is the socket's resolved `IP:port`, not the dialled host (02 §3.2). Ambiguous ports are resolved with `dns.lookup` of the heartbeat hosts. |
+| `proxyId` | latest `$spyglass.proxyId` from the heartbeat reply of that listener; else `null` |
 | `serverConnectionId` | `event.serverConnectionId` (`bigint \| null`), converted with `Number()`. If the value exceeds `Number.MAX_SAFE_INTEGER`, emit it as a string (not expected in practice). |
 | `requestId` | `event.requestId`. The driver takes it from the module-level counter it also writes into the wire header (`lib/cmap/commands.js`). |
 

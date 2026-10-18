@@ -63,8 +63,9 @@ internal sealed class MetricsServer : IAsyncDisposable
                 if (buf.AsSpan(0, n).IndexOf("\r\n\r\n"u8) >= 0) break;
             }
             var requestLine = Encoding.ASCII.GetString(buf, 0, n).Split("\r\n")[0].Split(' ');
+            // Rendering is synchronous work: keep it off the socket (possibly epoll) thread.
             var (status, contentType, body) = requestLine is [var method, var target, ..]
-                ? Handle(method, target.Split('?')[0])
+                ? await Task.Run(() => Handle(method, target.Split('?')[0])).ConfigureAwait(false)
                 : (400, "text/plain", "bad request\n");
 
             var payload = Encoding.UTF8.GetBytes(body);
@@ -84,6 +85,7 @@ internal sealed class MetricsServer : IAsyncDisposable
         switch (path)
         {
             case "/metrics":
+                _proxy.Metrics.UpdateProcess();
                 return (200, "text/plain; version=0.0.4; charset=utf-8", _proxy.Metrics.Registry.Render());
             case "/healthz":
                 return (200, "text/plain", "ok\n");

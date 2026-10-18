@@ -1,6 +1,5 @@
 using System.Collections.Concurrent;
 using Spyglass.Proxy.Forwarding;
-using Spyglass.Proxy.Metrics;
 using Spyglass.Proxy.Wire;
 
 namespace Spyglass.Proxy.Observation;
@@ -55,15 +54,15 @@ internal sealed class CapturePool
     private readonly int _requestBytes, _replyBytes;
     private readonly long _bound;
     private long _charged;
-    private readonly Gauge _gauge;
 
-    public CapturePool(int requestBytes, int replyBytes, long bound, Gauge gauge)
+    public CapturePool(int requestBytes, int replyBytes, long bound)
     {
         _requestBytes = requestBytes;
         _replyBytes = replyBytes;
         _bound = bound;
-        _gauge = gauge;
     }
+
+    public bool Disabled => _bound == 0;
 
     public long ChargedBytes => Volatile.Read(ref _charged);
 
@@ -75,7 +74,6 @@ internal sealed class CapturePool
             Interlocked.Add(ref _charged, -charge);
             return null;
         }
-        _gauge.Add(charge);
         var q = isRequest ? _requests : _replies;
         return q.TryDequeue(out var slot) ? slot : new FrameCapture(isRequest ? _requestBytes : _replyBytes, isRequest);
     }
@@ -84,7 +82,6 @@ internal sealed class CapturePool
     {
         slot.Conn = null!;
         Interlocked.Add(ref _charged, -slot.Charge);
-        _gauge.Add(-slot.Charge);
         (slot.IsRequest ? _requests : _replies).Enqueue(slot);
     }
 }

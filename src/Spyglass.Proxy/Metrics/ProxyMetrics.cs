@@ -19,6 +19,7 @@ public sealed class ProxyMetrics
     public readonly CounterFamily RewritesSkipped;
     public readonly CounterFamily UncorrelatedReplies;
     public readonly HistogramFamily AddedLatency;
+    private readonly Gauge _allocated, _rss, _cpuMicros, _gcCount;
 
     public ProxyMetrics()
     {
@@ -35,5 +36,23 @@ public sealed class ProxyMetrics
         AddedLatency = Registry.Histogram("spyglass_proxy_forward_added_latency_seconds",
             "Proxy residency of a read chunk that completed at least one frame: read completion to write completion.",
             AddedLatencyBuckets);
+        _allocated = Registry.Gauge("spyglass_proxy_process_allocated_bytes", "Managed bytes allocated since process start (GC.GetTotalAllocatedBytes).").WithLabels();
+        _rss = Registry.Gauge("spyglass_proxy_process_resident_bytes", "Process working set.").WithLabels();
+        _cpuMicros = Registry.Gauge("spyglass_proxy_process_cpu_microseconds", "Process CPU time (user + system) in microseconds.").WithLabels();
+        _gcCount = Registry.Gauge("spyglass_proxy_process_gc_collections", "Gen0 garbage collections since start.").WithLabels();
+    }
+
+    /// <summary>Gauges computed on demand rather than maintained on hot paths.</summary>
+    public event Action? BeforeScrape;
+
+    /// <summary>Refreshes the process gauges; called at scrape time.</summary>
+    public void UpdateProcess()
+    {
+        BeforeScrape?.Invoke();
+        _allocated.Set(GC.GetTotalAllocatedBytes(precise: true));
+        using var p = System.Diagnostics.Process.GetCurrentProcess();
+        _rss.Set(p.WorkingSet64);
+        _cpuMicros.Set((long)p.TotalProcessorTime.TotalMicroseconds);
+        _gcCount.Set(GC.CollectionCount(0));
     }
 }

@@ -21,13 +21,12 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
     private readonly ProxyConfig _config;
     private readonly CapturePool _pool;
     private readonly Worker[] _workers;
-    private readonly Redactor _redactor;
     private readonly CursorRegistry _cursors;
     private readonly CollectorSender? _sender;
     private readonly string _src;
 
     internal readonly CommandMetrics Commands;
-    private readonly Counter _noSlot, _pendingEvicted, _exportDropped, _tapFault, _observerFault;
+    private readonly Counter _noSlot, _pendingEvicted, _exportDropped, _tapFault, _observerFault, _uncorrelated;
 
     /// <summary>Test hook: every record line, after serialization (headless mode included).</summary>
     internal Action<byte[]>? RecordTap { get; set; }
@@ -43,11 +42,12 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
         _exportDropped = m.ObservationDropped.WithLabels("export_dropped");
         _tapFault = m.ObservationDropped.WithLabels("tap_fault");
         _observerFault = m.ObservationDropped.WithLabels("observer_fault");
+        _uncorrelated = m.UncorrelatedReplies.WithLabels();
         m.ObservationDropped.WithLabels("queue_full"); // pre-create: the pool bound covers the queue (01 §4)
 
-        _pool = new CapturePool(_config.Capture.CommandBytes, _config.Capture.ReplyBytes, _config.Limits.ObserveQueueBytes,
-            m.ObserveQueueBytes.WithLabels());
-        _redactor = new Redactor(_config.Capture);
+        _pool = new CapturePool(_config.Capture.CommandBytes, _config.Capture.ReplyBytes, _config.Limits.ObserveQueueBytes);
+        var queueGauge = m.ObserveQueueBytes.WithLabels();
+        m.BeforeScrape += () => queueGauge.Set(_pool.ChargedBytes);
         Commands = new CommandMetrics(m.Registry, _config.Metrics.MaxSeries);
         _cursors = new CursorRegistry(Commands);
 
@@ -78,7 +78,9 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
     // ---- IConnectionObserver ---------------------------------------------------------------
 
     public IFrameTap CreateTap(ConnectionContext conn, bool isRequest) =>
-        new CaptureTap(conn, isRequest, _pool, this, _noSlot, _tapFault);
+        _pool.Disabled // limits.observeQueueBytes=0: forwarding only, no per-frame work at all
+            ? NullTap.Instance
+            : new CaptureTap(conn, isRequest, _pool, this, _noSlot, _tapFault);
 
     public void Opened(ConnectionContext conn) => WorkerFor(conn).Post(new ObserverItem(null, conn, ObserverEvent.Opened));
 
@@ -159,7 +161,6 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
     {
         public readonly ConnectionContext Ctx = ctx;
         public readonly Dictionary<int, RequestInfo> Pending = new();
-        public readonly Queue<int> PendingOrder = new();
         /// <summary>moreToCome streams: next expected responseTo → stream state.</summary>
         public readonly Dictionary<int, StreamState> Streams = new();
         public ClientMetadata? Client;
@@ -179,9 +180,46 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
         private readonly Channel<ObserverItem> _channel = Channel.CreateUnbounded<ObserverItem>(new UnboundedChannelOptions { SingleReader = true });
         private readonly Dictionary<long, ObservedConnection> _conns = new();
         private readonly RecordWriter _rw = new();
+        // Per worker: a Regex shared between threads re-creates its runner (and its backtracking stacks)
+        // whenever two matches overlap; a private instance reuses one runner forever.
+        private readonly Redactor _redactor;
+        // Metric children resolved once per label set; the families' params-array/string.Join lookup is not
+        // something to pay per op.
+        private readonly Dictionary<(string, string, string?, string, string), Histogram> _duration = new();
+        private readonly Dictionary<(string, string, string?, string), (Histogram Bytes, Histogram Docs)> _sizes = new();
+        private readonly Dictionary<(string, string, string?, string, string), Counter> _errors = new();
         private Task _loop = Task.CompletedTask;
 
-        public Worker(Observer o) => _o = o;
+        public Worker(Observer o)
+        {
+            _o = o;
+            _redactor = new Redactor(o._config.Capture);
+        }
+
+        private Histogram Duration(string cmd, string db, string? coll, string app, string status)
+        {
+            if (_duration.TryGetValue((cmd, db, coll, app, status), out var h)) return h;
+            var cm = _o.Commands;
+            h = cm.Duration.WithLabels(cmd, db, cm.Collection(cm.Duration, cmd, db, coll, app, status), app, status);
+            return _duration[(cmd, db, coll, app, status)] = h;
+        }
+
+        private (Histogram Bytes, Histogram Docs) Sizes(string cmd, string db, string? coll, string app)
+        {
+            if (_sizes.TryGetValue((cmd, db, coll, app), out var s)) return s;
+            var cm = _o.Commands;
+            s = (cm.ReplyBytes.WithLabels(cmd, db, cm.Collection(cm.ReplyBytes, cmd, db, coll, app), app),
+                 cm.ReturnedDocuments.WithLabels(cmd, db, cm.Collection(cm.ReturnedDocuments, cmd, db, coll, app), app));
+            return _sizes[(cmd, db, coll, app)] = s;
+        }
+
+        private Counter Error(string cmd, string db, string? coll, string app, string codeName)
+        {
+            if (_errors.TryGetValue((cmd, db, coll, app, codeName), out var c)) return c;
+            var cm = _o.Commands;
+            c = cm.Errors.WithLabels(cmd, db, cm.Collection(cm.Errors, cmd, db, coll, app, codeName), app, codeName);
+            return _errors[(cmd, db, coll, app, codeName)] = c;
+        }
 
         public Task Completion => _loop;
 
@@ -241,7 +279,7 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
 
         private void OnRequest(ObservedConnection conn, FrameCapture f)
         {
-            var req = RequestParser.Parse(f, _o._redactor, _o._config.Compression);
+            var req = RequestParser.Parse(f, _o.BuildsRecords ? _redactor : null, _o._config.Compression);
             if (req.IsHello && req.Client != null && conn.Client == null)
                 conn.Client = req.Client;
 
@@ -253,24 +291,15 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
                 return;
             }
 
-            if (conn.Pending.Count >= _o._config.Limits.MaxPendingPerConnection)
+            if (conn.Pending.Count >= _o._config.Limits.MaxPendingPerConnection && !conn.Pending.ContainsKey(req.RequestId))
             {
-                while (conn.PendingOrder.TryDequeue(out var oldest))
-                    if (conn.Pending.Remove(oldest))
-                        break;
+                // Only reachable when a client pipelines past the bound (drivers don't): O(n) scan is fine here
+                // and keeps the common path free of any ordering structure.
+                var oldest = conn.Pending.MinBy(kv => kv.Value.TFirst).Key;
+                conn.Pending.Remove(oldest);
                 _o._pendingEvicted.Inc();
             }
             conn.Pending[req.RequestId] = req;
-            conn.PendingOrder.Enqueue(req.RequestId);
-            if (conn.PendingOrder.Count > conn.Pending.Count * 2 + 16)
-                CompactOrder(conn);
-        }
-
-        private static void CompactOrder(ObservedConnection conn)
-        {
-            var keep = conn.PendingOrder.Where(conn.Pending.ContainsKey).ToArray();
-            conn.PendingOrder.Clear();
-            foreach (var k in keep) conn.PendingOrder.Enqueue(k);
         }
 
         private void OnReply(ObservedConnection conn, FrameCapture f)
@@ -288,7 +317,7 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
 
             if (!conn.Pending.Remove(f.ResponseTo, out var req))
             {
-                _o._server.Metrics.UncorrelatedReplies.WithLabels().Inc();
+                _o._uncorrelated.Inc();
                 return;
             }
 
@@ -316,8 +345,8 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
             j.WriteString("closeReason", reason.Wire());
             if (detail != null && reason == CloseReason.InvalidFrame)
                 j.WriteString("invalidHeader", detail);
-            j.WriteNumber("bytesIn", Interlocked.Read(ref ctx.BytesFromClient));
-            j.WriteNumber("bytesOut", Interlocked.Read(ref ctx.BytesFromServer));
+            j.WriteNumber("bytesIn", Volatile.Read(ref ctx.BytesFromClient));
+            j.WriteNumber("bytesOut", Volatile.Read(ref ctx.BytesFromServer));
             _o.Emit(_rw.End());
         }
 
@@ -356,21 +385,20 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
             var db = req.Db ?? "";
             var app = conn.App;
             var member = conn.Ctx.Member.Advertised;
-            var cm = _o.Commands;
 
             // ---- metrics (always, headless included) ----
             if (reply != null)
             {
                 var seconds = Clock.Micros(req.TLast, reply.TFirst) / 1e6;
-                cm.Duration.WithLabels(req.Command, db, cm.Collection(cm.Duration, req.Command, db, req.Coll, app, status), app, status).Observe(Math.Max(0, seconds));
-                var coll = cm.Collection(cm.ReplyBytes, req.Command, db, req.Coll, app);
-                cm.ReplyBytes.WithLabels(req.Command, db, coll, app).Observe(reply.FrameLength);
+                Duration(req.Command, db, req.Coll, app, status).Observe(Math.Max(0, seconds));
+                var sizes = Sizes(req.Command, db, req.Coll, app);
+                sizes.Bytes.Observe(reply.FrameLength);
                 if (facts!.NReturned is { } nr)
-                    cm.ReturnedDocuments.WithLabels(req.Command, db, cm.Collection(cm.ReturnedDocuments, req.Command, db, req.Coll, app), app).Observe(nr);
+                    sizes.Docs.Observe(nr);
                 if (status == "error")
                 {
                     var codeName = facts.CodeNameLength >= 0 ? Encoding.UTF8.GetString(facts.CodeName, 0, facts.CodeNameLength) : facts.Code?.ToString() ?? "";
-                    cm.Errors.WithLabels(req.Command, db, cm.Collection(cm.Errors, req.Command, db, req.Coll, app, codeName), app, codeName).Inc();
+                    Error(req.Command, db, req.Coll, app, codeName).Inc();
                 }
                 TrackCursors(member, req, facts);
             }
@@ -435,9 +463,8 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
         {
             var member = conn.Ctx.Member.Advertised;
             var req = s.Request;
-            var cm = _o.Commands;
             var app = conn.App;
-            cm.ReplyBytes.WithLabels(req.Command, req.Db ?? "", cm.Collection(cm.ReplyBytes, req.Command, req.Db ?? "", req.Coll, app), app).Observe(f.FrameLength);
+            Sizes(req.Command, req.Db ?? "", req.Coll, app).Bytes.Observe(f.FrameLength);
             TrackCursors(member, req, f.Facts);
 
             if (!_o.BuildsRecords) return;

@@ -2,6 +2,13 @@ using Spyglass.Proxy;
 using Spyglass.Proxy.Config;
 using Spyglass.Proxy.Diagnostics;
 
+// Run socket continuations on the epoll threads instead of hopping to the thread pool. Measured on the
+// mongod A/B bench (tools/ProxyBench): added p50 latency 70–104 µs → 16–22 µs, proxy CPU/op −30%.
+// Safe because nothing on the forwarding path blocks (01 §3, I1). Must be set before the first socket
+// is created; an explicit value in the environment wins.
+if (Environment.GetEnvironmentVariable("DOTNET_SYSTEM_NET_SOCKETS_INLINE_COMPLETIONS") == null)
+    Environment.SetEnvironmentVariable("DOTNET_SYSTEM_NET_SOCKETS_INLINE_COMPLETIONS", "1");
+
 if (args is ["--help"] or ["-h"])
 {
     Console.WriteLine("""

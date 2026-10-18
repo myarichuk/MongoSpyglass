@@ -50,7 +50,7 @@ internal static class RequestParser
     /// <summary>compression=observe never inflates more than this per frame (I4).</summary>
     private const int MaxObservedInflate = 16 * 1024 * 1024;
 
-    public static RequestInfo Parse(FrameCapture c, Redactor redactor, CompressionMode compression)
+    public static RequestInfo Parse(FrameCapture c, Redactor? redactor, CompressionMode compression)
     {
         var info = new RequestInfo
         {
@@ -145,6 +145,14 @@ internal static class RequestParser
         }
 
         ExtractCommandFields(doc, info);
+        if (inflated == null)
+        {
+            // Fields at the end of a body longer than the capture come from the streaming scanner.
+            var fields = c.Sequences.Fields;
+            if (info.Db == null && fields.DbLength >= 0) info.Db = Encoding.UTF8.GetString(fields.Db, 0, fields.DbLength);
+            info.TxnNumber ??= fields.TxnNumber;
+            if (info.Lsid == null && fields.LsidIdLength > 0) info.Lsid = HashLsidBytes(fields.LsidId.AsSpan(0, fields.LsidIdLength));
+        }
         info.Db ??= dbFromNs;
 
         if (info.IsHello)
@@ -158,6 +166,9 @@ internal static class RequestParser
                 info.SeqDocs.Add((Encoding.UTF8.GetString(c.Sequences.Identifiers[i], 0, c.Sequences.IdentifierLengths[i]), c.Sequences.DocCounts[i]));
         }
 
+        info.IsRedactedCommand = Redactor.RedactedCommands.Contains(info.Command);
+        if (redactor == null) // headless: the exported body is never built (01 §11)
+            return info;
         var firstSeqDocs = sequencesStart > 0 ? FirstSequenceDocuments(body[sequencesStart..]) : null;
         (info.RedactedCommand, info.CommandTruncated, info.IsRedactedCommand) =
             redactor.Redact(info.Command, doc, firstSeqDocs, isHello: info.IsHello, captureTruncated: truncated);
@@ -199,11 +210,16 @@ internal static class RequestParser
         foreach (var e in Bson.Elements(lsidDoc))
         {
             if (!e.NameIs("id"u8) || e.Type != BsonType.Binary || e.Value.Length < 5) continue;
-            Span<byte> hash = stackalloc byte[32];
-            SHA256.HashData(e.Value[5..], hash);
-            return Convert.ToHexStringLower(hash[..8]);
+            return HashLsidBytes(e.Value[5..]);
         }
         return null;
+    }
+
+    public static string HashLsidBytes(ReadOnlySpan<byte> uuid)
+    {
+        Span<byte> hash = stackalloc byte[32];
+        SHA256.HashData(uuid, hash);
+        return Convert.ToHexStringLower(hash[..8]);
     }
 
     private static ClientMetadata? ParseClient(ReadOnlySpan<byte> doc)

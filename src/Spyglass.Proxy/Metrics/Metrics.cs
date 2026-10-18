@@ -146,6 +146,36 @@ public sealed class Histogram
         _counts = new long[bounds.Length + 1];
     }
 
+    public int BucketCount => _counts.Length;
+
+    public int BucketIndex(double v)
+    {
+        var i = Array.BinarySearch(_bounds, v);
+        return i < 0 ? ~i : i;
+    }
+
+    /// <summary>Merges locally accumulated samples (hot paths count per bucket without interlocked ops, then flush).</summary>
+    public void Merge(long[] counts, double sum)
+    {
+        for (var i = 0; i < counts.Length; i++)
+        {
+            if (counts[i] == 0) continue;
+            Interlocked.Add(ref _counts[i], counts[i]);
+            counts[i] = 0;
+        }
+        AddSum(sum);
+    }
+
+    private void AddSum(double v)
+    {
+        long seen, next;
+        do
+        {
+            seen = Volatile.Read(ref _sumBits);
+            next = BitConverter.DoubleToInt64Bits(BitConverter.Int64BitsToDouble(seen) + v);
+        } while (Interlocked.CompareExchange(ref _sumBits, next, seen) != seen);
+    }
+
     public void Observe(double v)
     {
         var i = Array.BinarySearch(_bounds, v);

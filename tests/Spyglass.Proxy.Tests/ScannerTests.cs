@@ -229,4 +229,33 @@ public sealed class ScannerTests
             Assert.Equal("deletes", Encoding.UTF8.GetString(s.Identifiers[1], 0, s.IdentifierLengths[1]));
         }
     }
+
+    [Fact]
+    public void Body_fields_after_a_large_inline_array_survive_any_split()
+    {
+        // Node 6.x shape: documents inline, $db/lsid/txnNumber at the end, far beyond commandBytes
+        var lsid = Guid.NewGuid();
+        var doc = new BsonDocument
+        {
+            ["insert"] = "c",
+            ["documents"] = new BsonArray(Enumerable.Range(0, 300).Select(i => new BsonDocument { ["i"] = i, ["re"] = new BsonRegularExpression("x"), ["s"] = new string('s', 60) })),
+            ["ordered"] = true,
+            ["lsid"] = new BsonDocument("id", new BsonBinaryData(lsid, GuidRepresentation.Standard)),
+            ["txnNumber"] = 42L,
+            ["$db"] = "nodeconf",
+        }.ToBson();
+        var body = new byte[4 + 1 + doc.Length];
+        doc.CopyTo(body, 5);
+        foreach (var cut in new[] { 1, 5, 9, 100, doc.Length / 2, body.Length - 3, body.Length - 1 })
+        {
+            var s = new SequenceScanner();
+            s.Begin(OpCodes.Msg, body.Length);
+            s.Feed(body.AsSpan(0, cut));
+            s.Feed(body.AsSpan(cut));
+            Assert.Equal("nodeconf", Encoding.UTF8.GetString(s.Fields.Db, 0, s.Fields.DbLength));
+            Assert.Equal(42L, s.Fields.TxnNumber);
+            Assert.Equal(lsid.ToByteArray(bigEndian: true), s.Fields.LsidId.AsSpan(0, s.Fields.LsidIdLength).ToArray());
+            Assert.Equal(0, s.SectionCount);
+        }
+    }
 }

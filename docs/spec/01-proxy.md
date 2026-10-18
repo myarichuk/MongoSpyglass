@@ -350,7 +350,8 @@ Replies to these are reduced to `ok`/`code`/`codeName` only.
 * `speculativeAuthenticate` in any hello-family request or reply: value replaced by
   `"$redacted"`.
 * Any field, at any depth, whose name matches `capture.redactFieldPattern`: value replaced
-  by `"$redacted"`.
+  by `"$redacted"`. Dotted paths (`{"profile.password": …}` in a filter or `$set`) match if any
+  segment matches.
 * `lsid.id` is replaced by a 16-hex-char SHA-256 prefix of its bytes. That keeps grouping by
   session without exporting the UUID.
 
@@ -391,6 +392,11 @@ The scanner descends only into `cursor` and the write-reply arrays. It skips eve
 else by length prefix. Complexity is O(number of top-level elements + batch length) pointer
 hops, with zero allocation. It MUST handle element and length boundaries split across chunks.
 Its state fits in ≤ 128 bytes per frame.
+
+The request side has the same kind of scanner for two things a truncated capture would lose:
+the document count of every kind-1 sequence (§9.4), and the fields drivers put at the *end* of
+the command body (`$db`, `lsid.id`, `txnNumber`). Node 6.x, for example, sends
+`insert.documents` inline, so a 250-document insert pushes `$db` past a 16 KiB capture.
 
 ## 11. Export to the collector
 
@@ -453,6 +459,11 @@ spyglass_cursors_open{database,collection}                                  gaug
 | Proxy OOM risk | Can't happen by construction: all buffers are bounded by config. Total = `observeQueueBytes + bufferBytes + listeners × connections × 2 × 64 KiB` read buffers. Log the computed worst case at startup. |
 
 ## 14. Performance budget (enforced by 06 §4)
+
+The proxy enables `DOTNET_SYSTEM_NET_SOCKETS_INLINE_COMPLETIONS=1` unless the environment sets it:
+socket continuations run on the epoll threads, with no thread-pool hop per read and write. That
+is safe only because nothing on the forwarding path blocks (I1); measured effect on the mongod
+bench: added p50 latency 70–104 µs → 16–46 µs, proxy CPU per op −30–45%.
 
 Loopback, 4 vCPU, the Mongo.Fakes reference backend at its fast-path configuration, and a
 real `mongod` in CI:

@@ -106,7 +106,7 @@ joinKey = (proxyId, member, serverConnectionId, requestId)
 | Field | Proxy knows it from | Exporter knows it from |
 |---|---|---|
 | `proxyId` | itself | `$spyglass.proxyId` seen in the heartbeat reply for the server at `member` |
-| `member` | listener's advertised address | the server address of the event: .NET `ConnectionId.ServerId.EndPoint`; Node `event.address` |
+| `member` | listener's advertised address | the `$spyglass.member` of the listener the command went to, mapped from the event's server address per §3.2 |
 | `serverConnectionId` | `connectionId` in the hello reply on that upstream connection | .NET `ConnectionId.LongServerValue`; Node `event.serverConnectionId` (bigint, driver ≥ 6.4.0) |
 | `requestId` | wire header of the request frame | .NET `CommandStartedEvent.RequestId`; Node `event.requestId` (the same value the driver writes into the wire header) |
 
@@ -133,11 +133,32 @@ Both sides MUST normalize `member` identically:
 
 Example: `LocalHost:27017` → `localhost:27017`; `::1` port 27018 → `[::1]:27018`.
 
-The exporter MUST use the address the driver dialled (the advertised one), not a resolved
-IP. The .NET `DnsEndPoint` and Node `address` strings already carry the hostname from the
-connection string or rewritten `hosts`.
+Exporters do not send their own spelling of the address: they send the proxy's, the `member`
+of the `$spyglass` document seen in the heartbeat for that server. The proxy and the collector
+therefore compare strings the proxy produced. Mapping a command event to its server:
+
+* **.NET:** `CommandStartedEvent.ConnectionId.ServerId` is the dialled endpoint (a `DnsEndPoint`
+  carrying the host from the connection string or rewritten `hosts`) and is the same `ServerId`
+  as the heartbeat's. Direct lookup.
+* **Node:** `commandStarted.address` is **not** the dialled address. It is the socket's resolved
+  remote `IP:port` (`streamIdentifier()` in `lib/cmap/connection.js`; verified in 6.4.0, 6.21.0
+  and 7.7.0, where a client dialling `localhost:P` reports `127.0.0.1:P`). Heartbeat and CMAP
+  events do carry the dialled host. The exporter maps by port: one proxy's listeners have
+  distinct ports, so the port selects the listener whenever the client talks to a single proxy
+  host. If two known listeners share the port (two proxies on different hosts), the exporter
+  resolves both hostnames (`dns.lookup`, all addresses, cached per heartbeat) and matches the IP;
+  if that is still ambiguous it sends `proxyId: null` (§3.3).
+
+Verified end-to-end by the conformance suite (06 §2): with these rules every non-handshake
+command event of the .NET driver 3.12 and the Node driver 6.4.0 / 6.21.0 / 7.7.0 matched exactly
+one proxy `op` record on a 3-member replica set.
 
 ### 3.3 When an exporter can't build the key
+
+* Handshake commands: the .NET driver raises `CommandStartedEvent` for the connection handshake
+  (`isMaster`/`hello`) before the server has assigned the connection id, so
+  `ConnectionId.LongServerValue` is null on them (verified, driver 3.12). Exporters skip
+  handshake commands; the proxy's `conn` record covers them.
 
 * No `$spyglass` seen for that address (for example, explicit config without a proxy, or a
   direct connection that bypasses the proxy): send `proxyId: null`. The collector stores the

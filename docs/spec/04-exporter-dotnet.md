@@ -69,12 +69,15 @@ UoW-associated reply opens a cursor.
 
 | Key part | Source |
 |---|---|
-| `member` | `ConnectionId.ServerId.EndPoint`. For `DnsEndPoint`: `Host` lower-cased + `Port`. For `IPEndPoint`: normalized per 02 §3.2. |
+| `member` | the `$spyglass.member` from the heartbeat of the same `ConnectionId.ServerId` (02 §3.2) |
 | `proxyId` | the latest `$spyglass.proxyId` seen in a heartbeat reply for that `ServerId`. `null` if none. |
 | `serverConnectionId` | `ConnectionId.LongServerValue` (null → `null`) |
 | `requestId` | `CommandStartedEvent.RequestId` |
 
 `operationId` (`long?`) is emitted as a decimal string.
+
+Commands with `ConnectionId.LongServerValue == null` are the connection handshake (the driver
+raises events for it before the server assigns an id; verified on 3.12). They are skipped.
 
 ## 5. Pool wait
 

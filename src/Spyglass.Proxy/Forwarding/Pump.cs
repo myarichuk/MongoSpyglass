@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using System.Net.Sockets;
 using Spyglass.Proxy.Config;
 using Spyglass.Proxy.Diagnostics;
@@ -45,6 +46,13 @@ internal sealed class Pump
     private readonly Histogram _addedLatency;
     private readonly byte[] _buf;
 
+    // Hot-path statistics are pump-local and flushed to the shared (per-listener) metrics at most every
+    // 250 ms and at exit: no interlocked operation, and no shared cache line, per read.
+    private static readonly long FlushTicks = Stopwatch.Frequency / 4;
+    private long _unflushedBytes, _unflushedFrames, _lastFlush, _totalBytes;
+    private readonly long[] _latencyCounts;
+    private double _latencySum;
+
     private int _held;          // bytes at _buf[0.._held) not yet forwarded (an incomplete header / inspect window)
     private State _state = State.Header;
     private int _remaining;     // body bytes of the current Pass frame still to come
@@ -69,6 +77,30 @@ internal sealed class Pump
         _frames = frames;
         _addedLatency = addedLatency;
         _buf = ArrayPool<byte>.Shared.Rent(config.Limits.ReadBufferBytes);
+        _latencyCounts = new long[addedLatency.BucketCount];
+        _lastFlush = Stopwatch.GetTimestamp();
+    }
+
+    private void ObserveLatency(long since)
+    {
+        var seconds = Stopwatch.GetElapsedTime(since).TotalSeconds;
+        _latencyCounts[_addedLatency.BucketIndex(seconds)]++;
+        _latencySum += seconds;
+    }
+
+    private void FlushStats(long now)
+    {
+        _lastFlush = now;
+        if (_unflushedBytes != 0) { _bytes.Add(_unflushedBytes); _unflushedBytes = 0; }
+        if (_unflushedFrames != 0) { _frames.Add(_unflushedFrames); _unflushedFrames = 0; }
+        if (_latencySum != 0 || _latencyCounts.AsSpan().ContainsAnyExcept(0))
+        {
+            _addedLatency.Merge(_latencyCounts, _latencySum);
+            _latencySum = 0;
+        }
+        // single writer per field: the observer and close path only read it
+        if (_isRequest) Volatile.Write(ref _conn.BytesFromClient, _totalBytes);
+        else Volatile.Write(ref _conn.BytesFromServer, _totalBytes);
     }
 
     public async Task<PumpEnd> RunAsync(CancellationToken ct)
@@ -102,17 +134,19 @@ internal sealed class Pump
                 }
 
                 var now = Stopwatch.GetTimestamp();
-                _bytes.Add(n);
-                if (_isRequest) Interlocked.Add(ref _conn.BytesFromClient, n);
-                else Interlocked.Add(ref _conn.BytesFromServer, n);
+                _unflushedBytes += n;
+                _totalBytes += n;
 
                 var r = await ProcessAsync(_held + n, now, ct).ConfigureAwait(false);
                 if (r != null)
                     return r.Value;
+                if (now - _lastFlush > FlushTicks)
+                    FlushStats(now);
             }
         }
         finally
         {
+            FlushStats(Stopwatch.GetTimestamp());
             _tap.Abort();
             ArrayPool<byte>.Shared.Return(_buf);
             if (_frame != null)
@@ -124,6 +158,7 @@ internal sealed class Pump
     }
 
     /// <summary>Processes <c>_buf[0..total)</c>. Returns null to continue reading.</summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     private async ValueTask<PumpEnd?> ProcessAsync(int total, long now, CancellationToken ct)
     {
         var p = 0;
@@ -239,7 +274,7 @@ internal sealed class Pump
             return PumpEnd.DestinationFailed;
         _held = 0;
         if (completedFrame)
-            _addedLatency.Observe(Stopwatch.GetElapsedTime(now).TotalSeconds);
+            ObserveLatency(now);
         return null;
 
     Hold:
@@ -250,17 +285,18 @@ internal sealed class Pump
         if (p > 0)
             Buffer.BlockCopy(_buf, p, _buf, 0, _held);
         if (completedFrame)
-            _addedLatency.Observe(Stopwatch.GetElapsedTime(now).TotalSeconds);
+            ObserveLatency(now);
         return null;
     }
 
     private void EndFrame(long now)
     {
         _tap.End(now);
-        _frames.Inc();
+        _unflushedFrames++;
         _state = State.Header;
     }
 
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     private async ValueTask<bool> ForwardBufferedAsync(long now, CancellationToken ct)
     {
         var frame = _frame!;
@@ -285,7 +321,7 @@ internal sealed class Pump
 
             _state = State.Header;
             _tap.End(now);
-            _frames.Inc();
+            _unflushedFrames++;
 
             try
             {
@@ -344,6 +380,7 @@ internal sealed class Pump
         return result;
     }
 
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     private async ValueTask<bool> WriteAsync(int offset, int count, CancellationToken ct)
     {
         try

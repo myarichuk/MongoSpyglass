@@ -195,7 +195,7 @@ public static class ConfigLoader
             },
 
             ["limits.maxClientConnections"] = (c, v) => c.Limits.MaxClientConnections = Int(v, 1, 1 << 20),
-            ["limits.observeQueueBytes"] = (c, v) => c.Limits.ObserveQueueBytes = Long(v, 0),
+            ["limits.observeQueueBytes"] = (c, v) => c.Limits.ObserveQueueBytes = Long(v, 0), // 0 = observe nothing (forwarding-only A/B runs)
             ["limits.maxPendingPerConnection"] = (c, v) => c.Limits.MaxPendingPerConnection = Int(v, 1, 1 << 20),
             ["limits.helloRewriteMaxBytes"] = (c, v) => c.Limits.HelloRewriteMaxBytes = Int(v, 4096, 48_000_000),
             ["limits.readBufferBytes"] = (c, v) => c.Limits.ReadBufferBytes = Int(v, 4096, 16 * 1024 * 1024),

@@ -11,13 +11,15 @@ public sealed class SequenceScanner
 {
     public const int MaxSections = 4, MaxIdentifier = 32;
 
-    private enum S : byte { Flags, Kind, Len4, Skip, SeqId, Done }
+    private enum S : byte { Flags, Kind, Len4, Skip, SeqId, Body, Done }
     private enum LenFor : byte { BodyDoc, SeqSize, SeqDoc }
 
     public int SectionCount;
     public readonly int[] DocCounts = new int[MaxSections];
     public readonly byte[][] Identifiers = [new byte[MaxIdentifier], new byte[MaxIdentifier], new byte[MaxIdentifier], new byte[MaxIdentifier]];
     public readonly int[] IdentifierLengths = new int[MaxSections];
+    /// <summary>$db / lsid / txnNumber of the kind-0 body, read while it streams.</summary>
+    public readonly BodyFieldScanner Fields = new();
 
     private S _s;
     private LenFor _lenFor;
@@ -35,6 +37,7 @@ public sealed class SequenceScanner
         _section = -1;
         _have = 0;
         _remainingBody = bodyLength;
+        Fields.Begin();
         _s = opCode == Wire.OpCodes.Msg ? S.Flags : S.Done;
     }
 
@@ -104,6 +107,16 @@ public sealed class SequenceScanner
                         NextInSequence();
                     break;
                 }
+                case S.Body:
+                {
+                    var n = (int)Math.Min(_skip, data.Length - i);
+                    Fields.Feed(data.Slice(i, n));
+                    i += n;
+                    _skip -= n;
+                    Consume(n);
+                    if (_skip == 0) NextSection();
+                    break;
+                }
                 case S.Skip:
                 {
                     var n = (int)Math.Min(_skip, data.Length - i);
@@ -131,7 +144,7 @@ public sealed class SequenceScanner
             case LenFor.BodyDoc:
                 if (v < 5) { _s = S.Done; return; }
                 _skip = v - 4;
-                _s = S.Skip;
+                _s = S.Body;
                 return;
             case LenFor.SeqSize:
                 if (v < 4) { _s = S.Done; return; }
