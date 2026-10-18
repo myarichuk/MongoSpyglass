@@ -321,9 +321,9 @@ counted).
 
 | Situation | Rule |
 |---|---|
-| Request with OP_MSG `moreToCome` (unacknowledged write) | Emit `op` immediately with `ack=false` and no reply facts. Don't insert into the pending table. |
+| Request with OP_MSG `moreToCome` (unacknowledged write) | Emit `op` immediately with `status=unacknowledged` and no reply facts. Don't insert into the pending table. |
 | Reply with `responseTo` in the table | Complete the op. Server latency = `reply.tFirst − request.tLast`. Emit `op`. |
-| Reply with OP_MSG `moreToCome` (exhaust cursor / streaming hello) | Complete the op as above with `stream=true`. Register `reply.requestId → same logical op` so the next reply in the stream correlates. Each further reply increments `op.replyCount` and emits a `stream` record (02 §4.3), not a new op. |
+| Reply with OP_MSG `moreToCome` (exhaust cursor / streaming hello) | Complete the op as above with `stream=true`. Register `reply.requestId → same logical op` so the next reply in the stream correlates. Each further reply emits a `stream` record (02 §4.2), not a new op; the collector counts them into `replyCount`. |
 | Reply with unknown `responseTo` | Count `spyglass_proxy_uncorrelated_replies_total`. No record. |
 | Connection closes with pending requests | Emit `op` with `status=connection_closed` for each. |
 

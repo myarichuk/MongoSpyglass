@@ -47,8 +47,8 @@ arrives (SSE `op.updated`).
 Operation {
   id                     // collector-assigned ULID
   joinKey, connSeq
-  ts, command, db, coll, opCode, status, ack, stream, replyCount
-  reqBytes, respBytes, serverLatency_us, timings{reqFirst,reqLast,respFirst,respLast}
+  ts, command, db, coll, opCode, status, ack, stream, replyCount      // ack, replyCount derived at ingest (02 §4.2)
+  reqBytes, respBytes, serverLatency_us, timings{reqFirst,reqLast,respFirst,respLast}   // serverLatency_us derived
   reply facts            // from op
   cmd (redacted BSON), cmdTruncated, seqDocs
   shapeHash, valueHash   // §4

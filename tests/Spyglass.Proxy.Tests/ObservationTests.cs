@@ -72,7 +72,7 @@ public sealed class ObservationTests(ObservationFixture f) : IClassFixture<Obser
         }
 
         var index = await f.Proxy.WaitForKeysAsync("op",
-            o => (S(o, "member"), o.GetProperty("serverConnectionId").ValueKind == System.Text.Json.JsonValueKind.Number ? o.GetProperty("serverConnectionId").GetInt64() : -1, o.GetProperty("requestId").GetInt32()),
+            o => (S(o, "member"), Rec.Long(o, "serverConnectionId") ?? -1, o.GetProperty("requestId").GetInt32()),
             events.Select(KeyOf).ToList());
         var missing = new List<string>();
         foreach (var e in events)
@@ -82,7 +82,7 @@ public sealed class ObservationTests(ObservationFixture f) : IClassFixture<Obser
             if (match.Count != 1) { missing.Add($"{e.CommandName} {key} x{match.Count}"); continue; }
             Assert.Equal(e.CommandName, S(match[0], "command"));
             Assert.Equal(e.DatabaseNamespace.DatabaseName, S(match[0], "db"));
-            Assert.Equal(f.Proxy.Server.ProxyId.ToString(), S(match[0], "proxyId"));
+            Assert.Equal(f.Proxy.Server.ProxyId.ToString(), S(match[0], "src")); // wire records: src is the proxyId
         }
         Assert.Empty(missing); // join rate 100% on a quiescent run
     }
@@ -102,8 +102,9 @@ public sealed class ObservationTests(ObservationFixture f) : IClassFixture<Obser
         Assert.Equal(120, insert.GetProperty("seqDocs").GetProperty("documents").GetInt32());
         Assert.Equal(120, insert.GetProperty("reply").GetProperty("n").GetInt32());
         Assert.Equal("ok", S(insert, "status"));
-        Assert.True(insert.GetProperty("ack").GetBoolean());
-        Assert.True(insert.GetProperty("serverLatency_us").GetInt64() > 0);
+        Assert.True(Rec.ServerLatency(insert) > 0);
+        Assert.False(Rec.Has(insert, "proxyId")); // == src, not repeated
+        Assert.False(Rec.Has(insert, "opCode"));  // OP_MSG is the default
         Assert.NotEqual("", S(insert, "lsid"));
         Assert.Equal(16, S(insert, "lsid").Length);
 
@@ -139,9 +140,9 @@ public sealed class ObservationTests(ObservationFixture f) : IClassFixture<Obser
         var w0 = db.GetCollection<BsonDocument>("w0").WithWriteConcern(WriteConcern.Unacknowledged);
         await w0.InsertOneAsync(new BsonDocument("x", 1));
         var unack = (await f.Proxy.WaitRecordsAsync(r => S(r, "coll") == "w0" && S(r, "command") == "insert", 1))[0];
-        Assert.False(unack.GetProperty("ack").GetBoolean());
         Assert.Equal("unacknowledged", S(unack, "status"));
-        Assert.Equal(JsonValueKind.Null, unack.GetProperty("reply").ValueKind);
+        Assert.Equal("unacknowledged", S(unack, "status"));
+        Assert.False(Rec.Has(unack, "reply"));
     }
 
     [Fact]
@@ -152,7 +153,7 @@ public sealed class ObservationTests(ObservationFixture f) : IClassFixture<Obser
         var open = (await f.Proxy.WaitRecordsAsync(r => S(r, "type") == "conn" && S(r, "event") == "open" && S(r, "app") == "conn-test-app", 1))[0];
         Assert.Contains("mongo-csharp-driver", S(open, "driver"));
         Assert.Equal(JsonValueKind.Number, open.GetProperty("serverConnectionId").ValueKind);
-        Assert.Equal(JsonValueKind.Null, open.GetProperty("exporter").ValueKind);
+        Assert.False(Rec.Has(open, "exporter"));
 
         // MongoClient.Dispose() leaves the shared cluster (and its sockets) alive; dispose the cluster itself.
         MongoDB.Driver.ClusterRegistry.Instance.UnregisterAndDisposeCluster(client.Cluster);

@@ -81,7 +81,7 @@ public sealed class NodeDriverTests(ObservationFixture f) : IClassFixture<Observ
         (string?, long, int) KeyOf(JsonElement c) =>
             (memberByPort[HostPort.Parse(c.GetProperty("address").GetString()!).Port], c.GetProperty("serverConnectionId").GetInt64(), c.GetProperty("requestId").GetInt32());
         var index = await f.Proxy.WaitForKeysAsync("op", o =>
-            (o.GetProperty("member").GetString(), o.GetProperty("serverConnectionId").ValueKind == JsonValueKind.Number ? o.GetProperty("serverConnectionId").GetInt64() : -1, o.GetProperty("requestId").GetInt32()),
+            (o.GetProperty("member").GetString(), Rec.Long(o, "serverConnectionId") ?? -1, o.GetProperty("requestId").GetInt32()),
             cmds.Select(KeyOf).ToList());
         var misses = new List<string>();
         foreach (var c in cmds)
@@ -97,13 +97,13 @@ public sealed class NodeDriverTests(ObservationFixture f) : IClassFixture<Observ
         // streaming hello (moreToCome) on the driver's monitoring connections: one op with stream=true, then
         // `stream` records for each further reply (01 §7, 06 §2.5)
         await ReplicaSetTests.WaitUntil(() => f.Proxy.RecordsOf("stream").Any(), TimeSpan.FromSeconds(10));
-        Assert.Contains(f.Proxy.RecordsOf("op"), o => o.GetProperty("stream").GetBoolean() && o.GetProperty("command").GetString() == "hello");
+        Assert.Contains(f.Proxy.RecordsOf("op"), o => Rec.Bool(o, "stream") && o.GetProperty("command").GetString() == "hello");
 
         // handshake marker (02 §2.4) where the driver has appendMetadata
-        var conns = f.Proxy.RecordsOf("conn").Where(r => r.GetProperty("app").ValueKind == JsonValueKind.String && r.GetProperty("app").GetString() == app).ToList();
+        var conns = f.Proxy.RecordsOf("conn").Where(r => Rec.Str(r, "app") == app).ToList();
         Assert.NotEmpty(conns);
         Assert.All(conns, c => Assert.StartsWith("nodejs", c.GetProperty("driver").GetString()));
-        var markers = conns.Select(c => c.GetProperty("exporter")).Where(e => e.ValueKind == JsonValueKind.String).Select(e => e.GetString()).Distinct().ToList();
+        var markers = conns.Select(c => Rec.Str(c, "exporter")).Where(e => e != null).Distinct().ToList();
         Assert.True(markers.Count == 0 || markers.SequenceEqual(["spyglass-node"]), string.Join(',', markers));
         if (driver != "mongodb-floor")
             Assert.Equal(["spyglass-node"], markers);

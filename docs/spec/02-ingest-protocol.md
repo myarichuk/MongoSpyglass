@@ -23,6 +23,9 @@ Design rules:
 * `schema` is a monotonically increasing integer within v0, starting at `1`.
 * A breaking change gets a new path, `/ingest/v1`, served side by side for at least one
   collector release.
+* Schema `1` is frozen at the first collector release. Until then it is edited in place. The
+  wire-record trim (absent fields, derived fields, no `proxyId` in wire records) was made under
+  that rule.
 
 ## 2. Discovery and the handshake marker
 
@@ -179,6 +182,11 @@ Encoding:
 * All durations are integer microseconds (`*_us`).
 * 64-bit identifiers that may exceed 2⁵³−1 (`cursorId`) are JSON **strings** in decimal.
   `serverConnectionId` and `requestId` are JSON numbers (both are far below 2⁵³).
+* **Absent means default.** In wire records (§4.2), a field that would be `null`, `false`, `0`
+  or its stated default is omitted, and consumers MUST read an absent field as that value.
+  The defaults: `opCode` = `"OP_MSG"`, booleans = `false`, counts = `0`, `reply.parsed` =
+  `true`. Values the collector can derive are not sent at all; their derivations are listed
+  under `op`.
 
 ### 4.1 Common envelope fields
 
@@ -186,14 +194,14 @@ Encoding:
 |---|---|---|---|
 | `type` | string | yes | record type |
 | `ts` | int | yes | event time (µs since epoch) |
-| `src` | string | yes | producer instance id (UUID per process start) |
+| `src` | string | yes | producer instance id (UUID per process start). For wire records it **is** the `proxyId`, which those records therefore don't repeat. |
 
 ### 4.2 Wire records (producer: proxy)
 
 **`proxy`**: once per proxy start, then every 60 s.
 
 ```json
-{"type":"proxy","ts":…,"src":"<proxyId>","proxyId":"<uuid>","version":"1.0.0","schema":1,
+{"type":"proxy","ts":…,"src":"<proxyId>","version":"1.0.0","schema":1,
  "topology":"replicaSet","setName":"rs0",
  "members":[{"member":"localhost:27017","upstream":"rs0-a.example.net:27017"}, …],
  "config":{"compression":"strip","values":"truncated","commandBytes":16384}}
@@ -203,11 +211,11 @@ Encoding:
 
 ```json
 {"type":"conn","ts":…,"src":"<proxyId>","event":"open|close",
- "proxyId":"…","member":"localhost:27017","connSeq":1234,
- "serverConnectionId":5512,                     // null until the first hello reply
- "client":"10.1.2.3:51122","tls":false,
- "app":"orders-api","driver":"nodejs|spyglass-node","driverVersion":"7.7.0|0.1.0",
- "exporter":"spyglass-node",                     // null if no marker
+ "member":"localhost:27017","connSeq":1234,
+ "serverConnectionId":5512,                     // absent until the first hello reply
+ "client":"10.1.2.3:51122","tls":true,          // absent = false
+ "app":"orders-api","driver":"nodejs|spyglass-node","driverVersion":"7.7.0|0.1.0",   // absent if the client sent none
+ "exporter":"spyglass-node",                     // absent if no marker
  "os":"linux","platform":"Node.js v22.4.0, LE",
  "closeReason":"client_closed|upstream_closed|invalid_frame|upstream_connect_failed|proxy_shutdown",   // close only
  "bytesIn":…, "bytesOut":…}                      // close only
@@ -217,28 +225,40 @@ Encoding:
 
 ```json
 {"type":"op","ts":<request tFirst as wall-clock µs>,"src":"<proxyId>",
- "proxyId":"…","member":"localhost:27017","serverConnectionId":5512,"requestId":88231,"connSeq":1234,
- "opCode":"OP_MSG","command":"find","db":"orders","coll":"orders",
- "ack":true,"stream":false,"replyCount":1,
+ "member":"localhost:27017","serverConnectionId":5512,"requestId":88231,"connSeq":1234,
+ "opCode":"OP_QUERY",                              // absent = "OP_MSG"
+ "command":"find","db":"orders","coll":"orders",
+ "stream":true,                                   // absent = false; a moreToCome stream started here
  "status":"ok|error|connection_closed|unacknowledged",
- "reqBytes":412,"respBytes":19384,
- "t":{"reqFirst_us":0,"reqLast_us":3,"respFirst_us":812,"respLast_us":845},  // relative to ts
- "serverLatency_us":809,                          // respFirst − reqLast
- "reply":{"ok":1,"code":null,"codeName":null,"errmsg":null,
-          "cursorId":"0","nReturned":17,"n":null,"nModified":null,
-          "writeErrors":0,"writeConcernError":false,"upserted":0},
- "lsid":"3fa1c09e5b7d2e11","txnNumber":null,
- "comment":null,                                  // string comments only, truncated to 256
+ "reqBytes":412,"respBytes":19384,                // respBytes absent = 0 (no reply)
+ "t":{"reqLast_us":3,"respFirst_us":812,"respLast_us":845},  // relative to ts (= reqFirst); resp* absent without a reply
+ "reply":{"ok":1,"code":11000,"codeName":"DuplicateKey","errmsg":"…",   // absent without a reply; each field absent if not in the reply
+          "cursorId":"0","nReturned":17,"n":5,"nModified":5,
+          "writeErrors":2,"writeConcernError":true,"upserted":1,           // absent = 0 / false
+          "parsed":false},                                                 // absent = true: the scanner read the whole reply
+ "lsid":"3fa1c09e5b7d2e11","txnNumber":7,         // absent outside a session / transaction
+ "comment":"…",                                   // string comments only, truncated to 256; absent if none
  "cmd":"<base64 of redacted BSON command body>",  // absent if values=shape and not needed; see 01 §9
- "cmdTruncated":false,
- "seqDocs":{"documents":120}}                     // kind-1 sequence identifiers → counts
+ "cmdTruncated":true,                             // absent = false
+ "seqDocs":{"documents":120},                     // kind-1 sequence identifiers → counts; absent if none
+ "compressor":"zlib"}                             // OP_COMPRESSED only
 ```
+
+Derived by the consumer, not sent:
+
+| Value | Derivation |
+|---|---|
+| `proxyId` | `src` |
+| `ack` | `status != "unacknowledged"` |
+| `serverLatency_us` | `t.respFirst_us − t.reqLast_us`, when both are present |
+| `replyCount` | 0 if `status` is `unacknowledged` or `connection_closed`; else 1 + the `stream` records for the same key |
+| `t.reqFirst_us` | 0 (it is `ts`) |
 
 **`stream`**: an additional reply on a `moreToCome` stream (exhaust getMore, streaming hello).
 
 ```json
-{"type":"stream","ts":…,"src":"…","proxyId":"…","member":"…","serverConnectionId":5512,
- "requestId":88231,"seq":2,"respBytes":…,"reply":{"cursorId":"…","nReturned":101}}
+{"type":"stream","ts":…,"src":"<proxyId>","member":"…","serverConnectionId":5512,
+ "requestId":88231,"seq":2,"respBytes":…,"reply":{"cursorId":"…","nReturned":101,"ok":1}}
 ```
 
 **`stats`**: every 10 s from every producer, including exporters.

@@ -48,7 +48,6 @@ internal sealed class RecordWriter
 /// <summary>Pre-encoded property names: no UTF-16 transcoding or escaping scan per record.</summary>
 internal static class J
 {
-    public static readonly JsonEncodedText ack = JsonEncodedText.Encode("ack");
     public static readonly JsonEncodedText app = JsonEncodedText.Encode("app");
     public static readonly JsonEncodedText bytesIn = JsonEncodedText.Encode("bytesIn");
     public static readonly JsonEncodedText bytesOut = JsonEncodedText.Encode("bytesOut");
@@ -83,11 +82,8 @@ internal static class J
     public static readonly JsonEncodedText os = JsonEncodedText.Encode("os");
     public static readonly JsonEncodedText parsed = JsonEncodedText.Encode("parsed");
     public static readonly JsonEncodedText platform = JsonEncodedText.Encode("platform");
-    public static readonly JsonEncodedText proxyId = JsonEncodedText.Encode("proxyId");
     public static readonly JsonEncodedText reply = JsonEncodedText.Encode("reply");
-    public static readonly JsonEncodedText replyCount = JsonEncodedText.Encode("replyCount");
     public static readonly JsonEncodedText reqBytes = JsonEncodedText.Encode("reqBytes");
-    public static readonly JsonEncodedText reqFirst_us = JsonEncodedText.Encode("reqFirst_us");
     public static readonly JsonEncodedText reqLast_us = JsonEncodedText.Encode("reqLast_us");
     public static readonly JsonEncodedText requestId = JsonEncodedText.Encode("requestId");
     public static readonly JsonEncodedText respBytes = JsonEncodedText.Encode("respBytes");
@@ -96,7 +92,6 @@ internal static class J
     public static readonly JsonEncodedText seq = JsonEncodedText.Encode("seq");
     public static readonly JsonEncodedText seqDocs = JsonEncodedText.Encode("seqDocs");
     public static readonly JsonEncodedText serverConnectionId = JsonEncodedText.Encode("serverConnectionId");
-    public static readonly JsonEncodedText serverLatency_us = JsonEncodedText.Encode("serverLatency_us");
     public static readonly JsonEncodedText src = JsonEncodedText.Encode("src");
     public static readonly JsonEncodedText status = JsonEncodedText.Encode("status");
     public static readonly JsonEncodedText stream = JsonEncodedText.Encode("stream");
@@ -112,6 +107,33 @@ internal static class J
 
 internal static class JsonExtensions
 {
+    // 02 §4: in wire records an absent field means null (or the field's default); these omit it.
+
+    public static void WriteIfNotNull(this Utf8JsonWriter w, JsonEncodedText name, string? value)
+    {
+        if (value != null) w.WriteString(name, value);
+    }
+
+    public static void WriteIfNotNull(this Utf8JsonWriter w, JsonEncodedText name, long? value)
+    {
+        if (value is { } v) w.WriteNumber(name, v);
+    }
+
+    public static void WriteIfNotNull(this Utf8JsonWriter w, JsonEncodedText name, double? value)
+    {
+        if (value is { } v) w.WriteNumber(name, v);
+    }
+
+    public static void WriteIfNonZero(this Utf8JsonWriter w, JsonEncodedText name, long value)
+    {
+        if (value != 0) w.WriteNumber(name, value);
+    }
+
+    public static void WriteIfTrue(this Utf8JsonWriter w, JsonEncodedText name, bool value)
+    {
+        if (value) w.WriteBoolean(name, true);
+    }
+
     public static void WriteStringOrNull(this Utf8JsonWriter w, JsonEncodedText name, string? value)
     {
         if (value == null) w.WriteNull(name);

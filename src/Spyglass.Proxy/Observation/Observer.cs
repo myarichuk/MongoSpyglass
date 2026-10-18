@@ -99,7 +99,6 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
     {
         var rw = new RecordWriter();
         var j = rw.Begin("proxy", Clock.NowUnixMicros(), _src);
-        j.WriteString("proxyId", _src);
         j.WriteString("version", typeof(Observer).Assembly.GetName().Version?.ToString(3) ?? "0");
         j.WriteNumber("schema", ProxyServer.Schema);
         var t = _server.Topology;
@@ -460,18 +459,17 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
         {
             var ctx = conn.Ctx;
             j.WriteString(J.@event, ev);
-            j.WriteString(J.proxyId, _o._src);
             j.WriteString(J.member, ctx.Member.Advertised);
             j.WriteNumber(J.connSeq, ctx.ConnSeq);
-            j.WriteNumberOrNull(J.serverConnectionId, ctx.ServerConnectionId);
+            j.WriteIfNotNull(J.serverConnectionId, ctx.ServerConnectionId);
             j.WriteString(J.client, ctx.ClientEndpoint);
-            j.WriteBoolean(J.tls, ctx.ClientTls);
-            j.WriteStringOrNull(J.app, conn.Client?.Application);
-            j.WriteStringOrNull(J.driver, conn.Client?.Driver);
-            j.WriteStringOrNull(J.driverVersion, conn.Client?.DriverVersion);
-            j.WriteStringOrNull(J.exporter, conn.Client?.Exporter);
-            j.WriteStringOrNull(J.os, conn.Client?.OsType);
-            j.WriteStringOrNull(J.platform, conn.Client?.Platform);
+            j.WriteIfTrue(J.tls, ctx.ClientTls);
+            j.WriteIfNotNull(J.app, conn.Client?.Application);
+            j.WriteIfNotNull(J.driver, conn.Client?.Driver);
+            j.WriteIfNotNull(J.driverVersion, conn.Client?.DriverVersion);
+            j.WriteIfNotNull(J.exporter, conn.Client?.Exporter);
+            j.WriteIfNotNull(J.os, conn.Client?.OsType);
+            j.WriteIfNotNull(J.platform, conn.Client?.Platform);
         }
 
         private void CompleteOp(ObservedConnection conn, RequestInfo req, FrameCapture? reply, string? status, bool stream = false)
@@ -501,26 +499,23 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
 
             if (!_o.BuildsRecords) return;
 
-            // ---- op record (02 §4.2) ----
+            // ---- op record (02 §4.2: absent = null/default; ack, replyCount, serverLatency_us are derived) ----
             var ts = Clock.ToUnixMicros(req.TFirst);
             var j = _rw.Begin("op", ts, _o._src);
-            j.WriteString(J.proxyId, _o._src);
             j.WriteString(J.member, member);
-            j.WriteNumberOrNull(J.serverConnectionId, conn.Ctx.ServerConnectionId);
+            j.WriteIfNotNull(J.serverConnectionId, conn.Ctx.ServerConnectionId);
             j.WriteNumber(J.requestId, req.RequestId);
             j.WriteNumber(J.connSeq, conn.Ctx.ConnSeq);
-            j.WriteString(J.opCode, OpCodes.Name(req.OpCode));
+            if (req.OpCode != OpCodes.Msg)
+                j.WriteString(J.opCode, OpCodes.Name(req.OpCode));
             j.WriteString(J.command, req.Command);
-            j.WriteStringOrNull(J.db, req.Db);
-            j.WriteStringOrNull(J.coll, req.Coll);
-            j.WriteBoolean(J.ack, !req.MoreToCome);
-            j.WriteBoolean(J.stream, stream);
-            j.WriteNumber(J.replyCount, reply != null ? 1 : 0);
+            j.WriteIfNotNull(J.db, req.Db);
+            j.WriteIfNotNull(J.coll, req.Coll);
+            j.WriteIfTrue(J.stream, stream);
             j.WriteString(J.status, status);
             j.WriteNumber(J.reqBytes, req.FrameLength);
-            j.WriteNumber(J.respBytes, reply?.FrameLength ?? 0);
+            j.WriteIfNonZero(J.respBytes, reply?.FrameLength ?? 0);
             j.WriteStartObject(J.t);
-            j.WriteNumber(J.reqFirst_us, 0);
             j.WriteNumber(J.reqLast_us, Clock.Micros(req.TFirst, req.TLast));
             if (reply != null)
             {
@@ -528,22 +523,16 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
                 j.WriteNumber(J.respLast_us, Clock.Micros(req.TFirst, reply.TLast));
             }
             j.WriteEndObject();
-            if (reply != null)
-                j.WriteNumber(J.serverLatency_us, Math.Max(0, Clock.Micros(req.TLast, reply.TFirst)));
-            else
-                j.WriteNull(J.serverLatency_us);
 
             if (facts != null)
                 WriteReply(j, facts, req.IsRedactedCommand);
-            else
-                j.WriteNull(J.reply);
 
-            j.WriteStringOrNull(J.lsid, req.Lsid);
-            j.WriteNumberOrNull(J.txnNumber, req.TxnNumber);
-            j.WriteStringOrNull(J.comment, req.Comment);
+            j.WriteIfNotNull(J.lsid, req.Lsid);
+            j.WriteIfNotNull(J.txnNumber, req.TxnNumber);
+            j.WriteIfNotNull(J.comment, req.Comment);
             if (req.HasRedactedCommand)
                 j.WriteBase64String(J.cmd, req.RedactedCommand);
-            j.WriteBoolean(J.cmdTruncated, req.CommandTruncated);
+            j.WriteIfTrue(J.cmdTruncated, req.CommandTruncated);
             if (req.SeqDocs.Count > 0)
             {
                 j.WriteStartObject(J.seqDocs);
@@ -565,16 +554,15 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
 
             if (!_o.BuildsRecords) return;
             var j = _rw.Begin("stream", Clock.ToUnixMicros(f.TFirst), _o._src);
-            j.WriteString(J.proxyId, _o._src);
             j.WriteString(J.member, member);
-            j.WriteNumberOrNull(J.serverConnectionId, conn.Ctx.ServerConnectionId);
+            j.WriteIfNotNull(J.serverConnectionId, conn.Ctx.ServerConnectionId);
             j.WriteNumber(J.requestId, req.RequestId);
             j.WriteNumber(J.seq, s.Seq);
             j.WriteNumber(J.respBytes, f.FrameLength);
             j.WriteStartObject(J.reply);
             if (f.Facts.CursorId is { } id) WriteInt64String(j, J.cursorId, id);
-            j.WriteNumberOrNull(J.nReturned, f.Facts.NReturned);
-            j.WriteNumberOrNull(J.ok, f.Facts.Ok);
+            j.WriteIfNotNull(J.nReturned, f.Facts.NReturned);
+            j.WriteIfNotNull(J.ok, f.Facts.Ok);
             j.WriteEndObject();
             Emit();
         }
@@ -620,10 +608,9 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
         private static void WriteReply(Utf8JsonWriter j, ReplyFacts f, bool authCommand)
         {
             j.WriteStartObject(J.reply);
-            j.WriteNumberOrNull(J.ok, f.Ok);
-            j.WriteNumberOrNull(J.code, f.Code);
+            j.WriteIfNotNull(J.ok, f.Ok);
+            j.WriteIfNotNull(J.code, f.Code);
             if (f.CodeNameLength >= 0) j.WriteString(J.codeName, f.CodeName.AsSpan(0, f.CodeNameLength));
-            else j.WriteNull(J.codeName);
             if (authCommand)
             {
                 // 01 §9.1: replies to redacted commands are reduced to ok/code/codeName
@@ -631,21 +618,19 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
                 return;
             }
             if (f.ErrmsgLength >= 0) j.WriteString(J.errmsg, f.Errmsg.AsSpan(0, f.ErrmsgLength));
-            else j.WriteNull(J.errmsg);
             if (f.CursorId is { } id) WriteInt64String(j, J.cursorId, id);
-            else j.WriteNull(J.cursorId);
-            j.WriteNumberOrNull(J.nReturned, f.NReturned);
-            j.WriteNumberOrNull(J.n, f.N);
-            j.WriteNumberOrNull(J.nModified, f.NModified);
-            j.WriteNumber(J.writeErrors, f.WriteErrors);
-            j.WriteBoolean(J.writeConcernError, f.WriteConcernError);
-            j.WriteNumber(J.upserted, f.Upserted);
+            j.WriteIfNotNull(J.nReturned, f.NReturned);
+            j.WriteIfNotNull(J.n, f.N);
+            j.WriteIfNotNull(J.nModified, f.NModified);
+            j.WriteIfNonZero(J.writeErrors, f.WriteErrors);
+            j.WriteIfTrue(J.writeConcernError, f.WriteConcernError);
+            j.WriteIfNonZero(J.upserted, f.Upserted);
             if (f.CursorsKilledCount + f.CursorsNotFoundCount > 0)
             {
                 j.WriteNumber(J.cursorsKilled, f.CursorsKilledCount);
                 j.WriteNumber(J.cursorsNotFound, f.CursorsNotFoundCount);
             }
-            j.WriteBoolean(J.parsed, f.Parsed);
+            if (!f.Parsed) j.WriteBoolean(J.parsed, false);
             j.WriteEndObject();
         }
     }

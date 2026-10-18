@@ -63,7 +63,7 @@ latest 7.x)**, both through the proxy.
 
 ### 2.5 Correlation ‡
 
-* Unacknowledged writes (`w:0`) produce `ack=false` ops.
+* Unacknowledged writes (`w:0`) produce `status=unacknowledged` ops.
 * Exhaust getMore (where the driver uses it) and streaming hello produce one op plus
   `stream` records.
 * Pipelined requests on one connection, if any driver issues them.

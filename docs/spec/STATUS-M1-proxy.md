@@ -129,9 +129,10 @@ slots). At under 3 % of the per-frame forwarding cost, it isn't worth it now.
 ## Open for M1
 
 1. Collector v1 (wire-only, 03): ingest, shapes, analyzers, storage, UI. Not started.
-2. Record size: an op record is ~860 B of JSON (explicit nulls, `proxyId` repeating `src`), which is
-   most of the remaining export CPU. Trimming it is a 02 §4.2 contract change, best made before
-   the collector exists.
+2. ~~Record size~~ done: wire records omit absent/default fields and derivable values, and drop
+   `proxyId` (it is `src`). 02 §4 has the rules and the derivations. A point-lookup op record
+   went from 858 to 497 B; the worker's record-building CPU moved only ~0.2 µs/op, so JSON size
+   was a smaller part of export cost than the first estimate said.
 3. Dedicated tests: tap-digest byte transparency, half-close / death mid-reply, pending-at-close.
 4. Nightly-only: PLAIN/LDAP, MONGODB-AWS, X.509 documented failure, SRV end-to-end, perf on pinned cores.
 5. Delete the old `MongoSpyglass.Proxy` once the collector replaces `MongoSpyglass.Service`.
