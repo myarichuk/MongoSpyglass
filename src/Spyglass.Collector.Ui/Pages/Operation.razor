@@ -1,6 +1,7 @@
 @page "/ops/{Id}"
 @inject Api Api
 @inject IJSRuntime JS
+@inject NavigationManager Nav
 
 <PageTitle>@(_op?.Command ?? "Operation") · Spyglass</PageTitle>
 @if (_missing)
@@ -19,9 +20,14 @@ else if (_op is { } o)
         </header>
 
         <section class="card p-container-padding" aria-label="Timing">
-            <h2 class="text-ui-label-sm uppercase text-muted mb-2">Timing (as seen by the proxy)</h2>
+            <h2 class="text-ui-label-sm uppercase text-muted mb-2">Timing</h2>
             <div class="grid grid-cols-[12rem_1fr_6rem] gap-x-3 gap-y-1 items-center">
-                <span class="text-muted">pool wait</span><span class="text-muted text-ui-label-sm">needs an exporter (M3)</span><span></span>
+                @if (o.Context is { PoolWaitUs: { } pw })
+                {
+                    <span>pool wait (driver)</span>
+                    <div class="relative h-3 bg-surface-3 rounded"><div class="absolute h-3 rounded bg-warn" style="left:0;width:@Width(0, pw)%"></div></div>
+                    <span class="num">@Fmt.Us(pw)</span>
+                }
                 @foreach (var (label, from, to, css) in Segments(o))
                 {
                     <span>@label</span>
@@ -31,7 +37,20 @@ else if (_op is { } o)
                     <span class="num">@Fmt.Us(to - from)</span>
                 }
             </div>
-            <p class="text-ui-label-sm text-muted mt-2">Server latency = first reply byte − last request byte at the proxy: server time plus the proxy↔server network.</p>
+            @if (o.Context is { ClientUs: { } cu } ctxT)
+            {
+                <div class="grid grid-cols-[12rem_1fr_6rem] gap-x-3 gap-y-1 items-center mt-1 pt-1 border-t border-line">
+                    <span>client total (driver)</span>
+                    <div class="relative h-3 bg-surface-3 rounded"><div class="absolute h-3 rounded bg-accent/40" style="left:0;width:@Width(0, cu)%"></div></div>
+                    <span class="num">@Fmt.Us(cu)</span>
+                    @if (ctxT.ClientOverheadUs is { } co)
+                    {
+                        <span class="text-muted">client overhead</span><span class="text-ui-label-sm text-muted">driver time outside the wire exchange (serialization, scheduling)</span><span class="num">@Fmt.Us(co)</span>
+                    }
+                </div>
+            }
+            <p class="text-ui-label-sm text-muted mt-2">Server latency = first reply byte − last request byte at the proxy: server time plus the proxy↔server network.
+                @(o.Context == null ? "Pool wait and client time need a driver exporter." : "")</p>
         </section>
 
         <div class="grid md:grid-cols-2 gap-4">
@@ -92,7 +111,42 @@ else if (_op is { } o)
                     @(c.ClosedReason != null ? $"closed ({c.ClosedReason}) {Fmt.Stamp(c.ClosedTs ?? 0)}" : $"open, last activity {Fmt.Stamp(c.LastActivityTs)}")</p>
             </section>
         }
-        <p class="text-ui-label-sm text-muted">Unit of work, callsite and client latency come from a driver exporter (M3).</p>
+        @if (o.Context is { } x)
+        {
+            <section class="card p-container-padding" aria-label="Application context">
+                <h2 class="text-ui-label-sm uppercase text-muted mb-2">Application context (exporter)</h2>
+                <dl class="grid grid-cols-[10rem_1fr] gap-y-0.5">
+                    @if (x.Uow is { } u)
+                    {
+                        <dt class="text-muted">unit of work</dt>
+                        <dd><a href="@UowHref(u.Id)" class="badge bg-accent/15 text-accent" title="other operations of this unit of work">@(u.Name ?? u.Id)</a>
+                            <span class="text-muted text-ui-label-sm">@u.Kind · <span class="mono">@u.Id</span></span></dd>
+                    }
+                    <dt class="text-muted">driver operation</dt><dd class="mono">@(x.OperationId ?? "–") @(x.Attempt is > 1 ? $"(attempt {x.Attempt})" : "")</dd>
+                    <dt class="text-muted">driver status</dt><dd>@x.Status @(x.ErrorCode != null ? $"· {x.ErrorCode}" : "") @(x.ErrorLabels is { Length: > 0 } l ? string.Join(", ", l) : "")</dd>
+                    @if (x.Traceparent != null) { <dt class="text-muted">trace</dt><dd class="mono select-text">@x.Traceparent</dd> }
+                    <dt class="text-muted">exporter</dt><dd class="mono">@x.Src</dd>
+                </dl>
+                @if (x.Callsite != null)
+                {
+                    <h3 class="text-ui-label-sm uppercase text-muted mt-3 mb-1">Callsite <span class="mono normal-case">@x.Callsite</span></h3>
+                    @if (x.Frames is { Length: > 0 } frames)
+                    {
+                        <ol class="mono text-ui-label-sm">
+                            @foreach (var f in frames)
+                            {
+                                <li><span>@f.Fn</span> <span class="text-muted">@f.File@(f.Line is { } ln ? $":{ln}" : "")</span></li>
+                            }
+                        </ol>
+                    }
+                    else { <p class="text-muted text-ui-label-sm">frames not received yet</p> }
+                }
+            </section>
+        }
+        else
+        {
+            <p class="text-ui-label-sm text-muted">Wire-only: no exporter reported this command. Unit of work, callsite and client time come from a driver exporter.</p>
+        }
     </div>
 }
 
@@ -109,7 +163,7 @@ else if (_op is { } o)
         _missing = r == null;
         _op = r?.Op;
         _alerts = r?.Alerts ?? [];
-        if (_op != null) _span = Math.Max(1, _op.Timings.RespLast ?? _op.Timings.ReqLast);
+        if (_op != null) _span = Math.Max(1, Math.Max(_op.Timings.RespLast ?? _op.Timings.ReqLast, Math.Max(_op.Context?.ClientUs ?? 0, _op.Context?.PoolWaitUs ?? 0)));
     }
 
     private static IEnumerable<(string, long, long, string)> Segments(OpDetailDto o)
@@ -122,6 +176,8 @@ else if (_op is { } o)
             yield return ("server → client (reply)", rf, t.RespLast ?? rf, "bg-ok");
         }
     }
+
+    private string UowHref(string? id) => Nav.BaseUri + "?uow=" + Uri.EscapeDataString(id ?? "");
 
     private string Pct(long us) => (100.0 * us / _span).ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
     private string Width(long from, long to) => Math.Max(0.4, 100.0 * (to - from) / _span).ToString("F2", System.Globalization.CultureInfo.InvariantCulture);

@@ -62,10 +62,19 @@ await runInUnitOfWork("ProcessOrderMessage", async () => { … });
 |---|---|
 | `serverHeartbeatSucceeded` (`reply`, `connectionId` = server address) | discovery: read `reply.$spyglass`; map address → `proxyId` |
 | `commandStarted` (`requestId`, `serverConnectionId`, `address`, `connectionId`, `commandName`, `databaseName`) | start context capture |
-| `commandSucceeded` / `commandFailed` (`duration`, `failure`) | emit `cmd` |
-| `connectionCheckedOut` (`address`, `connectionId`, `durationMS`) | pool wait |
+| `commandSucceeded` / `commandFailed` (`failure`) | emit `cmd` |
+| `connectionCheckOutStarted` (`address`), `connectionCheckedOut` (`address`, `connectionId`) | pool wait (timed by the exporter, see below) |
 | `connectionCheckOutFailed` (`reason`, `durationMS`) | `pool.checkoutFailed` |
 | `connectionPoolCreated` (`options.maxPoolSize`), `connectionCreated`, `connectionClosed`, `connectionCheckedIn` | `pool` statistics |
+
+**Durations are the exporter's own.** The driver's `duration` (command events) and `durationMS` (CMAP
+events) come from its `now()`, which floors `process.hrtime()` to whole milliseconds (6.4.0, 6.x, 7.7.0,
+`lib/utils.js`). A 300 µs command reports 0 or 1 ms: `client_us` below the server latency, and
+`clientOverhead_us` meaningless. The exporter reads `process.hrtime.bigint()` itself, in the handlers of
+`commandStarted` and `commandSucceeded`/`commandFailed` (`client_us`), and of
+`connectionCheckOutStarted` and `connectionCheckedOut` (`poolWait_us`, keyed by `address` while the
+checkout is pending). The handlers run synchronously where the driver emits, so they bracket the same
+interval. Found by driving the collector UI with a prototype exporter (M2).
 
 Setting `monitorCommands` makes the driver build event objects (including a copy of the
 command document) for every command. That cost belongs to the driver and is reported
@@ -92,10 +101,11 @@ aren't attributed in v1.
 The Node `connectionCheckedOut` event has no operation id, but a checked-out connection
 serves exactly one operation until it's checked back in. So:
 
-* On `connectionCheckedOut`, store `durationMS` in a `Map` keyed by
-  `` `${address}|${connectionId}` ``.
+* On `connectionCheckOutStarted`, push `process.hrtime.bigint()` on a per-`address` queue. On
+  `connectionCheckedOut`, pop the oldest and store the elapsed µs in a `Map` keyed by
+  `` `${address}|${connectionId}` `` (not `durationMS`: whole milliseconds, §3).
 * On the next `commandStarted` with the same `address` and `connectionId`, take and delete
-  it as `poolWait_us = Math.round(durationMS * 1000)`.
+  it as `poolWait_us`.
 * Subsequent commands in the same checkout (for example, batches of a split bulk write) get
   `poolWait_us = 0`.
 * On `connectionCheckedIn`, delete any leftover entry.

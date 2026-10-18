@@ -554,9 +554,11 @@ public sealed class Server : IAsyncDisposable
         var command = S(c.Request, "command");
         var status = S(c.Request, "status");
         var minLat = L(c.Request, "minLatencyUs");
+        var uow = S(c.Request, "uow");
         bool Filter(LiveEvent e) => e.Op is not { } o ||
             ((app == null || o.App == app) && (coll == null || o.Op.Coll == coll) && (command == null || o.Op.Command == command) &&
-             (status == null || o.Op.Status == status) && (minLat == null || o.ServerLatencyUs >= minLat));
+             (status == null || o.Op.Status == status) && (minLat == null || o.ServerLatencyUs >= minLat) &&
+             (uow == null || Volatile.Read(ref o.Ctx)?.UowId == uow));
 
         c.Features.Get<IHttpResponseBodyFeature>()?.DisableBuffering();
         c.Response.ContentType = "text/event-stream";

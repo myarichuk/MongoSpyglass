@@ -29,12 +29,25 @@
                     </tbody>
                 </table>
             }
+            @if (p.Kind != "proxy" && (p.Runtime ?? p.Driver ?? p.Host) != null)
+            {
+                <p>@p.App @p.AppVersion · <span class="mono">@p.Runtime</span> · <span class="mono">@p.Driver</span> · @p.Host @(p.Pid is { } pid ? $"pid {pid}" : "")</p>
+            }
+            @if (p.Join is { } j)
+            {
+                <p>
+                    join rate <strong class="@(j.Rate is < 0.999 ? "text-warn" : "text-ok")">@(j.Rate is { } r ? r.ToString("P2") : "–")</strong>
+                    · @j.Joined of @j.Cmds commands joined · @j.Orphans orphaned
+                    @if (j.Conflicts > 0) { <span class="text-bad"> · @j.Conflicts conflicts</span> }
+                    @if (j.SkewUs is { } sk) { <span class="@(Math.Abs(sk) > 1_000_000 ? "text-warn" : "text-muted")"> · clock @(sk >= 0 ? "+" : "−")@Fmt.Us(Math.Abs(sk)) vs the proxy</span> }
+                </p>
+            }
             <p class="text-ui-label-sm text-muted">@p.Records records · @p.Rejected rejected · @p.ClockSkewed clock-skewed
-                @if (p.Dropped.Count > 0) { <span> · dropped at the producer: @string.Join(", ", p.Dropped.Where(kv => kv.Value > 0).Select(kv => $"{kv.Key} {kv.Value}"))</span> }
+                @if (p.Dropped.Any(kv => kv.Value > 0)) { <span> · dropped at the producer: @string.Join(", ", p.Dropped.Where(kv => kv.Value > 0).Select(kv => $"{kv.Key} {kv.Value}"))</span> }
             </p>
         </section>
     }
-    <p class="text-ui-label-sm text-muted">Exporters (join rate, clock skew per exporter) appear here with M2/M3.</p>
+    <p class="text-ui-label-sm text-muted">Join rate: commands the exporter reported that found their proxy operation (02 §6). Orphans are commands sent without a proxy key (a server reached directly) or whose operation never arrived.</p>
 </div>
 
 @code {

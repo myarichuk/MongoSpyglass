@@ -23,9 +23,10 @@ Design rules:
 * `schema` is a monotonically increasing integer within v0, starting at `1`.
 * A breaking change gets a new path, `/ingest/v1`, served side by side for at least one
   collector release.
-* Schema `1` is frozen at the first collector release. Until then it is edited in place. The
-  wire-record trim (absent fields, derived fields, no `proxyId` in wire records) was made under
-  that rule.
+* Schema `1` is **frozen** as of M2, with the conformance vectors (§7). It was edited in place
+  until then: the wire-record trim (absent fields, derived fields, no `proxyId` in wire records)
+  and the fields M2 found missing from this text (`reply.cursorsKilled`/`cursorsNotFound`,
+  `stats.dropped.pending_evicted`) were made under that rule. Anything after this is additive.
 
 ## 2. Discovery and the handshake marker
 
@@ -235,6 +236,7 @@ Encoding:
  "reply":{"ok":1,"code":11000,"codeName":"DuplicateKey","errmsg":"…",   // absent without a reply; each field absent if not in the reply
           "cursorId":"0","nReturned":17,"n":5,"nModified":5,
           "writeErrors":2,"writeConcernError":true,"upserted":1,           // absent = 0 / false
+          "cursorsKilled":1,"cursorsNotFound":0,                           // killCursors replies: counts; both absent when both are 0
           "parsed":false},                                                 // absent = true: the scanner read the whole reply
  "lsid":"3fa1c09e5b7d2e11","txnNumber":7,         // absent outside a session / transaction
  "comment":"…",                                   // string comments only, truncated to 256; absent if none
@@ -264,9 +266,13 @@ Derived by the consumer, not sent:
 **`stats`**: every 10 s from every producer, including exporters.
 
 ```json
-{"type":"stats","ts":…,"src":"…","dropped":{"no_slot":0,"queue_full":0,"export":0},
+{"type":"stats","ts":…,"src":"…","dropped":{"no_slot":0,"queue_full":0,"pending_evicted":0,"export":0},
  "sent":{"records":12001,"batches":7}}
 ```
+
+`dropped` maps a reason to a count; consumers show whatever reasons arrive. The proxy's: `no_slot`
+and `queue_full` (01 §4), `pending_evicted` (a request evicted from the per-connection pending table when it
+exceeds `maxPendingPerConnection`, 01 §7), `export` (01 §11).
 
 ### 4.3 Context records (producer: exporter)
 
@@ -297,6 +303,10 @@ mirror `op`.
  "cursorId":null,                          // decimal string; set when this command's reply opened a cursor (non-zero cursor.id) inside a UoW
  "errorCode":null,"errorLabels":null}      // on error: server code (or a client-side code name)
 ```
+
+`proxyId`, `member` and `serverConnectionId` are always present, `null` when the exporter could not
+determine them (§3.3); a record that leaves them out is malformed. `requestId`, `command`, `db` and
+`status` are required. `errorCode` is a number (server code) or a string (client-side code name).
 
 Note that `cmd` carries **no** collection, filter, values or reply content (I6):
 
@@ -375,10 +385,19 @@ Responses:
 
 * The collector holds an unmatched `op` for `joinWait`:
   * 2 s if the connection has no exporter marker;
-  * 10 s if it has one.
+  * 10 s if it has one;
+  * not at all while no exporter has sent anything for 10 minutes (nothing could join in the wait),
+    and never for hello-family commands (exporters skip handshakes and monitoring, §3.3).
 * It holds an unmatched `cmd` for 30 s.
 * Records that match after their counterpart was stored are **merged into the stored op**,
-  provided they arrive within 10 minutes. After that they're discarded and counted.
+  provided they arrive within 10 minutes of the op's arrival. After that they're discarded and
+  counted. The index of stored ops that a late `cmd` can still find is bounded by memory like
+  dedup (§6.4): 2^17 keys per partition by default, about 10 minutes below ~200 ops/s per partition.
+* Waiting is per arrival, not per event time: the windows run on the collector's clock, from
+  when each record arrived.
+* The waiting sets are bounded too (200,000 ops and 200,000 cmds by default, 03 §11). Past the
+  bound the op closest to its deadline is stored early, wire-only, and counted; a `cmd` that
+  arrives for it later still merges.
 
 ### 6.3 Validation
 
@@ -395,13 +414,14 @@ partition (~8 MiB). That covers the whole window below ~440 records/s per partit
 
 ### 6.5 Orphans
 
-* `cmd` records with `proxyId: null`, or with no matching `op` after 30 s, are counted per
-  `src` and contribute only to exporter-side statistics.
+* `cmd` records with `proxyId`, `member` or `serverConnectionId` null, or with no matching `op` after
+  30 s, are counted per `src` and contribute only to exporter-side statistics.
 * `op` records with no `cmd` are normal: they're simply wire-only.
 
 ## 7. Conformance
 
 Test vectors live in `docs/spec/vectors/ingest-v0/`. They are specified in 06 §3:
 
-* producers' encoders MUST round-trip them;
+* producers' encoders MUST round-trip them, and MUST NOT emit a field or JSON type their record
+  type's full example does not have (the proxy is checked this way on a real workload);
 * collectors MUST produce the documented joined output for each scenario file.

@@ -18,6 +18,7 @@
                 </select>
             </Field>
             <Field Label="min latency (ms)"><input class="input w-24" type="number" min="0" step="any" @bind="_minMs" /></Field>
+            @if (Uow != null) { <Field Label="unit of work"><span class="badge bg-accent/15 text-accent mono">@Uow <a href="@Nav.GetUriWithQueryParameter("uow", (string?)null)" title="clear">✕</a></span></Field> }
             <button class="btn" type="submit">Apply</button>
         </form>
         <div class="ml-auto flex items-center gap-2 text-ui-label-sm text-muted">
@@ -43,11 +44,11 @@
                         <td class="mono"><a href="ops/@o.Id" @onclick:stopPropagation>@o.Command</a></td>
                         <td class="mono">@o.Ns</td>
                         <td class="num">@Fmt.Us(o.ServerLatencyUs)</td>
-                        <td class="num text-muted" title="needs an exporter (M3)">–</td>
+                        <td class="num" title="@(o.PoolWaitUs is { } pw ? $"incl. {Fmt.Us(pw)} pool wait" : null)">@(o.Joined ? Fmt.Us(o.ClientUs) : "")</td>
                         <td class="num">@(o.NReturned?.ToString() ?? "")</td>
                         <td class="num">@Fmt.Bytes(o.RespBytes)</td>
                         <td><StatusBadge Status="@o.Status" /> @if (o.CodeName != null) { <span class="text-bad text-ui-label-sm">@o.CodeName</span> }</td>
-                        <td class="text-muted">–</td>
+                        <td>@if (o.UowName != null || o.UowId != null) { <a class="badge bg-accent/15 text-accent" href="?uow=@Uri.EscapeDataString(o.UowId ?? "")" title="@o.UowId" @onclick:stopPropagation>@(o.UowName ?? "uow")</a> }</td>
                         <td>@if (o.Alerts is { Length: > 0 } a) { <span class="badge bg-warn/15 text-warn" title="@string.Join(", ", a)">⚠ @a.Length</span> }</td>
                     </tr>
                 }
@@ -67,6 +68,7 @@
     [SupplyParameterFromQuery] public string? Command { get; set; }
     [SupplyParameterFromQuery] public string? Status { get; set; }
     [SupplyParameterFromQuery] public double? MinMs { get; set; }
+    [SupplyParameterFromQuery] public string? Uow { get; set; }
 
     private string? _app, _coll, _command, _status;
     private double? _minMs;
@@ -83,7 +85,7 @@
         (_app, _coll, _command, _status, _minMs) = (App, Coll, Command, Status, MinMs);
         var q = new List<string>();
         void Add(string k, string? v) { if (!string.IsNullOrWhiteSpace(v)) q.Add($"{k}={Uri.EscapeDataString(v)}"); }
-        Add("app", App); Add("coll", Coll); Add("command", Command); Add("status", Status);
+        Add("app", App); Add("coll", Coll); Add("command", Command); Add("status", Status); Add("uow", Uow);
         if (MinMs is > 0) q.Add($"minLatencyUs={(long)(MinMs * 1000)}");
         var query = string.Join('&', q);
         if (query == _query && _cts != null) return;
@@ -156,6 +158,7 @@
     private void Apply() => Nav.NavigateTo(Nav.GetUriWithQueryParameters(new Dictionary<string, object?>
     {
         ["app"] = Nullify(_app), ["coll"] = Nullify(_coll), ["command"] = Nullify(_command), ["status"] = Nullify(_status), ["minMs"] = _minMs is > 0 ? _minMs : null,
+        ["uow"] = Uow,
     }));
 
     private static string? Nullify(string? s) => string.IsNullOrWhiteSpace(s) ? null : s.Trim();

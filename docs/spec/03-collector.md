@@ -32,14 +32,25 @@ Implements 02 §6 exactly.
 ### 3.1 State
 
 Per partition, two maps keyed by `joinKey`: unmatched `op`s and unmatched `cmd`s, each with
-its expiry. Expired `op`s are finalized as wire-only. Expired `cmd`s become orphans.
+its expiry. Expired `op`s are finalized as wire-only. Expired `cmd`s become orphans. A third,
+bounded map holds the keys of finalized ops (02 §6.2), so a late `cmd` finds the stored op it
+merges into. Each map is a dictionary of structs plus a FIFO of keys per wait length, so expiry
+is O(expired) and nothing is allocated per op beyond the entries. Measured: 0.78 µs and 95 B per
+op + cmd pair (§11).
 
 ### 3.2 Waiting policy
 
 `joinWait` is 2 s by default, and 10 s when the `conn` record for that
-`(proxyId, member, serverConnectionId)` names an exporter. Finalized ops are visible in the
-live feed **immediately**: the UI shows the op at once and patches it in place when context
-arrives (SSE `op.updated`).
+`(proxyId, member, serverConnectionId)` names an exporter. Ops don't wait while no exporter has
+reported for 10 minutes, and hello-family ops never wait (02 §6.2).
+
+An op goes through the analysis stage **on arrival**, whether it waits or not: wire rules,
+aggregates, cursors, and the live feed see it at once (§11's live-feed latency holds with
+exporters). What waits is storage: the op is written when it is final (joined, or its wait ran
+out), so a joined op is written once. While it waits, `/ops/{id}` serves it from memory. When
+context arrives the live row is patched in place (SSE `op.updated`). Context for an op already
+stored (a late `cmd`) is an update that goes through the storage writer's FIFO behind the op's own
+append; stream replies that arrive after storage do the same.
 
 ### 3.3 Joined operation (the stored entity)
 
@@ -53,7 +64,7 @@ Operation {
   cmd (redacted BSON), cmdTruncated, seqDocs
   shapeHash, valueHash   // §4
   app, driver, member, lsid, txnNumber, comment
-  // from cmd (nullable)
+  // from cmd (nullable): the cmd record itself, stored as its NDJSON line next to the op's
   operationId, client_us, poolWait_us, attempt, uowId, uowName, traceparent, callsite
   // derived
   clientOverhead_us      // client_us − (respLast − reqFirst), clamped ≥ 0
@@ -120,8 +131,8 @@ The shape always includes `cmd` (command name), `db`, `coll`.
 
 | Command | Shape adds |
 |---|---|
-| `find` | `filter: normFilter`, `sort` (keys and directions kept), `projection` (keys and inclusion kept), `limit`/`skip`/`batchSize` presence as `"?"`, `hint` (kept), `collation.locale` (kept) |
-| `aggregate` | `pipeline`: per stage, `{<stageName>: normStage}`. `$match` → normFilter. `$sort`/`$project`/`$group._id` structure kept with leaves tagged. Accumulator operators kept. `$lookup` keeps `from`/`localField`/`foreignField`/`as` and normalizes its sub-pipeline. `$limit`/`$skip` → `"?"`. Unknown stages: leaves tagged. |
+| `find` | `filter: normFilter`, `sort` (keys, order and directions kept, as `[[key, dir], …]`), `projection` (keys and inclusion kept), `limit`/`skip`/`batchSize` presence as `"?"`, `hint` (kept; a key pattern as `[[key, dir], …]`), `collation.locale` (kept) |
+| `aggregate` | `pipeline`: per stage, `{<stageName>: normStage}`. `$match` → normFilter. `$sort` as `[[key, dir], …]`. `$project`: inclusion flags kept, expressions with leaves tagged. `$group._id` structure kept with leaves tagged. Accumulator operators kept. `$lookup` keeps `from`/`localField`/`foreignField`/`as` and normalizes its sub-pipeline. `$limit`/`$skip` → `"?"`. Unknown stages: leaves tagged. |
 | `update` | `updates[]` → per statement `{q: normFilter, u: <operator names → field names → tag>, upsert, multi}`. Pipeline-style `u` is normalized like an aggregate pipeline. Statements deduplicated by canonical form. |
 | `delete` | `deletes[]` → per statement `{q: normFilter, limit}` |
 | `findAndModify` | `query`, `sort`, `update` (as above), `remove`/`new`/`upsert` flags |
@@ -129,6 +140,16 @@ The shape always includes `cmd` (command name), `db`, `coll`.
 | `insert` | nothing beyond `coll`. The document count is a metric, not shape. |
 | `getMore` | the shape of the op that opened the cursor (§5.4), so getMores group with their originating query |
 | others | command name only |
+| auth commands (01 §9.1, sent as `{$redacted: name}`) | command name only, no valueHash |
+
+Key order is significant in a sort and an index key pattern, and the canonical form sorts document
+keys, so those are written as arrays of pairs. (M2: the shape vectors caught `sort {a:1, b:1}` and
+`sort {b:1, a:1}` grouping together, and `$project {x:1}` with `$project {x:0}`.)
+
+With the proxy on `values: shape` (01 §9.3) every leaf arrives as its tag, including the literals a
+shape keeps: sort directions, `$exists`/`$type` operands, projection flags, a delete's `limit`.
+Shapes then group more coarsely (`sort {ts: 1}` with `sort {ts: -1}`). That is the price of that
+mode; the vectors pin it (`shape/proxy-encodings.json`).
 
 ### 4.4 valueHash
 
@@ -175,7 +196,7 @@ Alert { id, rule, scope{shapeHash?, coll?, app?, member?, uowName?, callsite?}, 
 | `client-overhead` | yes | `clientOverhead_us > max(5 ms, 50% of client_us)` for ≥ 20% of a shape's ops over 1 min | (app, shapeHash) | — |
 | `error-burst` | no | > 5% failures for one `(app, command, coll)` over 1 min, with ≥ 20 ops. A failure is `ok:0`, or `ok:1` with write errors or a write-concern error | (app, command, coll, codeName) | — |
 | `unacknowledged-writes` | no | any `ack=false` write (info) | (app, coll) | — |
-| `exporter-skew` | yes | per `src`, \|clock skew\| > 1 s, or join conflicts > 0 | src | — |
+| `exporter-skew` | yes | per `src`, \|clock skew\| > 1 s, or join conflicts > 0 | src | skew = median of `cmd.ts − op.ts` over the last 64 joins (on one clock: minus the client→proxy latency, well under 1 ms on a LAN) |
 
 Notes from running these against real drivers (M1):
 
@@ -249,7 +270,7 @@ Buckets roll up to hourly after 48 h.
 | Aggregates, hour | 30 d | — |
 | Alerts | 30 d after resolve | — |
 | UoW summaries | 7 d | — |
-| Callsites | until unused for 30 d | — |
+| Callsites | until unused for 30 d (used = a joined op referenced it; refreshed hourly) | — |
 
 Writes are batched (≥ 500 rows or 250 ms per transaction). Under write backpressure, raw
 operations are sampled (keep every slow, errored or alerted op, plus 1/N of the rest)
@@ -261,8 +282,8 @@ Base path `/api/v1`. All endpoints require auth (§9) except `/healthz`.
 
 | Method & path | Purpose |
 |---|---|
-| `GET /ops?from&to&app&coll&command&shape&uow&status&minLatencyUs&limit&cursor` | Operation search, newest first, cursor-paginated |
-| `GET /ops/{id}` | Operation detail: command (EJSON), facts, timing waterfall, joined context, cursor, linked alerts |
+| `GET /ops?from&to&app&coll&command&shape&uow&status&minLatencyUs&limit&cursor` | Operation search, newest first, cursor-paginated. Joined ops carry `joined`, `client_us`, `poolWait_us`, `uowId`, `uowName`. |
+| `GET /ops/{id}` | Operation detail: command (EJSON), facts, timing waterfall, joined `context` (the cmd, `clientOverhead_us`, callsite frames), cursor, linked alerts. Also serves an op still waiting for its context. |
 | `GET /shapes?from&to&app&coll&sort=totalTime\|p95\|count\|errors` | Shape leaderboard with aggregates |
 | `GET /shapes/{hash}` | Shape detail: normalized shape, latency series, examples (slowest 10 plus latest 10), callsites |
 | `GET /uows?from&to&name&minOps&minTimeUs` | Units of work |
@@ -270,8 +291,8 @@ Base path `/api/v1`. All endpoints require auth (§9) except `/healthz`.
 | `GET /alerts?state=open\|resolved&rule` · `POST /alerts/{id}/mute` | Alerts |
 | `GET /cursors?state=open\|closed&reason` | Cursors |
 | `GET /connections` · `GET /apps` | Live connections and apps (from `conn` records) |
-| `GET /producers` | Proxies and exporters: version, last seen, drops, skew, join rate |
-| `GET /live?filter=…` | SSE stream: `op.created`, `op.updated`, `alert.opened`, `alert.updated` |
+| `GET /producers` | Proxies and exporters: version, last seen, drops, skew; per exporter `join {cmds, joined, orphans, conflicts, rate, skew_us}` |
+| `GET /live?app&coll&command&status&minLatencyUs&uow` | SSE stream: `op.created`, `op.updated`, `alert.opened`, `alert.updated` |
 | `POST /export?from&to&…` | NDJSON download of ops and alerts for offline sharing |
 | `GET /metrics` | collector self-telemetry (Prometheus) |
 
@@ -317,5 +338,5 @@ circuit state.
 |---|---|
 | Sustained ingest | 50k records/s on 4 vCPU |
 | Op visible in the live feed after the proxy flush | ≤ 1 s (p95) |
-| Join CPU per op | ≤ 5 µs |
+| Join CPU per op | ≤ 5 µs (measured: 0.78 µs per op + cmd pair, `JoinBenchTests`) |
 | Memory | bounded by configured queues plus UoW/join state limits; worst case logged at startup |

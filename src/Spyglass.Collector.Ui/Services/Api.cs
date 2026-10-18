@@ -12,7 +12,9 @@ namespace Spyglass.Collector.Ui.Services;
 public sealed record OpSummary(
     string Id, long Ts, string ProxyId, string Member, string? App, string Command, string? Db, string? Coll, string Status,
     [property: JsonPropertyName("serverLatency_us")] long? ServerLatencyUs, int? NReturned, int ReqBytes, int RespBytes,
-    string ShapeHash, int ReplyCount, string? CodeName, string[]? Alerts)
+    string ShapeHash, int ReplyCount, string? CodeName, string[]? Alerts, bool Joined = false,
+    [property: JsonPropertyName("client_us")] long? ClientUs = null, [property: JsonPropertyName("poolWait_us")] long? PoolWaitUs = null,
+    string? UowId = null, string? UowName = null)
 {
     public string Ns => Coll == null ? Db ?? "" : $"{Db}.{Coll}";
 }
@@ -31,10 +33,19 @@ public sealed record OpDetailDto(
     string? Db, string? Coll, string? App, string? Driver, string Status, bool Ack, bool Stream, int ReplyCount, int ReqBytes, int RespBytes,
     [property: JsonPropertyName("serverLatency_us")] long? ServerLatencyUs, Timings Timings, JsonElement? Reply, string? Lsid, long? TxnNumber,
     string? Comment, string ShapeHash, string? ValueHash, JsonElement? Shape, [property: JsonPropertyName("command_ejson")] string? CommandEjson,
-    bool CmdTruncated, Dictionary<string, int>? SeqDocs, string? Compressor, string[]? Alerts, CursorDto? Cursor)
+    bool CmdTruncated, Dictionary<string, int>? SeqDocs, string? Compressor, string[]? Alerts, CursorDto? Cursor, ContextDto? Context)
 {
     public string Ns => Coll == null ? Db ?? "" : $"{Db}.{Coll}";
 }
+
+public sealed record UowDto(string? Id, string? Name, string? Kind);
+public sealed record FrameDto(string Fn, string? File, int? Line);
+
+/// <summary>The joined exporter <c>cmd</c> (03 §3.3 "from cmd").</summary>
+public sealed record ContextDto(string Src, long Ts, string? OperationId, string Status,
+    [property: JsonPropertyName("client_us")] long? ClientUs, [property: JsonPropertyName("poolWait_us")] long? PoolWaitUs,
+    [property: JsonPropertyName("clientOverhead_us")] long? ClientOverheadUs, int? Attempt, UowDto? Uow, string? Traceparent,
+    string? Callsite, string? Lang, FrameDto[]? Frames, string? CursorId, string? ErrorCode, string[]? ErrorLabels);
 
 public sealed record AlertDto(string Id, string Rule, Dictionary<string, string> Scope, string Severity, string State, bool Muted,
     long FirstSeen, long LastSeen, long Occurrences, string[] SampleOpIds, string Summary, string? Details, long? ResolvedAt);
@@ -65,7 +76,11 @@ public sealed record ShapeDetail(string ShapeHash, string Command, string? Db, s
 }
 
 public sealed record ProducerDto(string Src, string Kind, string? Version, int Schema, string? Topology, string? SetName, JsonElement Members,
-    string? Values, string? Compression, long FirstSeen, long LastSeen, long Records, long Rejected, long ClockSkewed, Dictionary<string, long> Dropped);
+    string? Values, string? Compression, long FirstSeen, long LastSeen, long Records, long Rejected, long ClockSkewed, Dictionary<string, long> Dropped,
+    string? Runtime = null, string? Driver = null, string? Host = null, long? Pid = null, string? App = null, string? AppVersion = null, JoinDto? Join = null);
+
+/// <summary>02 §6 per exporter.</summary>
+public sealed record JoinDto(long Cmds, long Joined, long Orphans, long Conflicts, double? Rate, [property: JsonPropertyName("skew_us")] long? SkewUs);
 
 /// <summary>Talks only to <c>/api/v1</c> on the page's own origin (03 §10). A 401 sends the user to the login page.</summary>
 public sealed class Api(HttpClient http, NavigationManager nav)

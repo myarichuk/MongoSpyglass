@@ -15,7 +15,7 @@ spyglass-proxy … --collector.endpoint http://collector:8080/ingest/v0 --collec
 |---|---|---|
 | §1 pipeline | ✅ | HTTP ingest → stage 1 partitions by `(proxyId, member, serverConnectionId)` → stage 2 analysis thread → storage writer. Bounded ingest queue (256 MiB; 429 above 90 %). One hand-off per ingested batch per partition. |
 | §2 validation | ✅ | required fields and JSON types per 02 §4; unknown types ignored, unknown fields kept (`extra`); future `ts` clamped and counted per src |
-| §3 join | ⏳ M2 | wire-only: ops finalize on arrival. Exporter records are accepted and counted (`context_deferred`). The join slots into stage 1. |
+| §3 join | ✅ M2 | see `STATUS-M2.md` |
 | §4 shapes, valueHash | ✅ | all §4.1–§4.4 rules; understands the proxy's encodings (`values: shape` tags, truncated strings, `{$binData}` stubs, capped arrays with `{$more}`) |
 | §5.2 wire-only rules | ✅ | slow-shape (threshold + p95 regression), n-plus-one-suspected, repeated-query, unbounded-scan, large-result, unbounded-in, cursor-abandoned, error-burst, unacknowledged-writes. Exporter rules: M2/M3. |
 | §5.4 cursors | ✅ | keyed by `(proxyId, member, cursorId)` across connections; exhausted / killed / server-expired / timed-out; getMore inherits the opening shape |
@@ -91,7 +91,7 @@ alerted op; the aggregates stay complete).
 
 ## Open
 
-1. M2: the join (02 §6) in stage 1, exporter records, join metrics.
+1. ~~M2: the join~~: done, `STATUS-M2.md`.
 2. Analysis throughput on dedicated cores. The next costs are allocation (~9 KB/record end to
    end) and SQLite writes.
 3. A container image (the publish script produces the directory it would copy). Not built here:

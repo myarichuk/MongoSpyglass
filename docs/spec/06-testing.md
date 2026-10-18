@@ -100,6 +100,24 @@ Directory `docs/spec/vectors/ingest-v0/` (created as part of M2):
 | `join/*.json` | Scenarios: interleaved `op`/`cmd` arrival orders, late `cmd` (merge into stored op), duplicate `cmd`, conflicting `command` (no join), `proxyId:null` orphan, proxy restart (new proxyId) with reused serverConnectionId. Each file holds `input` (records in arrival order with arrival times) and `expected` (stored operations after quiescence). |
 | `shape/*.json` | Commands → expected `shape` and `shapeHash` (03 §4), covering every row of 03 §4.3 and every operator rule of 03 §4.2. |
 
+The formats, as built in M2:
+
+* `join/*.json`: `{description, input: [{at_ms, record}], expected: {ops: [{proxyId, member,
+  serverConnectionId, requestId, joined: {src, operationId} | null, replyCount?}], counters?}}`.
+  `at_ms` is the arrival time on the collector's clock. The runner ingests each record at its time,
+  drains every stage, then runs the clock a minute past the last record. `ops` is the complete set
+  of stored operations. `counters` names the 02 §6 outcomes that must match (`joined`, `joined_late`,
+  `conflict`, `orphan_no_key`, `orphan_expired`, `late_discarded`, `already_joined`, `duplicate`).
+  The collector runs every scenario against the in-memory store and SQLite.
+* `shape/*.json`: `{description, cases: [{name, rule, command, db, coll, cmd | cmdHex, values?,
+  cmdTruncated?, expected: {shape, shapeHash, valueHash, inCardinality}}]}`. `cmd` is Extended JSON;
+  `cmdHex` is raw BSON for what Extended JSON cannot express (`{$regex: "…", $options: "…"}` reads
+  as a regex literal). `shape` is the canonical form as a JSON tree: serialized compactly, it is the
+  hashed bytes. `grouping.json` lists pairs that must share a `shapeHash` or must not.
+  `SPYGLASS_WRITE_SHAPE_VECTORS=1` fills `expected` from the implementation; a new case is read
+  against 03 §4 before it is committed.
+* `records/<type>.ndjson`: line 1 is the full example, line 2 the minimal one.
+
 ## 4. Performance gates
 
 The A/B harness is the evolution of `tools/ReviewHarness`:
