@@ -32,6 +32,8 @@ public sealed class ReplyFacts
 
 public sealed class OpRecord : Record
 {
+    /// <summary>The NDJSON line as received: what the SQLite store keeps (03 §2: unknown fields survive).</summary>
+    public byte[]? Raw;
     public string Member = "";
     public long? ServerConnectionId;
     public int RequestId;

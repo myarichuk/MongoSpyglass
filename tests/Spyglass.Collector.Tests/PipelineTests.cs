@@ -7,23 +7,43 @@ using static Spyglass.Collector.Tests.Records;
 
 namespace Spyglass.Collector.Tests;
 
+/// <summary>The pipeline suite against SQLite (03 §7 v1 store).</summary>
+public sealed class SqlitePipelineTests : PipelineTests
+{
+    private readonly string _dir = Path.Combine(Path.GetTempPath(), "spyglass-collector-" + Guid.NewGuid().ToString("N")[..8]);
+    protected override object CreateStore() => new SqliteStore(_dir);
+    public override async ValueTask DisposeAsync()
+    {
+        await base.DisposeAsync();
+        ((IDisposable)Store).Dispose();
+        try { Directory.Delete(_dir, true); } catch (IOException) { }
+    }
+}
+
 /// <summary>03 §1–§6 through <see cref="Collector.Ingest"/> with an in-memory store and a controllable clock.</summary>
-public sealed class PipelineTests : IAsyncLifetime
+public class PipelineTests : IAsyncLifetime
 {
     private long _now = T0 + 1_000_000;
     private Collector _c = null!;
-    private MemoryStore _store = null!;
+    private IOperationStore _store = null!;
+    private IAggregateStore _agg = null!;
+
+    protected virtual object CreateStore() => new MemoryStore();
+    protected object Store = null!;
 
     public ValueTask InitializeAsync()
     {
         var o = new CollectorOptions { IngestInsecure = true, Auth = AuthMode.None, Data = null, Workers = 3 };
-        _store = new MemoryStore();
-        _c = new Collector(o, _store, _store, _store, () => Volatile.Read(ref _now));
+        var store = CreateStore();
+        Store = store;
+        _store = (IOperationStore)store;
+        _agg = (IAggregateStore)store;
+        _c = new Collector(o, _store, _agg, (IAlertStore)store, () => Volatile.Read(ref _now));
         _c.Start();
         return ValueTask.CompletedTask;
     }
 
-    public async ValueTask DisposeAsync() => await _c.DisposeAsync();
+    public virtual async ValueTask DisposeAsync() => await _c.DisposeAsync();
 
     private async Task<IngestResult> Send(params string[] lines)
     {
@@ -62,9 +82,9 @@ public sealed class PipelineTests : IAsyncLifetime
         Assert.True(sub.Reader.TryRead(out var ev));
         Assert.Equal("op.created", ev.Name);
         Assert.Contains("\"app\":\"orders-api\"", Encoding.UTF8.GetString(ev.Payload));
-        var shape = Assert.Single(_store.Shapes());
+        var shape = Assert.Single(_agg.Shapes());
         Assert.Equal(op.ShapeHash, shape.ShapeHash);
-        var bucket = Assert.Single(_store.Buckets(0, long.MaxValue));
+        var bucket = Assert.Single(_agg.Buckets(0, long.MaxValue));
         Assert.Equal(1, bucket.Count);
     }
 

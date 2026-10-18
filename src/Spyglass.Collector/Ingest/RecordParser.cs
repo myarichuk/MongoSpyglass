@@ -39,7 +39,8 @@ public static class RecordParser
             if (r == null)
                 return ParseResult.Ignored;
             Fill(line, r);
-            r.Size = line.Length + 256;
+            if (r is OpRecord op) op.Raw = line.ToArray();
+            r.Size = (r is OpRecord ? 2 * line.Length : line.Length) + 256; // parsed fields + the raw line
             record = r;
             return ParseResult.Ok;
         }

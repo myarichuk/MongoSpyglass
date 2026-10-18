@@ -229,7 +229,6 @@ public sealed class Collector : IAsyncDisposable
         _analysis.Complete();
         _analysis.Join();
         _writer.Complete();
-        _writer.Join();
-        (Ops as IDisposable)?.Dispose();
+        _writer.Join(); // the stores belong to whoever created them
     }
 }

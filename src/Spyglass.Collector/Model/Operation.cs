@@ -36,6 +36,16 @@ public static class Ulid
 {
     private const string Alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
+    /// <summary>The smallest (or largest) ULID of millisecond <paramref name="unixMs"/>: time ranges as key ranges.</summary>
+    public static string Bound(long unixMs, bool low)
+    {
+        Span<char> c = stackalloc char[26];
+        var t = (ulong)Math.Max(0, unixMs);
+        for (var i = 9; i >= 0; i--) { c[i] = Alphabet[(int)(t & 31)]; t >>= 5; }
+        c[10..].Fill(low ? '0' : 'Z');
+        return new string(c);
+    }
+
     public static string New(long unixMs)
     {
         Span<byte> b = stackalloc byte[16];
