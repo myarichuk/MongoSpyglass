@@ -24,6 +24,8 @@ var latencyOps = int.Parse(opts.GetValueOrDefault("latencyOps") ?? "20000");
 var throughputSeconds = int.Parse(opts.GetValueOrDefault("seconds") ?? "8");
 var modes = (opts.GetValueOrDefault("modes") ?? "direct,bare,observe,export").Split(',');
 // e.g. --proxyEnv DOTNET_SYSTEM_NET_SOCKETS_INLINE_COMPLETIONS=1;DOTNET_ThreadPool_UnfairSemaphoreSpinLimit=0
+// --trace <dir>: CPU-sample the proxy (dotnet-trace, cpu-sampling) over each throughput window
+var traceDir = opts.GetValueOrDefault("trace");
 var proxyEnv = (opts.GetValueOrDefault("proxyEnv") ?? "").Split(';', StringSplitOptions.RemoveEmptyEntries)
     .Select(kv => kv.Split('=', 2)).ToDictionary(kv => kv[0], kv => kv[1]);
 
@@ -70,7 +72,7 @@ for (var r = 0; r < rounds; r++)
 
         try
         {
-            var result = await RunMode(mode, port, metricsPort);
+            var result = await RunMode(mode, port, metricsPort, proxy?.Id, r);
             result["round"] = r;
             results.Add(result);
             Console.WriteLine(string.Join("  ", result.Select(kv => $"{kv.Key}={Fmt(kv.Value)}")));
@@ -114,7 +116,7 @@ return 0;
 
 // ---------------------------------------------------------------------------------------
 
-async Task<Dictionary<string, object>> RunMode(string mode, int port, int? metricsPort)
+async Task<Dictionary<string, object>> RunMode(string mode, int port, int? metricsPort, int? proxyPid, int round)
 {
     var settings = MongoClientSettings.FromConnectionString($"mongodb://127.0.0.1:{port}/?directConnection=true&maxPoolSize=64");
     var client = new MongoClient(settings);
@@ -137,6 +139,15 @@ async Task<Dictionary<string, object>> RunMode(string mode, int port, int? metri
 
     // 2. throughput, 32 concurrent clients; proxy CPU and allocation over the same window
     var before = metricsPort is { } mp ? await Scrape(mp) : null;
+    Process? trace = null;
+    if (traceDir != null && proxyPid is { } pid)
+    {
+        Directory.CreateDirectory(traceDir);
+        var tool = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dotnet", "tools", "dotnet-trace");
+        trace = Start(tool, new Dictionary<string, string> { ["DOTNET_ROOT"] = Path.GetDirectoryName(Environment.ProcessPath)! },
+            ["collect", "-p", pid.ToString(), "--profile", "dotnet-sampled-thread-time", "--duration", TimeSpan.FromSeconds(Math.Max(1, throughputSeconds - 2)).ToString(@"hh\:mm\:ss"),
+             "-o", Path.Combine(traceDir, $"{mode}-r{round}.nettrace")]);
+    }
     long ops = 0;
     using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(throughputSeconds));
     var sw = Stopwatch.StartNew();
@@ -151,6 +162,11 @@ async Task<Dictionary<string, object>> RunMode(string mode, int port, int? metri
     }));
     var elapsed = sw.Elapsed.TotalSeconds;
     var after = metricsPort is { } mp2 ? await Scrape(mp2) : null;
+    if (trace != null)
+    {
+        await trace.WaitForExitAsync();
+        trace.Dispose();
+    }
 
     // 3. ~4 MiB single reply: 1024 × 4 KB in one batch
     var bigMs = new List<double>();

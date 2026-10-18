@@ -1,6 +1,7 @@
+using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
-using System.Threading.Channels;
+using System.Collections.Concurrent;
 using Spyglass.Proxy.Config;
 using Spyglass.Proxy.Diagnostics;
 using Spyglass.Proxy.Export;
@@ -29,7 +30,7 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
     private readonly Counter _noSlot, _pendingEvicted, _exportDropped, _tapFault, _observerFault, _uncorrelated;
 
     /// <summary>Test hook: every record line, after serialization (headless mode included).</summary>
-    internal Action<byte[]>? RecordTap { get; set; }
+    internal RecordSink? RecordTap { get; set; }
 
     public Observer(ProxyServer server)
     {
@@ -62,11 +63,12 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
 
         _workers = new Worker[Math.Max(1, Environment.ProcessorCount / 2)];
         for (var i = 0; i < _workers.Length; i++)
-            _workers[i] = new Worker(this);
+            _workers[i] = new Worker(this, m.ObserverBusy.WithLabels(i.ToString(System.Globalization.CultureInfo.InvariantCulture)));
     }
 
     public bool BuildsRecords => _sender != null || RecordTap != null;
     internal CapturePool Pool => _pool;
+    internal CollectorSender? Sender => _sender;
     internal CursorRegistry Cursors => _cursors;
 
     public void Start()
@@ -92,12 +94,6 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
     private Worker WorkerFor(ConnectionContext c) => _workers[(int)(c.ConnSeq % _workers.Length)];
 
     // ---- records ---------------------------------------------------------------------------
-
-    private void Emit(byte[] line)
-    {
-        RecordTap?.Invoke(line);
-        _sender?.Enqueue(line);
-    }
 
     private byte[] ProxyRecord()
     {
@@ -128,7 +124,7 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
         j.WriteString("values", _config.Capture.Values.ToString().ToLowerInvariant());
         j.WriteNumber("commandBytes", _config.Capture.CommandBytes);
         j.WriteEndObject();
-        return rw.End();
+        return rw.End().ToArray();
     }
 
     private byte[] StatsRecord()
@@ -145,7 +141,7 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
         j.WriteNumber("records", Interlocked.Read(ref _sender!.SentRecords));
         j.WriteNumber("batches", Interlocked.Read(ref _sender.SentBatches));
         j.WriteEndObject();
-        return rw.End();
+        return rw.End().ToArray();
     }
 
     public async ValueTask DisposeAsync()
@@ -177,23 +173,38 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
     private sealed class Worker
     {
         private readonly Observer _o;
-        private readonly Channel<ObserverItem> _channel = Channel.CreateUnbounded<ObserverItem>(new UnboundedChannelOptions { SingleReader = true });
+        // Pumps post with one CAS and no lock (an unbounded Channel<T> takes its sync lock on every write, and the
+        // pumps contended with the worker on it), and almost never wake the worker: a wake is a futex call on the
+        // pump thread, and below saturation the worker is asleep at nearly every post. Observation is not latency
+        // sensitive (records are batched for collector.flushIntervalMs anyway), so the worker sleeps on a short
+        // timer and a pump wakes it only every WakeEvery posts, which bounds the queue (and the pool charge) in a burst.
+        private const int MinSleepMs = 1, MaxSleepMs = 10, WakeEvery = 64;
+        private readonly ConcurrentQueue<ObserverItem> _queue = new();
+        private readonly SemaphoreSlim _wake = new(0);
+        private int _sleeping;
+        private int _sleepMs = MinSleepMs;
+        private int _posts; // racy on purpose: a lost increment only shifts when a wake happens
+        private volatile bool _completed;
+        private readonly TaskCompletionSource _done = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly Dictionary<long, ObservedConnection> _conns = new();
         private readonly RecordWriter _rw = new();
+        private readonly RecordBuffer? _out;
         // Per worker: a Regex shared between threads re-creates its runner (and its backtracking stacks)
         // whenever two matches overlap; a private instance reuses one runner forever.
-        private readonly Redactor _redactor;
+        private readonly RequestParser _parser;
         // Metric children resolved once per label set; the families' params-array/string.Join lookup is not
         // something to pay per op.
         private readonly Dictionary<(string, string, string?, string, string), Histogram> _duration = new();
         private readonly Dictionary<(string, string, string?, string), (Histogram Bytes, Histogram Docs)> _sizes = new();
         private readonly Dictionary<(string, string, string?, string, string), Counter> _errors = new();
-        private Task _loop = Task.CompletedTask;
+        private readonly Counter _busy;
 
-        public Worker(Observer o)
+        public Worker(Observer o, Counter busy)
         {
             _o = o;
-            _redactor = new Redactor(o._config.Capture);
+            _busy = busy;
+            _out = o._sender?.CreateBuffer();
+            _parser = new RequestParser(new Redactor(o._config.Capture), o._config.Compression);
         }
 
         private Histogram Duration(string cmd, string db, string? coll, string app, string status)
@@ -221,41 +232,111 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
             return _errors[(cmd, db, coll, app, codeName)] = c;
         }
 
-        public Task Completion => _loop;
+        public Task Completion => _done.Task;
 
-        public void Start() => _loop = Task.Factory.StartNew(LoopAsync, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+        private void Emit()
+        {
+            var line = _rw.End();
+            _o.RecordTap?.Invoke(line);
+            _out?.Append(line);
+        }
+
+        public void Start() => new Thread(Loop) { IsBackground = true, Name = "spyglass-observer" }.Start();
 
         public void Post(in ObserverItem item)
         {
-            if (!_channel.Writer.TryWrite(item) && item.Frame != null)
-                _o._pool.Return(item.Frame); // completed: shutting down
+            if (_completed)
+            {
+                if (item.Frame != null) _o._pool.Return(item.Frame); // shutting down
+                return;
+            }
+            _queue.Enqueue(item); // interlocked: a full fence before the read below
+            if ((++_posts & (WakeEvery - 1)) == 0 && Volatile.Read(ref _sleeping) == 1 && Interlocked.Exchange(ref _sleeping, 0) == 1)
+                _wake.Release();
         }
 
-        public void Complete() => _channel.Writer.TryComplete();
-
-        private async Task LoopAsync()
+        public void Complete()
         {
-            var reader = _channel.Reader;
-            while (await reader.WaitToReadAsync().ConfigureAwait(false))
+            _completed = true;
+            if (Interlocked.Exchange(ref _sleeping, 0) == 1)
+                _wake.Release();
+        }
+
+        /// <summary>
+        /// Sleeps until the timer or a wake. Whoever lowers the flag (a poster, <see cref="Complete"/>, or this
+        /// thread on timeout) owns it; a release that lands after a timeout only makes the next sleep short.
+        /// </summary>
+        private void Sleep(bool hadWork)
+        {
+            _sleepMs = hadWork ? MinSleepMs : Math.Min(MaxSleepMs, _sleepMs * 2);
+            Interlocked.Exchange(ref _sleeping, 1);
+            if (_completed && Interlocked.Exchange(ref _sleeping, 0) == 1)
+                return;
+            if (!_wake.Wait(_sleepMs))
+                Interlocked.Exchange(ref _sleeping, 0);
+        }
+
+        private long _busyCarry; // sub-µs remainder, in Stopwatch ticks: drains of one op are a few µs
+
+        private void AddBusy(long ticks)
+        {
+            ticks += _busyCarry;
+            var us = ticks * 1_000_000 / Stopwatch.Frequency;
+            _busyCarry = ticks - us * Stopwatch.Frequency / 1_000_000;
+            _busy.Add(us);
+        }
+
+        private void Loop()
+        {
+            try
             {
-                while (reader.TryRead(out var item))
+                while (true)
                 {
-                    try
+                    var hadWork = Drain();
+                    if (_completed)
                     {
-                        Handle(item);
+                        Drain(); // posts that raced with Complete
+                        return;
                     }
-                    catch (Exception e)
-                    {
-                        _o._observerFault.Inc();
-                        Log.Warn($"observer: {e.GetType().Name}: {e.Message}");
-                    }
-                    finally
-                    {
-                        if (item.Frame != null)
-                            _o._pool.Return(item.Frame);
-                    }
+                    Sleep(hadWork);
                 }
             }
+            finally
+            {
+                _done.TrySetResult();
+            }
+        }
+
+        private bool Drain()
+        {
+            if (_queue.IsEmpty) return false;
+            var t0 = Stopwatch.GetTimestamp();
+            var n = 0;
+            while (_queue.TryDequeue(out var item))
+            {
+                if (++n % 1024 == 0) // a queue that never drains still reports
+                {
+                    var t = Stopwatch.GetTimestamp();
+                    AddBusy(t - t0);
+                    t0 = t;
+                }
+                try
+                {
+                    Handle(item);
+                }
+                catch (Exception e)
+                {
+                    _o._observerFault.Inc();
+                    Log.Warn($"observer: {e.GetType().Name}: {e.Message}");
+                }
+                finally
+                {
+                    if (item.Frame != null)
+                        _o._pool.Return(item.Frame);
+                }
+            }
+            AddBusy(Stopwatch.GetTimestamp() - t0);
+            return true;
         }
 
         private void Handle(in ObserverItem item)
@@ -279,7 +360,7 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
 
         private void OnRequest(ObservedConnection conn, FrameCapture f)
         {
-            var req = RequestParser.Parse(f, _o.BuildsRecords ? _redactor : null, _o._config.Compression);
+            var req = _parser.Parse(f, records: _o.BuildsRecords);
             if (req.IsHello && req.Client != null && conn.Client == null)
                 conn.Client = req.Client;
 
@@ -288,6 +369,7 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
                 // unacknowledged write (w:0): complete now, no reply will come (01 §7)
                 EmitOpenIfNeeded(conn);
                 CompleteOp(conn, req, null, status: "unacknowledged");
+                _parser.Return(req);
                 return;
             }
 
@@ -296,9 +378,12 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
                 // Only reachable when a client pipelines past the bound (drivers don't): O(n) scan is fine here
                 // and keeps the common path free of any ordering structure.
                 var oldest = conn.Pending.MinBy(kv => kv.Value.TFirst).Key;
-                conn.Pending.Remove(oldest);
+                conn.Pending.Remove(oldest, out var evicted);
+                _parser.Return(evicted!);
                 _o._pendingEvicted.Inc();
             }
+            if (conn.Pending.Remove(req.RequestId, out var reused)) // a client reusing an id it never got a reply for
+                _parser.Return(reused);
             conn.Pending[req.RequestId] = req;
         }
 
@@ -312,6 +397,8 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
                 if (moreToCome)
                     conn.Streams[f.RequestId] = stream;
                 OnStreamReply(conn, stream, f);
+                if (!moreToCome)
+                    _parser.Return(stream.Request); // the stream ended
                 return;
             }
 
@@ -326,6 +413,8 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
 
             EmitOpenIfNeeded(conn);
             CompleteOp(conn, req, f, status: null, stream: moreToCome);
+            if (!moreToCome)
+                _parser.Return(req); // else the stream holds it
         }
 
         private void OnClosed(ConnectionContext ctx, CloseReason reason, string? detail)
@@ -337,17 +426,24 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
             }
             EmitOpenIfNeeded(conn);
             foreach (var req in conn.Pending.Values.OrderBy(r => r.TFirst))
+            {
                 CompleteOp(conn, req, null, status: "connection_closed");
+                _parser.Return(req);
+            }
+            conn.Pending.Clear();
+            foreach (var st in conn.Streams.Values)
+                _parser.Return(st.Request);
+            conn.Streams.Clear();
 
             if (!_o.BuildsRecords) return;
             var j = _rw.Begin("conn", Clock.NowUnixMicros(), _o._src);
             WriteConnFields(j, conn, "close");
-            j.WriteString("closeReason", reason.Wire());
+            j.WriteString(J.closeReason, reason.Wire());
             if (detail != null && reason == CloseReason.InvalidFrame)
-                j.WriteString("invalidHeader", detail);
-            j.WriteNumber("bytesIn", Volatile.Read(ref ctx.BytesFromClient));
-            j.WriteNumber("bytesOut", Volatile.Read(ref ctx.BytesFromServer));
-            _o.Emit(_rw.End());
+                j.WriteString(J.invalidHeader, detail);
+            j.WriteNumber(J.bytesIn, Volatile.Read(ref ctx.BytesFromClient));
+            j.WriteNumber(J.bytesOut, Volatile.Read(ref ctx.BytesFromServer));
+            Emit();
         }
 
         private void EmitOpenIfNeeded(ObservedConnection conn)
@@ -357,25 +453,25 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
             if (!_o.BuildsRecords) return;
             var j = _rw.Begin("conn", Clock.NowUnixMicros(), _o._src);
             WriteConnFields(j, conn, "open");
-            _o.Emit(_rw.End());
+            Emit();
         }
 
         private void WriteConnFields(Utf8JsonWriter j, ObservedConnection conn, string ev)
         {
             var ctx = conn.Ctx;
-            j.WriteString("event", ev);
-            j.WriteString("proxyId", _o._src);
-            j.WriteString("member", ctx.Member.Advertised);
-            j.WriteNumber("connSeq", ctx.ConnSeq);
-            j.WriteNumberOrNull("serverConnectionId", ctx.ServerConnectionId);
-            j.WriteString("client", ctx.ClientEndpoint);
-            j.WriteBoolean("tls", ctx.ClientTls);
-            j.WriteStringOrNull("app", conn.Client?.Application);
-            j.WriteStringOrNull("driver", conn.Client?.Driver);
-            j.WriteStringOrNull("driverVersion", conn.Client?.DriverVersion);
-            j.WriteStringOrNull("exporter", conn.Client?.Exporter);
-            j.WriteStringOrNull("os", conn.Client?.OsType);
-            j.WriteStringOrNull("platform", conn.Client?.Platform);
+            j.WriteString(J.@event, ev);
+            j.WriteString(J.proxyId, _o._src);
+            j.WriteString(J.member, ctx.Member.Advertised);
+            j.WriteNumber(J.connSeq, ctx.ConnSeq);
+            j.WriteNumberOrNull(J.serverConnectionId, ctx.ServerConnectionId);
+            j.WriteString(J.client, ctx.ClientEndpoint);
+            j.WriteBoolean(J.tls, ctx.ClientTls);
+            j.WriteStringOrNull(J.app, conn.Client?.Application);
+            j.WriteStringOrNull(J.driver, conn.Client?.Driver);
+            j.WriteStringOrNull(J.driverVersion, conn.Client?.DriverVersion);
+            j.WriteStringOrNull(J.exporter, conn.Client?.Exporter);
+            j.WriteStringOrNull(J.os, conn.Client?.OsType);
+            j.WriteStringOrNull(J.platform, conn.Client?.Platform);
         }
 
         private void CompleteOp(ObservedConnection conn, RequestInfo req, FrameCapture? reply, string? status, bool stream = false)
@@ -397,7 +493,7 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
                     sizes.Docs.Observe(nr);
                 if (status == "error")
                 {
-                    var codeName = facts.CodeNameLength >= 0 ? Encoding.UTF8.GetString(facts.CodeName, 0, facts.CodeNameLength) : facts.Code?.ToString() ?? "";
+                    var codeName = facts.CodeNameLength >= 0 ? _parser.Names.Get(facts.CodeName.AsSpan(0, facts.CodeNameLength)) : facts.Code?.ToString() ?? "";
                     Error(req.Command, db, req.Coll, app, codeName).Inc();
                 }
                 TrackCursors(member, req, facts);
@@ -408,55 +504,55 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
             // ---- op record (02 §4.2) ----
             var ts = Clock.ToUnixMicros(req.TFirst);
             var j = _rw.Begin("op", ts, _o._src);
-            j.WriteString("proxyId", _o._src);
-            j.WriteString("member", member);
-            j.WriteNumberOrNull("serverConnectionId", conn.Ctx.ServerConnectionId);
-            j.WriteNumber("requestId", req.RequestId);
-            j.WriteNumber("connSeq", conn.Ctx.ConnSeq);
-            j.WriteString("opCode", OpCodes.Name(req.OpCode));
-            j.WriteString("command", req.Command);
-            j.WriteStringOrNull("db", req.Db);
-            j.WriteStringOrNull("coll", req.Coll);
-            j.WriteBoolean("ack", !req.MoreToCome);
-            j.WriteBoolean("stream", stream);
-            j.WriteNumber("replyCount", reply != null ? 1 : 0);
-            j.WriteString("status", status);
-            j.WriteNumber("reqBytes", req.FrameLength);
-            j.WriteNumber("respBytes", reply?.FrameLength ?? 0);
-            j.WriteStartObject("t");
-            j.WriteNumber("reqFirst_us", 0);
-            j.WriteNumber("reqLast_us", Clock.Micros(req.TFirst, req.TLast));
+            j.WriteString(J.proxyId, _o._src);
+            j.WriteString(J.member, member);
+            j.WriteNumberOrNull(J.serverConnectionId, conn.Ctx.ServerConnectionId);
+            j.WriteNumber(J.requestId, req.RequestId);
+            j.WriteNumber(J.connSeq, conn.Ctx.ConnSeq);
+            j.WriteString(J.opCode, OpCodes.Name(req.OpCode));
+            j.WriteString(J.command, req.Command);
+            j.WriteStringOrNull(J.db, req.Db);
+            j.WriteStringOrNull(J.coll, req.Coll);
+            j.WriteBoolean(J.ack, !req.MoreToCome);
+            j.WriteBoolean(J.stream, stream);
+            j.WriteNumber(J.replyCount, reply != null ? 1 : 0);
+            j.WriteString(J.status, status);
+            j.WriteNumber(J.reqBytes, req.FrameLength);
+            j.WriteNumber(J.respBytes, reply?.FrameLength ?? 0);
+            j.WriteStartObject(J.t);
+            j.WriteNumber(J.reqFirst_us, 0);
+            j.WriteNumber(J.reqLast_us, Clock.Micros(req.TFirst, req.TLast));
             if (reply != null)
             {
-                j.WriteNumber("respFirst_us", Clock.Micros(req.TFirst, reply.TFirst));
-                j.WriteNumber("respLast_us", Clock.Micros(req.TFirst, reply.TLast));
+                j.WriteNumber(J.respFirst_us, Clock.Micros(req.TFirst, reply.TFirst));
+                j.WriteNumber(J.respLast_us, Clock.Micros(req.TFirst, reply.TLast));
             }
             j.WriteEndObject();
             if (reply != null)
-                j.WriteNumber("serverLatency_us", Math.Max(0, Clock.Micros(req.TLast, reply.TFirst)));
+                j.WriteNumber(J.serverLatency_us, Math.Max(0, Clock.Micros(req.TLast, reply.TFirst)));
             else
-                j.WriteNull("serverLatency_us");
+                j.WriteNull(J.serverLatency_us);
 
             if (facts != null)
                 WriteReply(j, facts, req.IsRedactedCommand);
             else
-                j.WriteNull("reply");
+                j.WriteNull(J.reply);
 
-            j.WriteStringOrNull("lsid", req.Lsid);
-            j.WriteNumberOrNull("txnNumber", req.TxnNumber);
-            j.WriteStringOrNull("comment", req.Comment);
-            if (req.RedactedCommand != null)
-                j.WriteBase64String("cmd", req.RedactedCommand);
-            j.WriteBoolean("cmdTruncated", req.CommandTruncated);
-            if (req.SeqDocs is { Count: > 0 })
+            j.WriteStringOrNull(J.lsid, req.Lsid);
+            j.WriteNumberOrNull(J.txnNumber, req.TxnNumber);
+            j.WriteStringOrNull(J.comment, req.Comment);
+            if (req.HasRedactedCommand)
+                j.WriteBase64String(J.cmd, req.RedactedCommand);
+            j.WriteBoolean(J.cmdTruncated, req.CommandTruncated);
+            if (req.SeqDocs.Count > 0)
             {
-                j.WriteStartObject("seqDocs");
+                j.WriteStartObject(J.seqDocs);
                 foreach (var (id, n) in req.SeqDocs) j.WriteNumber(id, n);
                 j.WriteEndObject();
             }
             if (req.Compressor != null)
-                j.WriteString("compressor", req.Compressor);
-            _o.Emit(_rw.End());
+                j.WriteString(J.compressor, req.Compressor);
+            Emit();
         }
 
         private void OnStreamReply(ObservedConnection conn, StreamState s, FrameCapture f)
@@ -469,18 +565,18 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
 
             if (!_o.BuildsRecords) return;
             var j = _rw.Begin("stream", Clock.ToUnixMicros(f.TFirst), _o._src);
-            j.WriteString("proxyId", _o._src);
-            j.WriteString("member", member);
-            j.WriteNumberOrNull("serverConnectionId", conn.Ctx.ServerConnectionId);
-            j.WriteNumber("requestId", req.RequestId);
-            j.WriteNumber("seq", s.Seq);
-            j.WriteNumber("respBytes", f.FrameLength);
-            j.WriteStartObject("reply");
-            if (f.Facts.CursorId is { } id) j.WriteString("cursorId", id.ToString());
-            j.WriteNumberOrNull("nReturned", f.Facts.NReturned);
-            j.WriteNumberOrNull("ok", f.Facts.Ok);
+            j.WriteString(J.proxyId, _o._src);
+            j.WriteString(J.member, member);
+            j.WriteNumberOrNull(J.serverConnectionId, conn.Ctx.ServerConnectionId);
+            j.WriteNumber(J.requestId, req.RequestId);
+            j.WriteNumber(J.seq, s.Seq);
+            j.WriteNumber(J.respBytes, f.FrameLength);
+            j.WriteStartObject(J.reply);
+            if (f.Facts.CursorId is { } id) WriteInt64String(j, J.cursorId, id);
+            j.WriteNumberOrNull(J.nReturned, f.Facts.NReturned);
+            j.WriteNumberOrNull(J.ok, f.Facts.Ok);
             j.WriteEndObject();
-            _o.Emit(_rw.End());
+            Emit();
         }
 
         private void TrackCursors(string member, RequestInfo req, ReplyFacts facts)
@@ -495,8 +591,7 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
                     else reg.Touched(member, gm);
                     return;
                 case "killCursors":
-                    if (req.KillCursorIds != null)
-                        foreach (var id in req.KillCursorIds) reg.Closed(member, id);
+                    foreach (var id in req.KillCursorIds) reg.Closed(member, id);
                     return;
                 default:
                     if (facts.CursorId is { } c and not 0)
@@ -504,9 +599,9 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
                         string? coll = req.Coll;
                         if (facts.NsLength > 0)
                         {
-                            var ns = Encoding.UTF8.GetString(facts.Ns, 0, facts.NsLength);
-                            var dot = ns.IndexOf('.');
-                            if (dot > 0) coll = ns[(dot + 1)..];
+                            var ns = facts.Ns.AsSpan(0, facts.NsLength);
+                            var dot = ns.IndexOf((byte)'.');
+                            if (dot > 0) coll = _parser.Names.Get(ns[(dot + 1)..]);
                         }
                         reg.Opened(member, c, req.Db ?? "", coll);
                     }
@@ -514,33 +609,43 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
             }
         }
 
+        /// <summary>Cursor ids are decimal strings in records (02 §4: they may exceed 2^53-1).</summary>
+        private static void WriteInt64String(Utf8JsonWriter j, JsonEncodedText name, long v)
+        {
+            Span<byte> digits = stackalloc byte[20];
+            v.TryFormat(digits, out var n, provider: System.Globalization.CultureInfo.InvariantCulture);
+            j.WriteString(name, digits[..n]);
+        }
+
         private static void WriteReply(Utf8JsonWriter j, ReplyFacts f, bool authCommand)
         {
-            j.WriteStartObject("reply");
-            j.WriteNumberOrNull("ok", f.Ok);
-            j.WriteNumberOrNull("code", f.Code);
-            j.WriteStringOrNull("codeName", f.CodeNameLength >= 0 ? Encoding.UTF8.GetString(f.CodeName, 0, f.CodeNameLength) : null);
+            j.WriteStartObject(J.reply);
+            j.WriteNumberOrNull(J.ok, f.Ok);
+            j.WriteNumberOrNull(J.code, f.Code);
+            if (f.CodeNameLength >= 0) j.WriteString(J.codeName, f.CodeName.AsSpan(0, f.CodeNameLength));
+            else j.WriteNull(J.codeName);
             if (authCommand)
             {
                 // 01 §9.1: replies to redacted commands are reduced to ok/code/codeName
                 j.WriteEndObject();
                 return;
             }
-            j.WriteStringOrNull("errmsg", f.ErrmsgLength >= 0 ? Encoding.UTF8.GetString(f.Errmsg, 0, f.ErrmsgLength) : null);
-            if (f.CursorId is { } id) j.WriteString("cursorId", id.ToString());
-            else j.WriteNull("cursorId");
-            j.WriteNumberOrNull("nReturned", f.NReturned);
-            j.WriteNumberOrNull("n", f.N);
-            j.WriteNumberOrNull("nModified", f.NModified);
-            j.WriteNumber("writeErrors", f.WriteErrors);
-            j.WriteBoolean("writeConcernError", f.WriteConcernError);
-            j.WriteNumber("upserted", f.Upserted);
+            if (f.ErrmsgLength >= 0) j.WriteString(J.errmsg, f.Errmsg.AsSpan(0, f.ErrmsgLength));
+            else j.WriteNull(J.errmsg);
+            if (f.CursorId is { } id) WriteInt64String(j, J.cursorId, id);
+            else j.WriteNull(J.cursorId);
+            j.WriteNumberOrNull(J.nReturned, f.NReturned);
+            j.WriteNumberOrNull(J.n, f.N);
+            j.WriteNumberOrNull(J.nModified, f.NModified);
+            j.WriteNumber(J.writeErrors, f.WriteErrors);
+            j.WriteBoolean(J.writeConcernError, f.WriteConcernError);
+            j.WriteNumber(J.upserted, f.Upserted);
             if (f.CursorsKilledCount + f.CursorsNotFoundCount > 0)
             {
-                j.WriteNumber("cursorsKilled", f.CursorsKilledCount);
-                j.WriteNumber("cursorsNotFound", f.CursorsNotFoundCount);
+                j.WriteNumber(J.cursorsKilled, f.CursorsKilledCount);
+                j.WriteNumber(J.cursorsNotFound, f.CursorsNotFoundCount);
             }
-            j.WriteBoolean("parsed", f.Parsed);
+            j.WriteBoolean(J.parsed, f.Parsed);
             j.WriteEndObject();
         }
     }

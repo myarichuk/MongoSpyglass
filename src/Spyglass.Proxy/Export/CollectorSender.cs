@@ -7,26 +7,111 @@ using Spyglass.Proxy.Metrics;
 
 namespace Spyglass.Proxy.Export;
 
+/// <summary>A run of complete NDJSON lines, each <c>\n</c>-terminated. Pooled by the sender.</summary>
+internal sealed class RecordChunk(int capacity)
+{
+    public readonly byte[] Buffer = new byte[capacity];
+    public int Length;
+    public int Records;
+}
+
 /// <summary>
-/// Ships NDJSON wire records to the collector (01 §11, 02 §5). One sender loop; the observer only enqueues
-/// serialized lines into a byte-bounded queue. Delivery is at most once; nothing here can block forwarding.
+/// One producer's (an observer worker's) open chunk. Records are copied in as they are serialized; the
+/// chunk goes to the sender when full or at the sender's flush. The lock is taken by the producer per
+/// record and by the sender once per flush, so it is uncontended in practice.
+/// </summary>
+internal sealed class RecordBuffer
+{
+    private readonly CollectorSender _sender;
+    private RecordChunk? _current;
+
+    internal RecordBuffer(CollectorSender sender) => _sender = sender;
+
+    /// <summary>Never blocks on I/O; drops (and counts) the record when the buffer bound is reached or the collector asked to pause.</summary>
+    public void Append(ReadOnlySpan<byte> line)
+    {
+        if (_sender.Paused)
+        {
+            _sender.Drop(1);
+            return;
+        }
+        var need = line.Length + 1;
+        lock (this)
+        {
+            var c = _current;
+            if (c != null && c.Length + need > c.Buffer.Length)
+            {
+                _sender.Seal(c);
+                c = _current = null;
+            }
+            if (c == null)
+            {
+                c = _current = _sender.Rent(need);
+                if (c == null)
+                {
+                    _sender.Drop(1);
+                    return;
+                }
+            }
+            line.CopyTo(c.Buffer.AsSpan(c.Length));
+            c.Length += line.Length;
+            c.Buffer[c.Length++] = (byte)'\n';
+            if (++c.Records >= _sender.BatchMaxRecords)
+            {
+                _sender.Seal(c);
+                _current = null;
+            }
+        }
+    }
+
+    /// <summary>Sender side: hands over the partially filled chunk.</summary>
+    internal void Flush()
+    {
+        RecordChunk? c;
+        lock (this)
+        {
+            c = _current;
+            _current = null;
+        }
+        if (c != null)
+        {
+            if (c.Records > 0) _sender.Seal(c);
+            else _sender.Release(c);
+        }
+    }
+}
+
+/// <summary>
+/// Ships NDJSON wire records to the collector (01 §11, 02 §5). One sender loop; observer workers append
+/// serialized lines to their <see cref="RecordBuffer"/>, which fills pooled chunks; a batch is a list of
+/// chunk segments posted without concatenation. Bounded by <c>collector.bufferBytes</c> (charged per
+/// chunk). Delivery is at most once; nothing here can block forwarding.
 /// </summary>
 internal sealed class CollectorSender : IAsyncDisposable
 {
+    /// <summary>Pooled chunk size; a record larger than this gets a chunk of its own, not pooled.</summary>
+    public const int ChunkBytes = 64 * 1024;
+
     private readonly CollectorConfig _config;
     private readonly Uri _endpoint;
     private readonly string _src;
     private readonly HttpClient _http;
-    private readonly ConcurrentQueue<byte[]> _queue = new();
+    private readonly ConcurrentQueue<RecordChunk> _ready = new();
+    private readonly ConcurrentQueue<RecordChunk> _free = new();
+    private readonly List<RecordBuffer> _buffers = [];
+    private readonly RecordBuffer _own;
     private readonly SemaphoreSlim _signal = new(0);
     private readonly CancellationTokenSource _cts = new();
     private readonly Counter _dropped;
-    private long _queuedBytes;
-    private int _queuedRecords;
+    private readonly int _chunkBytes;
+    private long _chargedBytes;
+    private int _readyRecords;
+    private long _pausedUntil; // Environment.TickCount64
     private Task? _loop;
-    private DateTime _pausedUntil = DateTime.MinValue;
 
     public long SentRecords, SentBatches, DroppedRecords;
+    /// <summary>Chunks created (not reused from the pool): flat in steady state.</summary>
+    internal long ChunksAllocated;
 
     public Func<IEnumerable<byte[]>>? Periodic60s { get; set; }
     public Func<byte[]>? Stats10s { get; set; }
@@ -37,6 +122,7 @@ internal sealed class CollectorSender : IAsyncDisposable
         _endpoint = new Uri(config.Endpoint!);
         _src = src;
         _dropped = dropped;
+        _chunkBytes = (int)Math.Min(ChunkBytes, Math.Max(1024, config.BatchMaxBytes));
         _http = new HttpClient(handler ?? new SocketsHttpHandler
         {
             PooledConnectionLifetime = TimeSpan.FromMinutes(2),
@@ -45,29 +131,65 @@ internal sealed class CollectorSender : IAsyncDisposable
         {
             Timeout = TimeSpan.FromSeconds(5),
         };
+        _own = CreateBuffer();
     }
+
+    internal int BatchMaxRecords => _config.BatchMaxRecords;
+    internal bool Paused => Environment.TickCount64 < Volatile.Read(ref _pausedUntil);
+    internal long ChargedBytes => Volatile.Read(ref _chargedBytes);
+
+    /// <summary>A producer's buffer; one per observer worker.</summary>
+    public RecordBuffer CreateBuffer()
+    {
+        var b = new RecordBuffer(this);
+        lock (_buffers) _buffers.Add(b);
+        return b;
+    }
+
+    /// <summary>Single-line convenience (periodic records, tests).</summary>
+    public void Enqueue(ReadOnlySpan<byte> line) => _own.Append(line);
 
     public void Start() => _loop = Task.Run(LoopAsync);
 
-    /// <summary>Called by observer workers. Never blocks.</summary>
-    public void Enqueue(byte[] line)
+    // ---- chunk pool -----------------------------------------------------------------------
+
+    internal RecordChunk? Rent(int need)
     {
-        if (Interlocked.Add(ref _queuedBytes, line.Length) > _config.BufferBytes || DateTime.UtcNow < _pausedUntil)
+        var capacity = Math.Max(_chunkBytes, need);
+        if (Interlocked.Add(ref _chargedBytes, capacity) > _config.BufferBytes)
         {
-            Interlocked.Add(ref _queuedBytes, -line.Length);
-            Drop(1);
-            return;
+            Interlocked.Add(ref _chargedBytes, -capacity);
+            return null;
         }
-        _queue.Enqueue(line);
-        if (Interlocked.Increment(ref _queuedRecords) == _config.BatchMaxRecords)
+        if (capacity == _chunkBytes && _free.TryDequeue(out var c))
+            return c;
+        Interlocked.Increment(ref ChunksAllocated);
+        return new RecordChunk(capacity);
+    }
+
+    internal void Release(RecordChunk c)
+    {
+        Interlocked.Add(ref _chargedBytes, -c.Buffer.Length);
+        c.Length = c.Records = 0;
+        if (c.Buffer.Length == _chunkBytes)
+            _free.Enqueue(c); // the pool never exceeds bufferBytes / chunk: every pooled chunk was charged once
+    }
+
+    internal void Seal(RecordChunk c)
+    {
+        _ready.Enqueue(c);
+        var before = Interlocked.Add(ref _readyRecords, c.Records) - c.Records;
+        if (before < _config.BatchMaxRecords && before + c.Records >= _config.BatchMaxRecords)
             _signal.Release();
     }
 
-    private void Drop(long n)
+    internal void Drop(long n)
     {
         Interlocked.Add(ref DroppedRecords, n);
         _dropped.Add(n);
     }
+
+    // ---- loop ----------------------------------------------------------------------------
 
     private async Task LoopAsync()
     {
@@ -101,38 +223,49 @@ internal sealed class CollectorSender : IAsyncDisposable
 
     private async Task FlushAsync(CancellationToken ct)
     {
-        while (!_queue.IsEmpty)
+        RecordBuffer[] buffers;
+        lock (_buffers) buffers = _buffers.ToArray();
+        foreach (var b in buffers)
+            b.Flush();
+
+        while (!_ready.IsEmpty)
         {
             var batch = TakeBatch();
-            if (batch.Count == 0) return;
-            if (DateTime.UtcNow < _pausedUntil)
+            if (batch.Chunks.Count == 0) return;
+            try
             {
-                Drop(batch.Count);
-                continue;
+                if (Paused)
+                {
+                    Drop(batch.Records);
+                    continue;
+                }
+                await SendAsync(batch, splitAllowed: true, ct).ConfigureAwait(false);
             }
-            await SendAsync(batch, splitAllowed: true, ct).ConfigureAwait(false);
-            if (_queue.Count < _config.BatchMaxRecords && !ct.IsCancellationRequested)
+            finally
+            {
+                foreach (var c in batch.Chunks) Release(c);
+            }
+            if (Volatile.Read(ref _readyRecords) < _config.BatchMaxRecords && !ct.IsCancellationRequested)
                 return; // wait for the next interval unless a full batch is ready
         }
     }
 
-    private List<byte[]> TakeBatch()
+    private Batch TakeBatch()
     {
-        var batch = new List<byte[]>();
-        var bytes = 0L;
-        while (batch.Count < _config.BatchMaxRecords && _queue.TryPeek(out var line))
+        var batch = new Batch();
+        while (_ready.TryPeek(out var c))
         {
-            if (bytes + line.Length + 1 > _config.BatchMaxBytes && batch.Count > 0) break;
-            _queue.TryDequeue(out _);
-            Interlocked.Add(ref _queuedBytes, -line.Length);
-            Interlocked.Decrement(ref _queuedRecords);
-            batch.Add(line);
-            bytes += line.Length + 1;
+            if (batch.Chunks.Count > 0 &&
+                (batch.Records + c.Records > _config.BatchMaxRecords || batch.Bytes + c.Length > _config.BatchMaxBytes))
+                break;
+            _ready.TryDequeue(out _);
+            Interlocked.Add(ref _readyRecords, -c.Records);
+            batch.Add(c);
         }
         return batch;
     }
 
-    private async Task SendAsync(List<byte[]> batch, bool splitAllowed, CancellationToken ct)
+    private async Task SendAsync(Batch batch, bool splitAllowed, CancellationToken ct)
     {
         for (var attempt = 0; attempt < 2; attempt++)
         {
@@ -140,7 +273,7 @@ internal sealed class CollectorSender : IAsyncDisposable
             TimeSpan? retryAfter = null;
             try
             {
-                using var req = new HttpRequestMessage(HttpMethod.Post, _endpoint) { Content = Body(batch) };
+                using var req = new HttpRequestMessage(HttpMethod.Post, _endpoint) { Content = new SegmentsContent(batch.Segments, batch.Bytes) };
                 if (_config.Token is { Length: > 0 } token)
                     req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
                 req.Headers.Add("X-Spyglass-Producer", "proxy");
@@ -151,7 +284,7 @@ internal sealed class CollectorSender : IAsyncDisposable
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
-                Drop(batch.Count);
+                Drop(batch.Records);
                 return;
             }
             catch (Exception e) when (e is HttpRequestException or TaskCanceledException or IOException)
@@ -162,25 +295,25 @@ internal sealed class CollectorSender : IAsyncDisposable
             switch ((int?)status)
             {
                 case >= 200 and < 300:
-                    Interlocked.Add(ref SentRecords, batch.Count);
+                    Interlocked.Add(ref SentRecords, batch.Records);
                     Interlocked.Increment(ref SentBatches);
                     return;
                 case 400 or 401 or 403:
                     Log.Warn($"collector rejected batch: {(int)status!}");
-                    Drop(batch.Count);
+                    Drop(batch.Records);
                     return;
-                case 413 when splitAllowed && batch.Count > 1:
-                    var half = batch.Count / 2;
-                    await SendAsync(batch.GetRange(0, half), splitAllowed: false, ct).ConfigureAwait(false);
-                    await SendAsync(batch.GetRange(half, batch.Count - half), splitAllowed: false, ct).ConfigureAwait(false);
+                case 413 when splitAllowed && batch.Records > 1:
+                    var (first, second) = batch.Split();
+                    await SendAsync(first, splitAllowed: false, ct).ConfigureAwait(false);
+                    await SendAsync(second, splitAllowed: false, ct).ConfigureAwait(false);
                     return;
                 case 413:
-                    Drop(batch.Count);
+                    Drop(batch.Records);
                     return;
                 case 429:
                     var pause = retryAfter is { } ra ? TimeSpan.FromSeconds(Math.Min(ra.TotalSeconds, 10)) : TimeSpan.FromSeconds(1);
-                    _pausedUntil = DateTime.UtcNow + pause;
-                    Drop(batch.Count);
+                    Volatile.Write(ref _pausedUntil, Environment.TickCount64 + (long)pause.TotalMilliseconds);
+                    Drop(batch.Records);
                     return;
             }
 
@@ -188,26 +321,10 @@ internal sealed class CollectorSender : IAsyncDisposable
             if (attempt == 0)
             {
                 try { await Task.Delay(1000, ct).ConfigureAwait(false); }
-                catch (OperationCanceledException) { Drop(batch.Count); return; }
+                catch (OperationCanceledException) { Drop(batch.Records); return; }
             }
         }
-        Drop(batch.Count);
-    }
-
-    private static ByteArrayContent Body(List<byte[]> batch)
-    {
-        var total = batch.Sum(b => b.Length + 1);
-        var buf = new byte[total];
-        var p = 0;
-        foreach (var line in batch)
-        {
-            line.CopyTo(buf, p);
-            p += line.Length;
-            buf[p++] = (byte)'\n';
-        }
-        var content = new ByteArrayContent(buf);
-        content.Headers.ContentType = new MediaTypeHeaderValue("application/x-ndjson");
-        return content;
+        Drop(batch.Records);
     }
 
     public async ValueTask DisposeAsync()
@@ -220,5 +337,84 @@ internal sealed class CollectorSender : IAsyncDisposable
         }
         _http.Dispose();
         _cts.Dispose();
+    }
+
+    // ---- batches -------------------------------------------------------------------------
+
+    internal readonly record struct Segment(byte[] Buffer, int Offset, int Length, int Records);
+
+    /// <summary>Segments of chunks; the chunks themselves are released by the flush that took them.</summary>
+    internal sealed class Batch
+    {
+        public readonly List<RecordChunk> Chunks = [];
+        public readonly List<Segment> Segments = [];
+        public int Records, Bytes;
+
+        public void Add(RecordChunk c)
+        {
+            Chunks.Add(c);
+            Add(new Segment(c.Buffer, 0, c.Length, c.Records));
+        }
+
+        private void Add(Segment s)
+        {
+            Segments.Add(s);
+            Records += s.Records;
+            Bytes += s.Length;
+        }
+
+        /// <summary>Two halves by records (413). Within one segment, at the line boundary nearest its middle.</summary>
+        public (Batch, Batch) Split()
+        {
+            Batch a = new(), b = new();
+            if (Segments.Count > 1)
+            {
+                var half = Records / 2;
+                var into = a;
+                foreach (var s in Segments)
+                {
+                    if (into == a && a.Segments.Count > 0 && a.Records + s.Records > half) into = b; // order kept
+                    into.Add(s);
+                }
+                return (a, b);
+            }
+            var only = Segments[0];
+            var span = only.Buffer.AsSpan(only.Offset, only.Length);
+            var mid = span[..(only.Length / 2)].LastIndexOf((byte)'\n') + 1;
+            if (mid <= 0) mid = span.IndexOf((byte)'\n') + 1; // first line is longer than half
+            var left = span[..mid].Count((byte)'\n');
+            a.Add(new Segment(only.Buffer, only.Offset, mid, left));
+            b.Add(new Segment(only.Buffer, only.Offset + mid, only.Length - mid, only.Records - left));
+            return (a, b);
+        }
+    }
+
+    /// <summary>The batch body: its segments written in order, no concatenation.</summary>
+    private sealed class SegmentsContent : HttpContent
+    {
+        private readonly List<Segment> _segments;
+        private readonly long _length;
+
+        public SegmentsContent(List<Segment> segments, long length)
+        {
+            _segments = segments;
+            _length = length;
+            Headers.ContentType = new MediaTypeHeaderValue("application/x-ndjson");
+        }
+
+        protected override async Task SerializeToStreamAsync(Stream stream, TransportContext? context, CancellationToken ct)
+        {
+            foreach (var s in _segments)
+                await stream.WriteAsync(s.Buffer.AsMemory(s.Offset, s.Length), ct).ConfigureAwait(false);
+        }
+
+        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) =>
+            SerializeToStreamAsync(stream, context, CancellationToken.None);
+
+        protected override bool TryComputeLength(out long length)
+        {
+            length = _length;
+            return true;
+        }
     }
 }

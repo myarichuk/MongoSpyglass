@@ -24,42 +24,59 @@ internal sealed class Redactor
     private readonly ValueMode _mode;
     private readonly int _truncateAt;
     private readonly Regex _fieldPattern;
+    /// <summary>Field name → pattern verdict. The pattern is fixed for the process, so a cached verdict is exact.</summary>
+    private readonly Utf8Table<bool> _verdicts = new(4096);
+    private readonly byte[] _truncated;
+    private LsidHasher _lsids = new(capacity: 64);
 
     public Redactor(CaptureConfig config)
     {
         _mode = config.Values;
         _truncateAt = config.TruncateStringsAt;
         _fieldPattern = new Regex(config.RedactFieldPattern, RegexOptions.CultureInvariant);
+        _truncated = new byte[_truncateAt + 32];
     }
 
-    public (byte[] Bson, bool Truncated, bool WholeCommandRedacted) Redact(
-        string command, ReadOnlySpan<byte> doc, List<(string Identifier, byte[] FirstDoc)>? firstSeqDocs, bool isHello, bool captureTruncated)
+    /// <summary>Convenience for tests and one-offs: a fresh buffer per call.</summary>
+    public (byte[] Bson, bool Truncated, bool WholeCommandRedacted) Redact(string command, ReadOnlySpan<byte> doc, bool isHello, bool captureTruncated)
     {
         var w = new BsonWriter(Math.Min(doc.Length + 64, 64 * 1024));
+        var (truncated, whole) = Redact(w, command, doc, default, [], _lsids, isHello, captureTruncated);
+        return (w.ToArray(), truncated, whole);
+    }
+
+    /// <summary>Writes the exported body into <paramref name="w"/> (reset by the caller).</summary>
+    /// <param name="sections">kind-1 sections of the capture; <paramref name="firstSeqDocs"/> holds offsets into it.</param>
+    public (bool Truncated, bool WholeCommandRedacted) Redact(
+        BsonWriter w, string command, ReadOnlySpan<byte> doc,
+        ReadOnlySpan<byte> sections, List<(int IdStart, int IdLength, int DocStart, int DocLength)> firstSeqDocs,
+        LsidHasher lsids, bool isHello, bool captureTruncated)
+    {
+        _lsids = lsids;
         if (RedactedCommands.Contains(command))
         {
             w.StartDocument();
             w.WriteString("$redacted", command);
             w.EndDocument();
-            return (w.ToArray(), false, true);
+            return (false, true);
         }
 
         w.StartDocument();
         var truncated = WriteElements(w, doc, depth: 0, topLevel: true, isHello) || captureTruncated;
-        if (firstSeqDocs != null)
+        if (firstSeqDocs.Count > 0)
         {
             Span<byte> scratch = stackalloc byte[12];
-            foreach (var (id, first) in firstSeqDocs)
+            foreach (var (idStart, idLength, docStart, docLength) in firstSeqDocs)
             {
-                w.StartArray(id);
+                w.StartArray(sections.Slice(idStart, idLength));
                 w.StartDocument(BsonWriter.IndexName(0, scratch));
-                truncated |= WriteElements(w, first, 1, topLevel: false, isHello: false);
+                truncated |= WriteElements(w, sections.Slice(docStart, docLength), 1, topLevel: false, isHello: false);
                 w.EndDocument();
                 w.EndDocument();
             }
         }
         w.EndDocument();
-        return (w.ToArray(), truncated, false);
+        return (truncated, false);
     }
 
     /// <returns>true if the source document was truncated or malformed.</returns>
@@ -86,14 +103,14 @@ internal sealed class Redactor
 
             if ((topLevel && isHello && e.NameIs("speculativeAuthenticate"u8)) || NameMatches(e.Name))
             {
-                w.WriteString(e.Name, "$redacted");
+                w.WriteStringUtf8(e.Name, "$redacted"u8);
                 continue;
             }
 
             if (topLevel && e.NameIs("lsid"u8) && e.Type == BsonType.Document)
             {
                 w.StartDocument(e.Name);
-                w.WriteString("id", RequestParser.HashLsid(e.Value) ?? "$redacted");
+                w.WriteString("id"u8, _lsids.HashDocument(e.Value) ?? "$redacted");
                 w.EndDocument();
                 continue;
             }
@@ -130,7 +147,7 @@ internal sealed class Redactor
 
         if (_mode == ValueMode.Shape)
         {
-            w.WriteString(e.Name, ShapeTag(e));
+            w.WriteStringUtf8(e.Name, ShapeTagUtf8(e));
             return;
         }
 
@@ -140,9 +157,14 @@ internal sealed class Redactor
             {
                 var s = e.StringBytes;
                 var cut = Utf8Boundary(s, _truncateAt);
-                var sb = new StringBuilder(Encoding.UTF8.GetString(s[..cut]));
-                sb.Append("…(+").Append(s.Length - cut).Append(')');
-                w.WriteString(e.Name, sb.ToString());
+                s[..cut].CopyTo(_truncated);
+                var n = cut;
+                "…(+"u8.CopyTo(_truncated.AsSpan(n));
+                n += "…(+"u8.Length;
+                (s.Length - cut).TryFormat(_truncated.AsSpan(n), out var digits, provider: System.Globalization.CultureInfo.InvariantCulture);
+                n += digits;
+                _truncated[n++] = (byte)')';
+                w.WriteStringUtf8(e.Name, _truncated.AsSpan(0, n));
                 return;
             }
             if (e.Type == BsonType.Binary)
@@ -162,18 +184,18 @@ internal sealed class Redactor
     }
 
     /// <summary>03 §4.1 leaf tags.</summary>
-    internal static string ShapeTag(in BsonElement e) => e.Type switch
+    internal static ReadOnlySpan<byte> ShapeTagUtf8(in BsonElement e) => e.Type switch
     {
-        BsonType.Int32 or BsonType.Int64 or BsonType.Double or BsonType.Decimal128 => "?number",
-        BsonType.String => e.StringBytes.SequenceEqual("$redacted"u8) ? "?redacted" : "?string",
-        BsonType.ObjectId => "?objectId",
-        BsonType.DateTime => "?date",
-        BsonType.Boolean => "?bool",
-        BsonType.Null or BsonType.Undefined => "?null",
-        BsonType.Binary => e.Value.Length >= 5 && e.Value[4] == 4 ? "?uuid" : "?binData",
-        BsonType.Regex => "?regex",
-        BsonType.Timestamp => "?timestamp",
-        _ => "?other",
+        BsonType.Int32 or BsonType.Int64 or BsonType.Double or BsonType.Decimal128 => "?number"u8,
+        BsonType.String => e.StringBytes.SequenceEqual("$redacted"u8) ? "?redacted"u8 : "?string"u8,
+        BsonType.ObjectId => "?objectId"u8,
+        BsonType.DateTime => "?date"u8,
+        BsonType.Boolean => "?bool"u8,
+        BsonType.Null or BsonType.Undefined => "?null"u8,
+        BsonType.Binary => e.Value.Length >= 5 && e.Value[4] == 4 ? "?uuid"u8 : "?binData"u8,
+        BsonType.Regex => "?regex"u8,
+        BsonType.Timestamp => "?timestamp"u8,
+        _ => "?other"u8,
     };
 
     /// <summary>
@@ -181,6 +203,15 @@ internal sealed class Redactor
     /// <c>{"profile.password": …}</c> in a filter or <c>$set</c> is redacted like <c>{profile: {password: …}}</c>.
     /// </summary>
     private bool NameMatches(ReadOnlySpan<byte> name)
+    {
+        if (_verdicts.TryGetValue(name, out var verdict))
+            return verdict;
+        verdict = Evaluate(name);
+        _verdicts.TryAdd(name, verdict);
+        return verdict;
+    }
+
+    private bool Evaluate(ReadOnlySpan<byte> name)
     {
         if (name.Length > 512) return true; // absurd key: redact rather than run the regex on it
         Span<char> chars = stackalloc char[name.Length];

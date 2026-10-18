@@ -10,8 +10,14 @@ dotnet tools/ProxyBench/bin/Release/net10.0/ProxyBench.dll \
   --mongod tools/mongod/.cache/8.0.23/bin \
   --proxy src/Spyglass.Proxy/bin/Release/net10.0/spyglass-proxy.dll \
   --rounds 3 [--modes direct,bare,observe,export] [--json out.json] \
-  [--proxyEnv "K=V;K2=V2"]
+  [--proxyEnv "K=V;K2=V2"] [--trace <dir>]
 ```
+
+`--trace <dir>` attaches `dotnet-trace` (`dotnet tool install -g dotnet-trace`) to the proxy for each
+throughput window and writes `<mode>-r<round>.nettrace`. Read one with
+`dotnet-trace report <file> topN -n 50 [--inclusive]`. The profile is thread time sampled at
+~100 Hz: wall clock, managed frames only. Use it to find structure (what is on the stack), and
+the Release cost gates in the test suite (`ObserverCostTests`) to get per-op numbers.
 
 | Mode | Proxy configuration |
 |---|---|

@@ -213,6 +213,16 @@ struct FrameCapture {
 * Observer workers (default `max(1, cores/2)`) consume the queue with **per-connection
   affinity** (`connSeq mod workers`), so per-connection ordering is preserved for
   correlation (§7).
+* Publishing never takes a lock, and a pump almost never wakes a worker. A wake is a futex call
+  on the pump thread, and below saturation the worker is asleep at nearly every frame. So a
+  worker sleeps on a short timer (1 ms after a drain that found work, backing off to 10 ms
+  when idle), and a pump wakes it only on every 64th publish, which bounds the queue in a
+  burst. Observation therefore runs up to ~10 ms behind the wire. Nothing downstream can
+  tell: records are batched for `collector.flushIntervalMs`, and metrics are scraped.
+* Observer state that repeats across operations is cached per worker: interned
+  command/db/collection names, lsid hashes by session id (drivers pool sessions, and SHA-256
+  is microseconds a call), and field-pattern verdicts by name. Each cache is bounded and stops
+  admitting new entries when full, so client-chosen names cannot grow it.
 
 The tap never allocates per frame in steady state. Buffers come from a pool sized at startup
 and grown only up to the queue byte bound.
@@ -402,7 +412,10 @@ the command body (`$db`, `lsid.id`, `txnNumber`). Node 6.x, for example, sends
 
 Wire records (02 §4.2) are built by the observer and handed to one sender thread:
 
-* in-memory buffer bounded by `collector.bufferBytes`;
+* each worker serializes into a reused writer and copies the line into its own pooled 64 KiB
+  NDJSON chunk; a batch is a list of chunk segments posted as-is (no per-record arrays, no
+  concatenation); a 413 splits a batch by records, at a line boundary;
+* in-memory buffer bounded by `collector.bufferBytes`, charged per chunk;
 * batches per 02 §5;
 * on an unreachable collector or a 5xx: one retry after 1 s, then drop the batch and count
   it;
@@ -427,6 +440,7 @@ spyglass_proxy_observation_dropped_total{reason}             counter   reason = 
 spyglass_proxy_observe_queue_bytes                           gauge
 spyglass_proxy_rewrite_total{kind}  / _skipped_total{reason} counter
 spyglass_proxy_uncorrelated_replies_total                    counter
+spyglass_proxy_observer_busy_microseconds_total{worker}      counter   time a worker spent processing (wake → drained); rate ÷ 1e6 = utilization
 spyglass_proxy_forward_added_latency_seconds                 histogram buckets 5e-6 … 5e-3 (proxy residency of a frame's last byte)
 ```
 

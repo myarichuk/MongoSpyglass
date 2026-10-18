@@ -1,13 +1,13 @@
 # M1 — proxy implementation status
 
-Code: `src/Spyglass.Proxy` (BCL-only, `spyglass-proxy`). Tests: `tests/Spyglass.Proxy.Tests` (82 tests;
+Code: `src/Spyglass.Proxy` (BCL-only, `spyglass-proxy`). Tests: `tests/Spyglass.Proxy.Tests` (92 tests;
 real `mongod`/`mongos` 8.0.23 via `tools/mongod/fetch.sh`, .NET driver 3.12, Node driver 6.4.0 /
 6.21.0 / 7.7.0 via `tests/node-conformance`). Bench: `tools/ProxyBench`.
 
 ```sh
 tools/mongod/fetch.sh && (cd tests/node-conformance && npm install)
 dotnet build tests/Spyglass.Proxy.Tests && dotnet tests/Spyglass.Proxy.Tests/bin/Debug/net10.0/Spyglass.Proxy.Tests.dll
-dotnet build -c Release tests/Spyglass.Proxy.Tests && dotnet tests/Spyglass.Proxy.Tests/bin/Release/net10.0/Spyglass.Proxy.Tests.dll -class Spyglass.Proxy.Tests.AllocationTests
+dotnet build -c Release tests/Spyglass.Proxy.Tests && dotnet tests/Spyglass.Proxy.Tests/bin/Release/net10.0/Spyglass.Proxy.Tests.dll   # + allocation/cost gates
 ```
 
 ## 06 §2 conformance — where each item is covered
@@ -41,26 +41,78 @@ dotnet build -c Release tests/Spyglass.Proxy.Tests && dotnet tests/Spyglass.Prox
 
 ## 01 §14 performance — measured
 
-`tools/ProxyBench`, 4 vCPU shared by the client (32 concurrent workers), `mongod` and the proxy;
-medians of 3 rounds, point lookups by `_id`:
+### End to end (`tools/ProxyBench`)
 
-| | +p50 | +p99 | throughput vs direct | 4 MiB reply vs direct | proxy CPU / op | alloc / frame |
-|---|---|---|---|---|---|---|
-| budget | ≤ 50 µs | ≤ 250 µs | ≥ 90 % | ≤ 110 % | — | 0 B (forwarding) |
-| bare (forwarding only) | 31 µs ✅ | 107 µs ✅ | 87 % ❌ | 113 % ❌ | 30 µs | **0.15 B** ✅ (gate test) |
-| observe (headless) | 76 µs ❌ | 192 µs ✅ | 83 % ❌ | 115 % ❌ | 42 µs | 129 B (observer) |
-| export | 47 µs ✅ | 102 µs ✅ | 77 % ❌ | 114 % ❌ | 53 µs | ~1.4 KB (observer + records) |
+4 vCPU shared by the client (32 concurrent workers), `mongod` and the proxy; medians of 3 rounds,
+point lookups by `_id`. **Read only the CPU column.** On this VM the `direct` baseline alone
+swings between 18k and 36k ops/s from round to round, so the throughput and latency ratios
+mostly measure the neighbours. With 5 alternating rounds, observe and bare have the same p50
+(189 µs vs 189 µs).
 
-Reading it: this box is CPU-saturated by client + mongod alone, so throughput and the 4 MiB ratio
-measure proxy CPU more than forwarding latency. Run-to-run noise on `direct` alone is ±15 %.
-The budgets are to be judged on the nightly mongod runner with the proxy pinned to its own cores
-(06 §4); until then the numbers to drive down are **CPU / op** (bare 30 µs, observer +12 µs,
-export +11 µs) and observer allocation.
+| proxy CPU / op | bare | observe | export |
+|---|---|---|---|
+| M1 first cut | 30 µs | 42 µs (+12) | 53 µs (+23) |
+| after the observer pass | 29.6 µs | 31.9 µs (**+2.3**) | 35.0 µs (**+5.4**) |
 
-What moved the numbers (each measured): inline socket completions (+p50 70–104 → 16–46 µs);
-pump-local statistics instead of per-read interlocked ops; pooled `ValueTask` builders; a
-quadratic pending-queue compaction in the observer (15.9 KB → 0.3 KB per frame); per-worker
-`Regex` and metric-child caches; skipping redaction when headless.
+The budgets (+p50 ≤ 50 µs, +p99 ≤ 250 µs, throughput ≥ 90 %, 4 MiB ≤ 110 %) are to be
+judged on the nightly mongod runner, with the proxy pinned to its own cores (06 §4).
+
+### Isolated, deterministic (Release test gates)
+
+* **Forwarding** (`AllocationTests`): a raw-socket client that allocates nothing, so every byte
+  counted is the proxy's. Bare forwarding: **0.01–0.02 B/frame** (gate < 1).
+* **Observation** (`ObserverCostTests`): driver-shaped frames (find by `_id` with `lsid`, a
+  one-document cursor reply) go through the real tap → worker queue → correlation → metrics
+  (→ records → sender → HTTP) path, with no sockets or mongod. Measured per op (one request
+  plus one reply) and gated on B/op:
+
+| mode | tap (pump thread) | worker | allocation | before this pass |
+|---|---|---|---|---|
+| headless (metrics) | ~1.7 µs | ~1.4 µs | **0–1 B/op** (gate 4) | 6–9 µs CPU, 350 B/op |
+| records built | ~1.5 µs | ~3.3 µs | **0–0.5 B/op** (gate 4) | 8 µs CPU, 1712 B/op |
+| records shipped over HTTP | ~1.5 µs | ~3.3 µs | **5–7 B/op** (gate 16): HttpClient per batch | — |
+
+What moved the numbers, each one measured:
+
+* **lsid hashing was ~90 % of observer CPU.** SHA-256 went through the platform provider,
+  twice per op (parser and redactor), for values that repeat. Now it's a per-worker cache by
+  session id, and headless mode doesn't hash at all.
+* **Pumps contended with workers on `Channel<T>`'s lock**, which an unbounded channel takes on
+  every write; that was half the tap's cost. Replaced by a lock-free queue and a dedicated
+  worker thread.
+* **Every frame paid a thread wake on the pump thread**, because below saturation the worker
+  is always asleep. Replaced by timer-based worker sleep, with a wake on every 64th publish
+  (01 §4).
+* **Per-op allocation removed:**
+  * `RequestInfo` is pooled per worker;
+  * command/db/collection/codeName strings are interned;
+  * the redactor writes into a reused writer, with no per-op `StringBuilder` or arrays;
+  * field-pattern verdicts are cached per name;
+  * records serialize into a reused writer and go out as pooled NDJSON chunks, so there's no
+    `byte[]` per record, no batch concatenation and no `List<byte[]>`;
+  * JSON property names are pre-encoded, and Release skips JSON structural validation (Debug
+    keeps it).
+* Earlier: inline socket completions (+p50 70–104 → 16–46 µs), pump-local statistics, pooled
+  `ValueTask` builders, and the quadratic pending-queue compaction.
+
+Measurement fixes made along the way, each of which had been producing wrong numbers:
+
+* **Process CPU** charges idle thread-pool spinning to whatever ran. Worker cost now comes
+  from `spyglass_proxy_observer_busy_microseconds_total`, a new metric that is also
+  operationally useful: its rate is the worker's utilization.
+* **Tap cost** is now taken from `CLOCK_THREAD_CPUTIME_ID` on the feeding thread, not wall
+  time, which preemption inflated.
+* **The gates run in a non-parallel collection,** after disposing clusters leaked by earlier
+  tests' `MongoClient`s (the driver keeps them in a process-wide registry).
+* **The gates wait out the `EventListener`'s own asynchronous event dispatch** before opening
+  the window.
+* **The capture pool is filled to its bound** before measuring, because bursty feeding
+  otherwise grows it mid-window.
+
+Known residual: of the tap's ~0.75 µs per frame, ~0.4 µs is the cross-core handoff itself
+(measured by returning slots on the same thread instead). Removing it needs per-connection
+slot caching, which conflicts with the I4 byte bound (idle connections would pin charged
+slots). At under 3 % of the per-frame forwarding cost, it isn't worth it now.
 
 ## Spec corrections made from measurements
 
@@ -77,7 +129,9 @@ quadratic pending-queue compaction in the observer (15.9 KB → 0.3 KB per frame
 ## Open for M1
 
 1. Collector v1 (wire-only, 03): ingest, shapes, analyzers, storage, UI. Not started.
-2. Observer CPU: per-op `RequestInfo`/string allocation (129 B/frame), export JSON (≈1.4 KB/frame).
+2. Record size: an op record is ~860 B of JSON (explicit nulls, `proxyId` repeating `src`), which is
+   most of the remaining export CPU. Trimming it is a 02 §4.2 contract change, best made before
+   the collector exists.
 3. Dedicated tests: tap-digest byte transparency, half-close / death mid-reply, pending-at-close.
 4. Nightly-only: PLAIN/LDAP, MONGODB-AWS, X.509 documented failure, SRV end-to-end, perf on pinned cores.
 5. Delete the old `MongoSpyglass.Proxy` once the collector replaces `MongoSpyglass.Service`.

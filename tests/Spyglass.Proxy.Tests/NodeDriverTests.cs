@@ -71,10 +71,6 @@ public sealed class NodeDriverTests(ObservationFixture f) : IClassFixture<Observ
         var cmds = lines.Where(l => K(l) == "cmd").ToList();
         Assert.True(cmds.Count > 15, $"only {cmds.Count} commands");
         Assert.All(cmds, c => Assert.Equal(JsonValueKind.Number, c.GetProperty("serverConnectionId").ValueKind)); // ≥ 6.4.0
-        var ops = await f.Proxy.WaitRecordsAsync(r => r.GetProperty("type").GetString() == "op", cmds.Count);
-        await Task.Delay(200);
-        var index = f.Proxy.RecordsOf("op").ToLookup(o =>
-            (o.GetProperty("member").GetString(), o.GetProperty("serverConnectionId").ValueKind == JsonValueKind.Number ? o.GetProperty("serverConnectionId").GetInt64() : -1, o.GetProperty("requestId").GetInt32()));
         // Node's command-event `address` is the socket's resolved remote IP:port, not the dialled host (verified
         // 6.4.0–7.7.0). The exporter maps it to the proxy's own member string from $spyglass (05 §4): by port,
         // which is unique among one proxy's listeners.
@@ -82,10 +78,15 @@ public sealed class NodeDriverTests(ObservationFixture f) : IClassFixture<Observ
             .GroupBy(hb => HostPort.Parse(hb.GetProperty("address").GetString()!).Port)
             .ToDictionary(g => g.Key, g => g.First().GetProperty("spyglass").GetProperty("member").GetString()!);
         Assert.Contains(cmds, c => c.GetProperty("address").GetString()!.StartsWith("127.0.0.1:"));
+        (string?, long, int) KeyOf(JsonElement c) =>
+            (memberByPort[HostPort.Parse(c.GetProperty("address").GetString()!).Port], c.GetProperty("serverConnectionId").GetInt64(), c.GetProperty("requestId").GetInt32());
+        var index = await f.Proxy.WaitForKeysAsync("op", o =>
+            (o.GetProperty("member").GetString(), o.GetProperty("serverConnectionId").ValueKind == JsonValueKind.Number ? o.GetProperty("serverConnectionId").GetInt64() : -1, o.GetProperty("requestId").GetInt32()),
+            cmds.Select(KeyOf).ToList());
         var misses = new List<string>();
         foreach (var c in cmds)
         {
-            var key = (memberByPort[HostPort.Parse(c.GetProperty("address").GetString()!).Port], c.GetProperty("serverConnectionId").GetInt64(), c.GetProperty("requestId").GetInt32());
+            var key = KeyOf(c);
             var m = index[key].ToList();
             if (m.Count != 1) { misses.Add($"{c.GetProperty("commandName")} {key} x{m.Count}"); continue; }
             Assert.Equal(c.GetProperty("commandName").GetString(), m[0].GetProperty("command").GetString());

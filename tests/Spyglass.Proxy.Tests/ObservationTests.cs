@@ -60,19 +60,24 @@ public sealed class ObservationTests(ObservationFixture f) : IClassFixture<Obser
         var events = started.ToArray();
         Assert.True(events.Length > 20, $"only {events.Length} commands");
 
-        var ops = await f.Proxy.WaitRecordsAsync(r => S(r, "type") == "op", events.Length);
-        var index = ops.ToLookup(o => (S(o, "member"), o.GetProperty("serverConnectionId").GetInt64(), o.GetProperty("requestId").GetInt32()));
-        var missing = new List<string>();
         // The driver raises command events for the handshake itself, before the server has assigned the
         // connection id: those (and only those) cannot be joined (02 §3.3; the exporter skips them, 04 §4).
         var handshakes = events.Where(e => e.ConnectionId.LongServerValue == null).ToList();
         Assert.All(handshakes, e => Assert.True(e.CommandName is "isMaster" or "hello", e.CommandName));
         events = events.Where(e => e.ConnectionId.LongServerValue != null).ToArray();
-
-        foreach (var e in events)
+        static (string, long, int) KeyOf(CommandStartedEvent e)
         {
             var ep = (DnsEndPoint)e.ConnectionId.ServerId.EndPoint;
-            var key = ($"{ep.Host.ToLowerInvariant()}:{ep.Port}", e.ConnectionId.LongServerValue!.Value, e.RequestId);
+            return ($"{ep.Host.ToLowerInvariant()}:{ep.Port}", e.ConnectionId.LongServerValue!.Value, e.RequestId);
+        }
+
+        var index = await f.Proxy.WaitForKeysAsync("op",
+            o => (S(o, "member"), o.GetProperty("serverConnectionId").ValueKind == System.Text.Json.JsonValueKind.Number ? o.GetProperty("serverConnectionId").GetInt64() : -1, o.GetProperty("requestId").GetInt32()),
+            events.Select(KeyOf).ToList());
+        var missing = new List<string>();
+        foreach (var e in events)
+        {
+            var key = KeyOf(e);
             var match = index[key].ToList();
             if (match.Count != 1) { missing.Add($"{e.CommandName} {key} x{match.Count}"); continue; }
             Assert.Equal(e.CommandName, S(match[0], "command"));

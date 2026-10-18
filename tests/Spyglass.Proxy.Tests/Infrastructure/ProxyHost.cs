@@ -32,7 +32,7 @@ public sealed class ProxyHost : IAsyncDisposable
         var server = new ProxyServer(config);
         await server.StartAsync();
         var host = new ProxyHost { Server = server, BasePort = basePort };
-        server.Observation!.RecordTap = line => host.Records.Enqueue(JsonDocument.Parse(line).RootElement.Clone());
+        server.Observation!.RecordTap = line => host.Records.Enqueue(JsonDocument.Parse(line.ToArray()).RootElement.Clone());
         return host;
     }
 
@@ -60,6 +60,22 @@ public sealed class ProxyHost : IAsyncDisposable
             if (found.Count >= count) return found;
             if (DateTime.UtcNow > deadline)
                 throw new TimeoutException($"expected {count} records, have {found.Count}");
+            await Task.Delay(20);
+        }
+    }
+
+    /// <summary>
+    /// Waits until every expected key has a record (a count is not enough: other tests' records share the
+    /// fixture and the observer delivers asynchronously). Returns the index either way, so the caller's
+    /// assertion names what is missing.
+    /// </summary>
+    public async Task<ILookup<TKey, JsonElement>> WaitForKeysAsync<TKey>(string type, Func<JsonElement, TKey> keyOf, IReadOnlyCollection<TKey> expected, TimeSpan? timeout = null)
+    {
+        var deadline = DateTime.UtcNow + (timeout ?? TimeSpan.FromSeconds(10));
+        while (true)
+        {
+            var index = RecordsOf(type).ToLookup(keyOf);
+            if (expected.All(index.Contains) || DateTime.UtcNow > deadline) return index;
             await Task.Delay(20);
         }
     }

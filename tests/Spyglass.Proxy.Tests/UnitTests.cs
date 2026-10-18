@@ -117,7 +117,7 @@ public sealed class RedactorTests
     {
         var r = new Redactor(new CaptureConfig { Values = mode });
         var bytes = cmd.ToBson();
-        var (bson, _, _) = r.Redact(cmd.GetElement(0).Name, bytes.AsSpan(0, Math.Min(capture, bytes.Length)), null, hello, captureTruncated: capture < bytes.Length);
+        var (bson, _, _) = r.Redact(cmd.GetElement(0).Name, bytes.AsSpan(0, Math.Min(capture, bytes.Length)), hello, captureTruncated: capture < bytes.Length);
         return BsonSerializer.Deserialize<BsonDocument>(bson);
     }
 

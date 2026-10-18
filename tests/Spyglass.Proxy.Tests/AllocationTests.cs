@@ -13,7 +13,7 @@ namespace Spyglass.Proxy.Tests;
 /// zero-allocation raw socket loop on its own threads, so (almost) every byte allocated in the process
 /// during the window is the proxy's. AllocationTick sampling names the types when the gate fails.
 /// </summary>
-[Collection("console")]
+[Collection(Isolated.Name)]
 public sealed class AllocationTests(StandaloneFixture f) : IClassFixture<StandaloneFixture>
 {
 #if DEBUG
@@ -22,9 +22,10 @@ public sealed class AllocationTests(StandaloneFixture f) : IClassFixture<Standal
     private static readonly bool IsDebugBuild = false;
 #endif
 
-    private sealed class AllocListener : EventListener
+    internal sealed class AllocListener : EventListener
     {
         public readonly ConcurrentDictionary<string, long> Types = new();
+        public string Top(int n) => string.Join(", ", Types.OrderByDescending(kv => kv.Value).Take(n).Select(kv => $"{kv.Key}×{kv.Value}"));
         public volatile bool Recording;
 
         protected override void OnEventSourceCreated(EventSource source)
@@ -48,6 +49,8 @@ public sealed class AllocationTests(StandaloneFixture f) : IClassFixture<Standal
     {
         if (IsDebugBuild)
             Assert.Skip("allocation gate needs a Release build: Debug compiles async state machines as heap classes");
+        if (Clusters.DisposeAll() > 0) // earlier tests' clients would otherwise be measured too
+            await Task.Delay(2000);    // their disposal finishes in the background
         await using var proxy = await ProxyHost.StartAsync(f.Mongo.DirectUri, listeners: 1, configure: a => a["limits.observeQueueBytes"] = observeQueueBytes);
         proxy.Server.Observation!.RecordTap = null; // the test host's JSON parsing would count as allocation
 
@@ -84,6 +87,7 @@ public sealed class AllocationTests(StandaloneFixture f) : IClassFixture<Standal
         await Task.Delay(1500); // warm-up: tiering, pools
         using var listener = new AllocListener();
         GC.Collect();
+        await Task.Delay(500); // the listener's own event dispatch (EventPipe, asynchronous) must not land in the window
         var before = GC.GetTotalAllocatedBytes(precise: true);
         var rtBefore = Interlocked.Read(ref roundTrips);
         listener.Recording = true;
