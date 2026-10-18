@@ -6,6 +6,7 @@ public sealed class CursorInfo
     public required long CursorId;
     public required string OpenOpId, ShapeHash;
     public string? App, Db, Coll;
+    public bool AwaitsByDesign;   // tailable / awaitData / change stream: its getMores wait by design
     public long OpenedTs, LastActivityTs;
     public long Documents;
     public int GetMores;
@@ -36,14 +37,14 @@ public sealed class CursorRegistry
     public IEnumerable<CursorInfo> Closed => _closed;
     public IReadOnlyDictionary<string, CursorShapeStats> ByShape => _byShape;
 
-    public void Opened(string proxyId, string member, long cursorId, string opId, string shapeHash, string? app, string? db, string? coll, long ts, int firstBatch)
+    public void Opened(string proxyId, string member, long cursorId, string opId, string shapeHash, string? app, string? db, string? coll, long ts, int firstBatch, bool awaitsByDesign = false)
     {
         if (_open.Count >= MaxOpen) // bounded: the oldest open cursor is dropped from tracking, not closed
             _open.Remove(_open.MinBy(kv => kv.Value.LastActivityTs).Key);
         _open[(proxyId, member, cursorId)] = new CursorInfo
         {
             ProxyId = proxyId, Member = member, CursorId = cursorId, OpenOpId = opId, ShapeHash = shapeHash,
-            App = app, Db = db, Coll = coll, OpenedTs = ts, LastActivityTs = ts, Documents = firstBatch,
+            App = app, Db = db, Coll = coll, OpenedTs = ts, LastActivityTs = ts, Documents = firstBatch, AwaitsByDesign = awaitsByDesign,
         };
     }
 
@@ -58,9 +59,11 @@ public sealed class CursorRegistry
         return c;
     }
 
-    public CursorInfo? Close(string proxyId, string member, long cursorId, string reason, long ts)
+    /// <param name="finalGetMore">closed by a getMore (its batch, possibly empty, counts)</param>
+    public CursorInfo? Close(string proxyId, string member, long cursorId, string reason, long ts, int returned = 0, bool finalGetMore = false)
     {
         if (!_open.Remove((proxyId, member, cursorId), out var c)) return null;
+        if (finalGetMore) { c.Documents += returned; c.GetMores++; }
         c.ClosedReason = reason;
         c.ClosedTs = ts;
         _closed.Enqueue(c);

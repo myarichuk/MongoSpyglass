@@ -1,0 +1,47 @@
+@inherits LayoutComponentBase
+@inject IJSRuntime JS
+@inject Api Api
+@inject NavigationManager Nav
+
+<div class="flex h-screen overflow-hidden">
+    <nav class="w-44 shrink-0 border-r border-line bg-surface-2 flex flex-col" aria-label="Main">
+        <div class="px-container-padding py-3 font-display-mono text-display-mono text-accent">spyglass</div>
+        <NavLink class="px-container-padding py-1.5 text-ink hover:bg-surface-3 hover:no-underline" activeClass="bg-surface-3 border-l-2 border-accent" href="" Match="NavLinkMatch.All">Live</NavLink>
+        <NavLink class="px-container-padding py-1.5 text-ink hover:bg-surface-3 hover:no-underline" activeClass="bg-surface-3 border-l-2 border-accent" href="shapes">Shapes</NavLink>
+        <NavLink class="px-container-padding py-1.5 text-ink hover:bg-surface-3 hover:no-underline" activeClass="bg-surface-3 border-l-2 border-accent" href="alerts">Alerts</NavLink>
+        <NavLink class="px-container-padding py-1.5 text-ink hover:bg-surface-3 hover:no-underline" activeClass="bg-surface-3 border-l-2 border-accent" href="cursors">Cursors</NavLink>
+        <NavLink class="px-container-padding py-1.5 text-ink hover:bg-surface-3 hover:no-underline" activeClass="bg-surface-3 border-l-2 border-accent" href="producers">Topology &amp; producers</NavLink>
+        <div class="mt-auto p-container-padding flex flex-col gap-2">
+            <button class="btn" @onclick="ToggleTheme" aria-label="Toggle theme">@(_dark ? "☀ Light" : "☾ Dark")</button>
+            @if (_auth == "password")
+            {
+                <button class="btn" @onclick="Logout">Sign out</button>
+            }
+        </div>
+    </nav>
+    <main class="flex-1 overflow-auto">@Body</main>
+</div>
+
+@code {
+    private bool _dark = true;
+    private string? _auth;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _dark = await JS.InvokeAsync<bool>("spyglass.isDark");
+        try
+        {
+            var me = await Api.Whoami();
+            if (me.ValueKind == JsonValueKind.Object) _auth = me.GetProperty("auth").GetString();
+        }
+        catch (HttpRequestException) { }
+    }
+
+    private async Task ToggleTheme() => _dark = await JS.InvokeAsync<bool>("spyglass.toggleTheme");
+
+    private async Task Logout()
+    {
+        await Api.Logout();
+        Nav.NavigateTo("login", forceLoad: false);
+    }
+}

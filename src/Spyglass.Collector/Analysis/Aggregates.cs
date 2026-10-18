@@ -105,8 +105,8 @@ public sealed class AggregateBook
     {
         var r = op.Op;
         b.Count++;
-        if (op.IsError) b.Errors++;
-        if (r.ServerLatencyUs is { } lat) b.Latency.Add(lat);
+        if (op.Failed) b.Errors++;
+        if (r.ServerLatencyUs is { } lat && !op.AwaitsByDesign) b.Latency.Add(lat); // waiting by design is not latency
         b.SumRespBytes += r.RespBytes;
         b.SumReqBytes += r.ReqBytes;
         if (r.Reply?.NReturned is { } nr) { b.SumReturned += nr; b.MaxReturned = Math.Max(b.MaxReturned, nr); }

@@ -35,7 +35,7 @@ internal sealed class AnalysisStage
     private readonly Dictionary<(string, string, long, int), Operation> _streams = [];
     private readonly Queue<(string, string, long, int)> _streamOrder = new();
     private readonly Dictionary<(string?, string?), long> _collMaxReturned = [];
-    private readonly Dictionary<(string?, string, string?), (long Minute, long Count, long Errors)> _errorWindows = [];
+    private readonly Dictionary<(string?, string, string?), (long Minute, long Count, long Errors, string? LastFailure)> _errorWindows = [];
     private readonly Func<long> _nowUs;
     private Thread? _thread;
     private volatile CursorInfo[] _openCursors = [];
@@ -150,6 +150,7 @@ internal sealed class AnalysisStage
                 op.ShapeHash = c.ShapeHash;   // 03 §4.3: getMores group with the query that opened the cursor
                 op.ShapeJson = Aggregates.Shapes.TryGetValue(c.ShapeHash, out var si) ? si.ShapeJson : op.ShapeJson;
                 op.App ??= c.App;
+                op.AwaitsByDesign |= c.AwaitsByDesign;
             }
             if (r.Reply is { } f)
             {
@@ -158,12 +159,18 @@ internal sealed class AnalysisStage
                     if (Cursors.Close(r.ProxyId, r.Member, gm, "server-expired", r.Ts) is { } closed)
                         Abandoned(closed, op, "the server expired the cursor (CursorNotFound)");
                 }
-                else if (f.CursorId == 0) Cursors.Close(r.ProxyId, r.Member, gm, "exhausted", r.Ts + (r.RespLastUs ?? 0));
-                else Cursors.Touched(r.ProxyId, r.Member, gm, r.Ts, f.NReturned ?? 0);
+                else
+                {
+                    var c2 = f.CursorId == 0
+                        ? Cursors.Close(r.ProxyId, r.Member, gm, "exhausted", r.Ts + (r.RespLastUs ?? 0), returned: f.NReturned ?? 0, finalGetMore: true)
+                        : Cursors.Touched(r.ProxyId, r.Member, gm, r.Ts, f.NReturned ?? 0);
+                    // drivers cap getMore batches (Node: 1000), so a collection's size shows in cursor totals, not single replies
+                    if (c2 != null) LargeCollection(c2.Db, c2.Coll, c2.Documents);
+                }
             }
         }
         else if (CursorOpeners.Contains(r.Command) && r.Reply?.CursorId is { } cid and not 0)
-            Cursors.Opened(r.ProxyId, r.Member, cid, op.Id, op.ShapeHash, op.App, r.Db, r.Coll, r.Ts, r.Reply.NReturned ?? 0);
+            Cursors.Opened(r.ProxyId, r.Member, cid, op.Id, op.ShapeHash, op.App, r.Db, r.Coll, r.Ts, r.Reply.NReturned ?? 0, op.AwaitsByDesign);
         else if (r.Command == "killCursors" && op.KillCursorIds != null && r.Status == "ok")
             foreach (var id in op.KillCursorIds) Cursors.Close(r.ProxyId, r.Member, id, "killed", r.Ts);
 
@@ -179,36 +186,38 @@ internal sealed class AnalysisStage
 
         // ---- global rules (03 §5.2, wire-only) ----
         var nr = r.Reply?.NReturned ?? 0;
-        if (nr > 0)
-            _collMaxReturned[(r.Db, r.Coll)] = Math.Max(_collMaxReturned.GetValueOrDefault((r.Db, r.Coll)), nr);
+        LargeCollection(r.Db, r.Coll, nr);
 
-        if (r.ServerLatencyUs > _options.SlowShapeUs)
+        if (r.ServerLatencyUs > _options.SlowShapeUs && !op.AwaitsByDesign)
             Hit("slow-shape", op.ShapeHash, Scope(op, shape: true), op,
-                $"{r.Command} {r.Db}.{r.Coll} took {r.ServerLatencyUs / 1000.0:F1} ms on the server (> {_options.SlowShapeUs / 1000} ms)");
+                $"{r.Command} {op.Ns} took {r.ServerLatencyUs / 1000.0:F1} ms on the server (> {_options.SlowShapeUs / 1000} ms)");
         if (r.Command != "getMore" && (r.RespBytes > 1 << 20 || nr > 1000))
             Hit("large-result", op.ShapeHash, Scope(op, shape: true), op,
-                $"{r.Command} {r.Db}.{r.Coll} returned {nr} documents / {r.RespBytes / 1024} KiB in one reply");
+                $"{r.Command} {op.Ns} returned {nr} documents / {r.RespBytes / 1024} KiB in one reply");
         if (op.InCardinality > 1000)
-            Hit("unbounded-in", op.ShapeHash, Scope(op, shape: true), op, $"$in with {op.InCardinality} values on {r.Db}.{r.Coll}");
+            Hit("unbounded-in", op.ShapeHash, Scope(op, shape: true), op, $"$in with {op.InCardinality} values on {op.Ns}");
         if (op.Unbounded && _collMaxReturned.GetValueOrDefault((r.Db, r.Coll)) > 1000)
             Hit("unbounded-scan", $"{op.App}|{op.ShapeHash}", Scope(op, shape: true, app: true), op,
-                $"{r.Command} on {r.Db}.{r.Coll} with no filter and no limit, on a collection that has returned > 1000 documents");
+                $"{r.Command} on {op.Ns} with no filter and no limit, on a collection that has returned > 1000 documents");
         if (!r.Ack && Writes.Contains(r.Command))
             Hit("unacknowledged-writes", $"{op.App}|{r.Coll}", Scope(op, app: true, coll: true), op,
-                $"unacknowledged (w:0) {r.Command} on {r.Db}.{r.Coll}: failures are invisible to the application");
+                $"unacknowledged (w:0) {r.Command} on {op.Ns}: failures are invisible to the application");
         ErrorBurst(op);
 
         if (connectionHits != null)
             foreach (var h in connectionHits)
             {
-                var scope = h.Rule == "repeated-query"
-                    ? new Dictionary<string, string?> { ["app"] = op.App, ["valueHash"] = op.ValueHash, ["shapeHash"] = op.ShapeHash }
-                    : Scope(op, shape: true, app: true);
-                Hit(h.Rule, h.ScopeKey, scope, op, h.Summary);
+                Hit(h.Rule, h.ScopeKey, Scope(op, shape: true, app: true), op, h.Summary);
             }
 
         _live.Publish(new LiveEvent("op.created", Json.Write(w => Json.OpSummary(w, op)), op));
         _writer.Enqueue(op);
+    }
+
+    private void LargeCollection(string? db, string? coll, long returned)
+    {
+        if (returned > _collMaxReturned.GetValueOrDefault((db, coll)))
+            _collMaxReturned[(db, coll)] = returned;
     }
 
     private void ErrorBurst(Operation op)
@@ -216,19 +225,21 @@ internal sealed class AnalysisStage
         var r = op.Op;
         var key = (op.App, r.Command, r.Coll);
         var minute = r.Ts / 60_000_000;
-        var (m, n, e) = _errorWindows.GetValueOrDefault(key);
-        if (m != minute) (m, n, e) = (minute, 0, 0);
+        var (m, n, e, last) = _errorWindows.GetValueOrDefault(key);
+        if (m != minute) (m, n, e, last) = (minute, 0, 0, null);
         n++;
-        if (op.IsError) e++;
-        _errorWindows[key] = (m, n, e);
-        if (op.IsError && n >= 20 && e * 20 > n) // > 5 %
+        if (op.Failed) { e++; last = op.FailureName; }
+        _errorWindows[key] = (m, n, e, last);
+        // > 5 % with ≥ 20 ops; evaluated on each failure, and when the window reaches the volume floor
+        // (the failures may all have come first)
+        if ((op.Failed || n == 20) && n >= 20 && e * 20 > n)
         {
-            var codeName = r.Reply?.CodeName ?? r.Reply?.Code?.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            var codeName = op.Failed ? op.FailureName : last;
             var scope = Scope(op, app: true, coll: true);
             scope["command"] = r.Command;
             scope["codeName"] = codeName;
             Hit("error-burst", $"{op.App}|{r.Command}|{r.Coll}|{codeName}", scope, op,
-                $"{e} of {n} {r.Command} ops on {r.Db}.{r.Coll} failed this minute ({codeName})");
+                $"{e} of {n} {r.Command} ops on {op.Ns} failed this minute ({codeName})");
         }
         if (_errorWindows.Count > 50_000) _errorWindows.Clear();
     }

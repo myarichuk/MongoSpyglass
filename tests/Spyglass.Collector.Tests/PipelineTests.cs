@@ -159,7 +159,10 @@ public class PipelineTests : IAsyncLifetime
 
         await Send(Op(6, "getMore", gm, sid: 9, connSeq: 3, nReturned: 7, cursorId: 0));
         Assert.Empty(_c.Analysis.Cursors.Open);
-        Assert.Equal("exhausted", Assert.Single(_c.Analysis.Cursors.Closed).ClosedReason);
+        var closed = Assert.Single(_c.Analysis.Cursors.Closed);
+        Assert.Equal("exhausted", closed.ClosedReason);
+        Assert.Equal(209, closed.Documents);                       // the closing batch counts
+        Assert.Equal(2, closed.GetMores);
         Assert.Empty(Alerts("cursor-abandoned"));
     }
 
@@ -195,7 +198,10 @@ public class PipelineTests : IAsyncLifetime
             Op(2, "find", new BsonDocument { ["find"] = "big", ["filter"] = new BsonDocument("x", 1) }, coll: "big", nReturned: 1500), // large-result
             Op(3, "find", new BsonDocument { ["find"] = "orders", ["filter"] = new BsonDocument("id", new BsonDocument("$in", new BsonArray(Enumerable.Range(0, 1001)))) }),
             Op(4, "insert", status: "unacknowledged"),
-            Op(5, "find", latencyUs: 90_000));                                                    // not slow
+            Op(5, "find", latencyUs: 90_000),                                                     // not slow
+            Op(6, "hello", new BsonDocument { ["hello"] = 1, ["maxAwaitTimeMS"] = 10000 }, db: "admin", coll: null, latencyUs: 9_000_000), // streaming hello waits by design
+            Op(7, "aggregate", new BsonDocument { ["aggregate"] = "orders", ["pipeline"] = new BsonArray { new BsonDocument("$changeStream", new BsonDocument()) } }, cursorId: 31),
+            Op(8, "getMore", new BsonDocument("getMore", 31L), cursorId: 31, latencyUs: 1_000_000));                            // change stream getMore: awaitData
         Assert.Single(Alerts("slow-shape"));
         Assert.Equal(1, Alerts("slow-shape")[0].Occurrences);
         Assert.Single(Alerts("large-result"));
@@ -248,6 +254,9 @@ public class PipelineTests : IAsyncLifetime
         var q = new BsonDocument { ["find"] = "users", ["filter"] = new BsonDocument("_id", 42) };
         await Send(Conn(1, "app"), Op(1, "find", q, coll: "users", ts: _now), Op(2, "find", q, coll: "users", ts: _now + 100_000), Op(3, "find", q, coll: "users", ts: _now + 200_000));
         Assert.Single(Alerts("repeated-query"));
+        var again = new BsonDocument { ["find"] = "users", ["filter"] = new BsonDocument("_id", 44) };
+        await Send(Op(7, "find", again, coll: "users", ts: _now + 300_000), Op(8, "find", again, coll: "users", ts: _now + 400_000), Op(9, "find", again, coll: "users", ts: _now + 500_000));
+        Assert.Equal(2, Assert.Single(Alerts("repeated-query")).Occurrences); // another repeated value of the same shape: the same alert
         var other = new BsonDocument { ["find"] = "users", ["filter"] = new BsonDocument("_id", 43) };
         await Send(Op(4, "find", other, coll: "users", ts: _now), Op(5, "find", other, coll: "users", ts: _now + 2_000_000), Op(6, "find", other, coll: "users", ts: _now + 4_000_000));
         Assert.Single(Alerts("repeated-query")); // spread over 4 s: no
@@ -263,6 +272,31 @@ public class PipelineTests : IAsyncLifetime
         await Send(Op(50, "insert", status: "error", codeName: "DuplicateKey", code: 11000));
         var a = Assert.Single(Alerts("error-burst"));
         Assert.Equal("DuplicateKey", a.Scope["codeName"]);
+    }
+
+    [Fact]
+    public async Task Error_burst_counts_write_errors()
+    {
+        // a duplicate key is ok:1 + writeErrors, not ok:0: the commonest failure an app sees
+        var lines = new List<string> { Conn(1, "app") };
+        for (var i = 0; i < 20; i++) lines.Add(Op(i, "insert", writeErrors: i < 4 ? 1 : 0));
+        await Send([.. lines]);
+        var a = Assert.Single(Alerts("error-burst"));
+        Assert.Equal("WriteError", a.Scope["codeName"]);
+        Assert.Equal(4, Assert.Single(_agg.Buckets(0, long.MaxValue)).Errors);
+    }
+
+    [Fact]
+    public async Task Unbounded_scan_learns_collection_size_from_cursor_totals()
+    {
+        // drivers cap getMore batches (Node: 1000): no single reply exceeds 1000, the cursor does
+        var all = new BsonDocument { ["find"] = "orders", ["filter"] = new BsonDocument() };
+        await Send(Conn(1, "app"), Op(1, "find", all, nReturned: 101, cursorId: 5));
+        await Send(Op(2, "getMore", new BsonDocument("getMore", 5L), nReturned: 1000, cursorId: 5),
+                   Op(3, "getMore", new BsonDocument("getMore", 5L), nReturned: 1000, cursorId: 0));
+        Assert.Empty(Alerts("unbounded-scan"));
+        await Send(Op(4, "find", all, nReturned: 101, cursorId: 6));
+        Assert.Single(Alerts("unbounded-scan"));
     }
 
     [Fact]

@@ -1,0 +1,43 @@
+@page "/producers"
+@inject Api Api
+
+<PageTitle>Topology &amp; producers · Spyglass</PageTitle>
+<div class="p-container-padding flex flex-col gap-4 max-w-6xl">
+    <h1 class="h">Topology &amp; producers</h1>
+    @if (_rows.Length == 0) { <p class="text-muted">No producer has sent anything yet.</p> }
+    @foreach (var p in _rows)
+    {
+        <section class="card p-container-padding flex flex-col gap-2" aria-label="@p.Src">
+            <div class="flex flex-wrap items-baseline gap-3">
+                <span class="badge bg-surface-3">@p.Kind</span>
+                <span class="mono">@p.Src</span>
+                <span class="text-muted">@p.Version · schema @p.Schema</span>
+                <span class="ml-auto text-ui-label-sm @(Fmt.NowUs() - p.LastSeen > 120_000_000 ? "text-warn" : "text-muted")">last seen @Fmt.Ago(p.LastSeen, Fmt.NowUs()) ago</span>
+            </div>
+            @if (p.Topology != null)
+            {
+                <p>@p.Topology @(p.SetName != null ? $"({p.SetName})" : "") · capture values: <span class="mono">@p.Values</span> · compression: <span class="mono">@p.Compression</span></p>
+                <table class="tbl"><thead><tr><th>listener (member)</th><th>upstream</th></tr></thead>
+                    <tbody>
+                        @if (p.Members.ValueKind == JsonValueKind.Array)
+                        {
+                            foreach (var m in p.Members.EnumerateArray())
+                            {
+                                <tr><td class="mono">@m.GetProperty("member").GetString()</td><td class="mono">@m.GetProperty("upstream").GetString()</td></tr>
+                            }
+                        }
+                    </tbody>
+                </table>
+            }
+            <p class="text-ui-label-sm text-muted">@p.Records records · @p.Rejected rejected · @p.ClockSkewed clock-skewed
+                @if (p.Dropped.Count > 0) { <span> · dropped at the producer: @string.Join(", ", p.Dropped.Where(kv => kv.Value > 0).Select(kv => $"{kv.Key} {kv.Value}"))</span> }
+            </p>
+        </section>
+    }
+    <p class="text-ui-label-sm text-muted">Exporters (join rate, clock skew per exporter) appear here with M2/M3.</p>
+</div>
+
+@code {
+    private ProducerDto[] _rows = [];
+    protected override async Task OnInitializedAsync() => _rows = await Api.Producers();
+}

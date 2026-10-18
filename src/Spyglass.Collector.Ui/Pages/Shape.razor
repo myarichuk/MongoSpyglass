@@ -1,0 +1,83 @@
+@page "/shapes/{Hash}"
+@inject Api Api
+
+<PageTitle>Shape @Hash · Spyglass</PageTitle>
+@if (_s is { } s)
+{
+    <div class="p-container-padding flex flex-col gap-4 max-w-6xl">
+        <header class="flex flex-wrap items-baseline gap-3">
+            <h1 class="h mono">@s.Command <span class="text-muted">@s.Ns</span></h1>
+            <span class="mono text-ui-label-sm text-muted">@s.ShapeHash</span>
+            <span class="text-muted">@string.Join(", ", s.Apps)</span>
+        </header>
+        <div class="grid grid-cols-2 md:grid-cols-7 gap-2">
+            @foreach (var (k, v) in new[] { ("count", s.Count.ToString()), ("errors", s.Errors.ToString()), ("total", Fmt.Us(s.TotalTimeUs)), ("p50", Fmt.Us(s.P50Us)), ("p95", Fmt.Us(s.P95Us)), ("p99", Fmt.Us(s.P99Us)), ("max", Fmt.Us(s.MaxUs)) })
+            {
+                <div class="card px-3 py-2"><div class="text-ui-label-sm uppercase text-muted">@k</div><div class="num text-left text-ui-header">@v</div></div>
+            }
+        </div>
+        <section class="card p-container-padding" aria-label="Latency over time">
+            <h2 class="text-ui-label-sm uppercase text-muted mb-2">p95 server latency (line) and ops per minute (bars)</h2>
+            <svg viewBox="0 0 1000 160" class="w-full h-40" role="img" aria-label="latency series">
+                @if (s.Series.Length > 0)
+                {
+                    var maxC = Math.Max(1, s.Series.Max(p => p.Count));
+                    var maxL = Math.Max(1, s.Series.Max(p => p.P95Us));
+                    var w = Math.Min(40.0, 1000.0 / s.Series.Length); // a few minutes of data must not become one wall-wide bar
+                    for (var i = 0; i < s.Series.Length; i++)
+                    {
+                        var p = s.Series[i];
+                        var h = 150.0 * p.Count / maxC;
+                        <rect class="fill-surface-3" x="@F(i * w)" y="@F(160 - h)" width="@F(Math.Max(1, w - 1))" height="@F(h)"><title>@Fmt.Stamp(p.Minute * 60_000_000) · @p.Count ops · p95 @Fmt.Us(p.P95Us)</title></rect>
+                    }
+                    <polyline class="stroke-accent" fill="none" stroke-width="2"
+                              points="@string.Join(' ', s.Series.Select((p, i) => $"{F(i * w + w / 2)},{F(155 - 145 * p.P95Us / maxL)}"))" />
+                }
+            </svg>
+        </section>
+        <section class="card p-container-padding" aria-label="Normalized shape">
+            <h2 class="text-ui-label-sm uppercase text-muted mb-2">Normalized shape</h2>
+            <pre class="mono whitespace-pre-wrap select-text">@JsonSerializer.Serialize(s.Shape, new JsonSerializerOptions { WriteIndented = true })</pre>
+        </section>
+        <div class="grid md:grid-cols-2 gap-4">
+            @foreach (var (title, list) in new[] { ("Slowest", s.Slowest), ("Latest", s.Latest) })
+            {
+                <section class="card" aria-label="@title">
+                    <h2 class="text-ui-label-sm uppercase text-muted p-container-padding pb-1">@title</h2>
+                    <table class="tbl">
+                        <tbody>
+                            @foreach (var o in list)
+                            {
+                                <tr data-href="ops/@o.Id" tabindex="0"><td class="mono text-muted"><a href="ops/@o.Id">@Fmt.Stamp(o.Ts)</a></td><td>@o.App</td><td class="num">@Fmt.Us(o.ServerLatencyUs)</td><td><StatusBadge Status="@o.Status" /></td></tr>
+                            }
+                        </tbody>
+                    </table>
+                </section>
+            }
+        </div>
+        @if (s.Cursors is { } c)
+        {
+            <section class="card p-container-padding" aria-label="Cursors">
+                <h2 class="text-ui-label-sm uppercase text-muted mb-2">Cursors</h2>
+                <p>@c.Closed closed · @c.Documents documents · @c.GetMores getMores @(c.MeanTimeToExhaustionUs is { } t ? $"· mean time to exhaustion {Fmt.Us(t)}" : "")</p>
+                <p class="text-muted">@string.Join(" · ", c.Reasons.Select(kv => $"{kv.Key}: {kv.Value}"))</p>
+            </section>
+        }
+    </div>
+}
+else if (_loaded) { <p class="p-container-padding text-muted">Unknown shape.</p> }
+
+@code {
+    [Parameter] public string Hash { get; set; } = "";
+    [SupplyParameterFromQuery] public string? Range { get; set; }
+    private ShapeDetail? _s;
+    private bool _loaded;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        _s = await Api.Shape(Hash, TimeRange.Query(Range));
+        _loaded = true;
+    }
+
+    private static string F(double v) => v.ToString("F1", System.Globalization.CultureInfo.InvariantCulture);
+}

@@ -1,0 +1,8 @@
+<label class="flex flex-col gap-0.5">
+    <span class="text-ui-label-sm text-muted">@Label</span>
+    @ChildContent
+</label>
+@code {
+    [Parameter] public string Label { get; set; } = "";
+    [Parameter] public RenderFragment? ChildContent { get; set; }
+}

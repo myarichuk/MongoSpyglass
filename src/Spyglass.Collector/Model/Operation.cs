@@ -22,6 +22,13 @@ public sealed class Operation
     public List<long>? KillCursorIds;
     /// <summary>find/count/aggregate without a filter/limit or a leading $match/$limit (03 §5.2 unbounded-scan input).</summary>
     public bool Unbounded;
+    /// <summary>
+    /// Waits on the server by design: hello-family monitoring (streaming hello holds for maxAwaitTimeMS),
+    /// tailable/awaitData cursors and change streams, and their getMores. Not slow, whatever its latency.
+    /// </summary>
+    public bool AwaitsByDesign;
+    /// <summary>"db.coll", or "db" for commands with no collection.</summary>
+    public string Ns => Op.Coll is { } c ? $"{Op.Db}.{c}" : Op.Db ?? "";
     public int ReplyCount;
     /// <summary>Alert rules this op raised (03 §8 op detail "linked alerts").</summary>
     public List<string>? Alerts;
@@ -29,6 +36,19 @@ public sealed class Operation
     public long Ts => Op.Ts;
     public long? ServerLatencyUs => Op.ServerLatencyUs;
     public bool IsError => Op.Status == "error";
+    /// <summary>
+    /// Failed from the application's point of view: ok:0, or ok:1 with write errors or a write-concern error
+    /// (a duplicate key is ok:1 + writeErrors). What error-burst and the aggregates' error counts use.
+    /// </summary>
+    public bool Failed => IsError || Op.Reply is { WriteErrors: > 0 } or { WriteConcernError: true };
+    public string? FailureName => Op.Reply switch
+    {
+        { CodeName: { } cn } => cn,
+        { Code: { } code } => code.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        { WriteErrors: > 0 } => "WriteError",
+        { WriteConcernError: true } => "WriteConcernError",
+        _ => null,
+    };
 }
 
 /// <summary>ULIDs (Crockford base32, 48-bit ms time + 80 random bits): sortable by creation time.</summary>

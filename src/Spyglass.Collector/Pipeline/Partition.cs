@@ -130,12 +130,22 @@ internal sealed class Partition
         op.ShapeJson = shape.ShapeJson;
         op.InCardinality = shape.InCardinality;
         op.Unbounded = cmd != null && IsUnbounded(r.Command, cmd);
+        op.AwaitsByDesign = AwaitsByDesign(r.Command, cmd);
 
         _toAnalysis(op, DataCommands.Contains(r.Command) ? ConnectionRules(op) : null);
         return true;
     }
 
     private static bool IsRedacted(string command) => command is "authenticate" or "saslStart" or "saslContinue" or "getnonce" or "createUser" or "updateUser" or "copydbgetnonce" or "copydbsaslstart" or "copydb";
+
+    internal static bool AwaitsByDesign(string command, BsonDocument? cmd)
+    {
+        if (command is "hello" or "isMaster" or "ismaster") return true;
+        if (cmd == null) return false;
+        if (cmd.TryGetValue("tailable", out var t) && t.ToBoolean() || cmd.TryGetValue("awaitData", out var a) && a.ToBoolean()) return true;
+        return command == "aggregate" && cmd.TryGetValue("pipeline", out var p) && p is BsonArray { Count: > 0 } stages &&
+               stages[0] is BsonDocument { ElementCount: > 0 } first && first.GetElement(0).Name == "$changeStream";
+    }
 
     /// <summary>03 §5.2 unbounded-scan input: no filter and no limit, or an aggregate without a leading $match/$limit.</summary>
     internal static bool IsUnbounded(string command, BsonDocument cmd)
@@ -174,7 +184,7 @@ internal sealed class Partition
         st.LastRespLastAbs = r.Ts + (r.RespLastUs ?? r.ReqLastUs);
         if (st.Run == _options.NPlusOneCount)
             (hits ??= []).Add(new RuleHit("n-plus-one-suspected", $"{op.App}|{op.ShapeHash}",
-                $"{st.Run}+ {r.Command} ops of one shape back to back on one connection (suspected: no unit-of-work context)"));
+                $"{st.Run}+ {r.Command} ops on {op.Ns} of one shape back to back on one connection (suspected: no unit-of-work context)"));
 
         // the same values ≥ M times within 1 s on one connection
         if (op.ValueHash is { } vh)
@@ -184,9 +194,10 @@ internal sealed class Partition
                     st.Values.Remove(stale);
             var (first, n) = st.Values.TryGetValue(vh, out var e) && r.Ts - e.FirstTs <= 1_000_000 ? e : (r.Ts, 0);
             st.Values[vh] = (first, ++n);
+            // scoped by shape, not by value: one alert per repeated value floods the list (03 §5.2 note)
             if (n == _options.RepeatedQueryCount)
-                (hits ??= []).Add(new RuleHit("repeated-query", $"{op.App}|{vh}",
-                    $"the same {r.Command} with the same values {n}× within 1 s on one connection (suspected)"));
+                (hits ??= []).Add(new RuleHit("repeated-query", $"{op.App}|{op.ShapeHash}",
+                    $"the same {r.Command} on {op.Ns} with the same values {n}× within 1 s on one connection (suspected)"));
         }
         return hits;
     }

@@ -158,20 +158,30 @@ Alert { id, rule, scope{shapeHash?, coll?, app?, member?, uowName?, callsite?}, 
 
 | Rule | Needs exporter | Trigger | Scope | Default |
 |---|---|---|---|---|
-| `slow-shape` | no | `serverLatency_us > threshold` | shapeHash | threshold 100 ms; also per-shape p95 regression ×3 vs the 1-hour baseline (needs ≥ 50 samples) |
+| `slow-shape` | no | `serverLatency_us > threshold`, except ops that wait by design (hello family, tailable/awaitData cursors, change streams, and their getMores) | shapeHash | threshold 100 ms; also per-shape p95 regression ×3 vs the 1-hour baseline (needs ≥ 50 samples) |
 | `n-plus-one` | yes (precise) | within one UoW: ≥ N ops of the same shapeHash with ≥ 2 distinct valueHashes | (uowName, shapeHash, callsite) | N = 10 |
 | `n-plus-one-suspected` | no | same connection: ≥ N same-shape ops, each starting ≤ G after the previous reply's `respLast` (tight-loop signature) | (app, shapeHash) | N = 10, G = 5 ms. Labelled "suspected (no unit-of-work context)" |
-| `repeated-query` | yes (precise) / no (suspected) | ≥ M ops with the same valueHash within one UoW (or within 1 s on one connection) | (uowName or app, valueHash) | M = 3 |
-| `unbounded-scan` | no | `find`/`count` with an empty filter and no limit, or an aggregate without a leading `$match`/`$limit`, on a collection that has returned > 1000 docs in any op | (app, shapeHash) | — |
+| `repeated-query` | yes (precise) / no (suspected) | ≥ M ops with the same valueHash within one UoW (or within 1 s on one connection) | (uowName or app, shapeHash); the repeated values are the samples | M = 3 |
+| `unbounded-scan` | no | `find`/`count` with an empty filter and no limit, or an aggregate without a leading `$match`/`$limit`, on a collection that has returned > 1000 docs in any op or cursor | (app, shapeHash) | — |
 | `large-result` | no | `respBytes > 1 MiB` or `nReturned > 1000` (first batch) | shapeHash | — |
 | `unbounded-in` | no | `inCardinality > 1000` | shapeHash | — |
 | `cursor-abandoned` | no | §5.4 | (app, shapeHash) | — |
 | `cursor-not-exhausted` | yes | the UoW ended while a cursor it opened was still open | (uowName, callsite) | grace 1 s |
 | `pool-starvation` | yes | p95 `poolWait_us` > 10 ms over 1 min, or any `checkoutFailed.timeout > 0` | (app, member) | — |
 | `client-overhead` | yes | `clientOverhead_us > max(5 ms, 50% of client_us)` for ≥ 20% of a shape's ops over 1 min | (app, shapeHash) | — |
-| `error-burst` | no | > 5% errors for one `(app, command, coll)` over 1 min, with ≥ 20 ops | (app, command, coll, codeName) | — |
+| `error-burst` | no | > 5% failures for one `(app, command, coll)` over 1 min, with ≥ 20 ops. A failure is `ok:0`, or `ok:1` with write errors or a write-concern error | (app, command, coll, codeName) | — |
 | `unacknowledged-writes` | no | any `ack=false` write (info) | (app, coll) | — |
 | `exporter-skew` | yes | per `src`, \|clock skew\| > 1 s, or join conflicts > 0 | src | — |
+
+Notes from running these against real drivers (M1):
+
+* `repeated-query` was scoped by `valueHash`. That gave one alert per repeated value: a loop
+  over 20 ids repeated a few times opened 20 alerts for one defect.
+* "Returned > 1000 docs in any op" never held. Drivers cap a getMore batch (Node: 1000), so a
+  3000-document scan never returns more than 1000 in one reply. Cursor totals are counted too.
+* A duplicate key is `ok:1` with `writeErrors`, not `ok:0`. Counting only `ok:0` hid the
+  commonest failure an application sees. The per-shape aggregate `errors` uses the same
+  definition.
 
 ### 5.3 Unit of work
 

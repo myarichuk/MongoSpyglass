@@ -56,7 +56,7 @@ internal sealed class StorageWriter
     }
 
     private bool Keep(Operation op) =>
-        op.IsError || op.Alerts is { Count: > 0 } || op.ServerLatencyUs > _options.SlowShapeUs;
+        op.IsError || op.Alerts is { Count: > 0 } || (op.ServerLatencyUs > _options.SlowShapeUs && !op.AwaitsByDesign);
 
     public void Complete() => _queue.CompleteAdding();
     public void Join() => _thread?.Join();

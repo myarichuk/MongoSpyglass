@@ -1,0 +1,22 @@
+@* A tiny inline SVG line: one shape's trend (03 §10 Shapes). *@
+<svg width="@Width" height="@Height" viewBox="0 0 @Width @Height" class="inline-block align-middle text-accent" aria-hidden="true">
+    @if (_points != null)
+    {
+        <polyline fill="none" stroke="currentColor" stroke-width="1.5" points="@_points" />
+    }
+</svg>
+
+@code {
+    [Parameter] public IReadOnlyList<double>? Values { get; set; }
+    [Parameter] public int Width { get; set; } = 90;
+    [Parameter] public int Height { get; set; } = 20;
+    private string? _points;
+
+    protected override void OnParametersSet()
+    {
+        if (Values is not { Count: > 1 } v) { _points = null; return; } // one point is not a trend
+        var max = Math.Max(1e-9, v.Max());
+        var step = v.Count > 1 ? (Width - 2.0) / (v.Count - 1) : 0;
+        _points = string.Join(' ', v.Select((x, i) => FormattableString.Invariant($"{1 + i * step:F1},{Height - 1 - (Height - 2) * x / max:F1}")));
+    }
+}

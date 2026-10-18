@@ -13,7 +13,7 @@ internal static class Records
     public static string Op(int requestId, string command, BsonDocument? cmd = null, string db = "shop", string? coll = "orders",
         long ts = 0, long sid = 7, long connSeq = 1, string status = "ok", long latencyUs = 500, int? nReturned = null,
         long? cursorId = null, int respBytes = 200, string? codeName = null, int? code = null, bool stream = false,
-        bool truncated = false, string member = "localhost:27017", string src = Proxy)
+        bool truncated = false, string member = "localhost:27017", string src = Proxy, int writeErrors = 0)
     {
         var o = new Dictionary<string, object?>
         {
@@ -31,6 +31,7 @@ internal static class Records
             if (cursorId != null) reply["cursorId"] = cursorId.Value.ToString();
             if (codeName != null) reply["codeName"] = codeName;
             if (code != null) reply["code"] = code;
+            if (writeErrors > 0) reply["writeErrors"] = writeErrors;
             o["reply"] = reply;
         }
         else o["t"] = new Dictionary<string, long> { ["reqLast_us"] = 2 };

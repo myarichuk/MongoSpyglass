@@ -1,0 +1,84 @@
+@page "/alerts"
+@inject Api Api
+@inject NavigationManager Nav
+
+<PageTitle>Alerts · Spyglass</PageTitle>
+<div class="p-container-padding flex flex-col gap-4 max-w-6xl">
+    <header class="flex items-end gap-3">
+        <h1 class="h mr-4">Alerts</h1>
+        <Field Label="state">
+            <select class="input" value="@(State ?? "open")" @onchange="SetState">
+                <option value="open">open</option><option value="resolved">resolved</option><option value="all">all</option>
+            </select>
+        </Field>
+    </header>
+    @if (_loaded && _alerts.Length == 0) { <p class="text-muted">No @(State ?? "open") alerts.</p> }
+    @foreach (var g in _alerts.GroupBy(a => a.Rule).OrderBy(g => g.Key))
+    {
+        <section class="card" aria-label="@g.Key">
+            <h2 class="flex items-center gap-2 px-container-padding py-2 border-b border-line">
+                <span class="mono">@g.Key</span><span class="badge bg-surface-3 text-muted">@g.Count()</span>
+                <span class="text-ui-label-sm text-muted ml-2">@Explain(g.Key)</span>
+            </h2>
+            @foreach (var a in g.OrderByDescending(a => a.LastSeen))
+            {
+                <div class="px-container-padding py-2 border-b border-line/50 flex flex-col gap-1 @(a.Muted ? "opacity-60" : "")">
+                    <div class="flex flex-wrap items-center gap-2">
+                        <span class="badge @Sev(a.Severity)">@a.Severity</span>
+                        <span>@a.Summary</span>
+                        <span class="ml-auto text-ui-label-sm text-muted">×@a.Occurrences · first @Fmt.Stamp(a.FirstSeen) · last @Fmt.Stamp(a.LastSeen) @(a.State == "resolved" ? "· resolved" : "")</span>
+                        <button class="btn" @onclick="() => Toggle(a)">@(a.Muted ? "unmute" : "mute")</button>
+                    </div>
+                    <div class="text-ui-label-sm text-muted flex flex-wrap gap-3">
+                        @foreach (var (k, v) in a.Scope)
+                        {
+                            @if (k == "shapeHash") { <a class="mono" href="shapes/@v">shape @v</a> } else { <span>@k: <span class="mono">@v</span></span> }
+                        }
+                        @if (a.SampleOpIds.Length > 0)
+                        {
+                            <span>samples:
+                                @foreach (var id in a.SampleOpIds) { <a class="mono mr-1" href="ops/@id">@id[^6..]</a> }
+                            </span>
+                        }
+                    </div>
+                </div>
+            }
+        </section>
+    }
+</div>
+
+@code {
+    [SupplyParameterFromQuery] public string? State { get; set; }
+    private AlertDto[] _alerts = [];
+    private bool _loaded;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        _alerts = await Api.Alerts(State is "all" ? "" : "state=" + (State ?? "open"));
+        _loaded = true;
+    }
+
+    private void SetState(ChangeEventArgs e) => Nav.NavigateTo(Nav.GetUriWithQueryParameter("state", e.Value?.ToString()));
+
+    private async Task Toggle(AlertDto a)
+    {
+        if (await Api.Mute(a.Id, !a.Muted))
+            _alerts = await Api.Alerts(State is "all" ? "" : "state=" + (State ?? "open"));
+    }
+
+    private static string Sev(string s) => s switch { "critical" => "bg-bad/15 text-bad", "warning" => "bg-warn/15 text-warn", _ => "bg-surface-3 text-muted" };
+
+    private static string Explain(string rule) => rule switch
+    {
+        "slow-shape" => "server latency over the threshold, or p95 at ≥ 3× the previous hour",
+        "n-plus-one-suspected" => "the same shape back to back on one connection: a query in a loop (no unit-of-work context)",
+        "repeated-query" => "the same query with the same values, repeatedly, within a second",
+        "unbounded-scan" => "no filter and no limit on a collection known to be large",
+        "large-result" => "> 1 MiB or > 1000 documents in one reply",
+        "unbounded-in" => "$in with more than 1000 values",
+        "cursor-abandoned" => "a cursor the client stopped reading: the server expired it",
+        "error-burst" => "> 5% of a command's ops failing in a minute",
+        "unacknowledged-writes" => "w:0 writes: failures never reach the application",
+        _ => "",
+    };
+}
