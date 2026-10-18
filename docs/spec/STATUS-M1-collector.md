@@ -97,6 +97,13 @@ alerted op; the aggregates stay complete).
 3. ~~A container image~~: `src/Spyglass.Collector/Dockerfile` (03 §12). Its build stage was replayed
    command for command and its output run as the container runs it; `docker build` itself still needs a
    machine with Docker.
-4. One full-suite Release run had one `EndToEndTests` failure whose message was lost. It has
-   not reproduced in 9 runs since, nor in 5 standalone. The test names the missing keys if it
-   recurs.
+4. ~~The one-off `EndToEndTests` failure~~. Its message was lost, so it can't be proven. The
+   test's one timing-dependent assertion is the `n-plus-one-suspected` alert: 10 finds back to
+   back, each starting within 5 ms of the previous reply. Measured under load (6 CPU burners on
+   4 vCPUs), most gaps were 0.5–1 ms, but spikes reached 4.5 ms, and the first iteration took up
+   to 12 ms. One gap over 5 ms mid-loop leaves no run of 10. The test now uses a 50 ms gap, since the
+   5 ms threshold is the rule tests' business, and prints the measured gaps if it ever fails. The
+   other candidate, an op analysed before its `conn` record, can't happen: the proxy writes
+   `conn open` from the same worker before the first op, its sender posts sequentially, and
+   ingest applies `conn` records synchronously. Since then: 6 full collector runs (3 Debug,
+   3 Release with the benches) and the proxy suite in both, green.

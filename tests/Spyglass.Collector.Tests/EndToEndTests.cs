@@ -27,6 +27,10 @@ public sealed class EndToEndTests : IAsyncLifetime
         _collector = await Server.StartAsync(new CollectorOptions
         {
             Bind = new IPEndPoint(IPAddress.Loopback, 0), Token = Token, Auth = AuthMode.None, Data = null, Workers = 2,
+            // The tight-loop gap (03 §5.2, 5 ms) is the rule's tests' business; here the point is that real traffic raises
+            // the alert. Under a loaded full-suite run the driver's loop showed scheduling gaps up to 4.5 ms (12 ms on the
+            // first iteration): one over 5 ms mid-loop leaves no run of 10, and the alert never fires.
+            NPlusOneGapUs = 50_000,
         });
         _proxy = await ProxyHost.StartAsync(_mongo.DirectUri, listeners: 1, configure: a =>
         {
@@ -104,7 +108,9 @@ public sealed class EndToEndTests : IAsyncLifetime
         Assert.True(Exhausted());
 
         var alerts = _collector.Collector.Analysis.Alerts.Snapshot();
-        Assert.Contains(alerts, a => a.Rule == "n-plus-one-suspected");
+        var loop = ops.Where(o => o.Op.Command == "find" && o.Op.Coll == "orders" && o.Op.Reply is { CursorId: 0, NReturned: 1 }).OrderBy(o => o.Op.Ts).ToList();
+        Assert.True(alerts.Any(a => a.Rule == "n-plus-one-suspected"), "no n-plus-one-suspected; gaps (ms) in the loop: " +
+            string.Join(" ", loop.Zip(loop.Skip(1), (a, b) => ((b.Op.Ts - a.Op.Ts - (a.Op.RespLastUs ?? 0)) / 1000.0).ToString("F2"))));
         Assert.Contains(ops, o => o.Op.Command == "insert" && o.Failed); // the duplicate key: ok:1 + writeErrors
         var producer = Assert.Single(_collector.Collector.Producers.All);
         Assert.Equal(_proxy.Server.ProxyId.ToString(), producer.Src);
