@@ -51,3 +51,35 @@ public sealed class TestCertificates
         return new TestCertificates { CaFile = caFile, ServerPemFile = pemFile, ServerCertFile = certFile, ServerKeyFile = keyFile };
     }
 }
+
+public static class TestClients
+{
+    /// <summary>
+    /// The .NET driver does not honour <c>tlsCAFile</c> in a connection string; trust is configured through
+    /// <see cref="MongoDB.Driver.SslSettings"/>. <paramref name="caFile"/> is a PEM bundle to trust instead of the system store.
+    /// </summary>
+    public static MongoDB.Driver.MongoClient Create(string uri, string? caFile, Action<MongoDB.Driver.MongoClientSettings>? configure = null)
+    {
+        var settings = MongoDB.Driver.MongoClientSettings.FromConnectionString(uri);
+        if (caFile != null)
+        {
+            var trust = new X509Certificate2Collection();
+            trust.ImportFromPemFile(caFile);
+            settings.UseTls = true;
+            settings.SslSettings = new MongoDB.Driver.SslSettings
+            {
+                ServerCertificateValidationCallback = (_, cert, _, errors) =>
+                {
+                    if (cert == null || (errors & System.Net.Security.SslPolicyErrors.RemoteCertificateNameMismatch) != 0) return false;
+                    using var chain = new X509Chain();
+                    chain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
+                    chain.ChainPolicy.CustomTrustStore.AddRange(trust);
+                    chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+                    return chain.Build(new X509Certificate2(cert));
+                }
+            };
+        }
+        configure?.Invoke(settings);
+        return new MongoDB.Driver.MongoClient(settings);
+    }
+}

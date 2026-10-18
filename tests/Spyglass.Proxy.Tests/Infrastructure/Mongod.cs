@@ -166,7 +166,7 @@ public sealed class Deployment : IAsyncDisposable
             var hosts = string.Join(',', Members.Select(m => $"localhost:{m.Port}"));
             var opts = new List<string>();
             if (SetName != null) opts.Add("replicaSet=" + SetName);
-            if (Tls != null) opts.Add("tls=true&tlsCAFile=" + Uri.EscapeDataString(Tls.CaFile));
+            if (Tls != null) opts.Add("tls=true");
             return $"mongodb://{hosts}/" + (opts.Count > 0 ? "?" + string.Join('&', opts) : "");
         }
     }
@@ -193,7 +193,7 @@ public sealed class Deployment : IAsyncDisposable
             await p.WaitListeningAsync(TimeSpan.FromSeconds(30));
 
         var d = new Deployment { Kind = "replicaSet", Members = procs, Root = root, SetName = setName, Tls = tls };
-        var direct = new MongoClient(d.MemberUri(0, direct: true));
+        var direct = d.NewClient(d.MemberUri(0, direct: true));
         var config = new BsonDocument
         {
             ["_id"] = setName,
@@ -209,9 +209,12 @@ public sealed class Deployment : IAsyncDisposable
         return d;
     }
 
+    /// <summary>A client for this deployment that trusts its test CA.</summary>
+    public MongoClient NewClient(string uri) => TestClients.Create(uri, Tls?.CaFile);
+
     public string MemberUri(int i, bool direct)
     {
-        var tls = Tls != null ? "&tls=true&tlsCAFile=" + Uri.EscapeDataString(Tls.CaFile) : "";
+        var tls = Tls != null ? "&tls=true" : "";
         return $"mongodb://localhost:{Members[i].Port}/?directConnection={(direct ? "true" : "false")}{tls}";
     }
 
@@ -224,7 +227,7 @@ public sealed class Deployment : IAsyncDisposable
             {
                 try
                 {
-                    var c = new MongoClient(MemberUri(i, direct: true));
+                    var c = NewClient(MemberUri(i, direct: true));
                     var hello = await c.GetDatabase("admin").RunCommandAsync<BsonDocument>(new BsonDocument("hello", 1));
                     if (hello.GetValue("isWritablePrimary", false).ToBoolean())
                         return;
