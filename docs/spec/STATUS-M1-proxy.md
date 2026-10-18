@@ -128,7 +128,7 @@ slots). At under 3 % of the per-frame forwarding cost, it isn't worth it now.
 
 ## Open for M1
 
-1. Collector v1 (wire-only, 03): ingest, shapes, analyzers, storage, UI. Not started.
+1. ~~Collector v1~~ built: see [STATUS-M1-collector.md](STATUS-M1-collector.md).
 2. ~~Record size~~ done: wire records omit absent/default fields and derivable values, and drop
    `proxyId` (it is `src`). 02 §4 has the rules and the derivations. A point-lookup op record
    went from 858 to 497 B; the worker's record-building CPU moved only ~0.2 µs/op, so JSON size

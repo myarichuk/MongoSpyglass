@@ -1,6 +1,5 @@
 using System.Collections.Concurrent;
 using MongoDB.Bson;
-using MongoDB.Bson.Serialization;
 using Spyglass.Collector.Model;
 using Spyglass.Collector.Shapes;
 
@@ -25,31 +24,32 @@ internal sealed class Partition
         public long LastRespLastAbs;
         public int Run;
         public readonly Dictionary<string, (long FirstTs, int Count)> Values = [];
+        /// <summary>Values in first-seen order: expiry pops from the front, O(1) per op.</summary>
+        public readonly Queue<(string Hash, long FirstTs)> ValueOrder = new();
     }
 
     private readonly CollectorOptions _options;
     private readonly ConnectionRegistry _conns;
     private readonly ProducerRegistry _producers;
-    private readonly Action<Operation, List<RuleHit>?> _toAnalysis;
-    private readonly Action<StreamRecord> _streamToAnalysis;
+    /// <summary>One hand-off per ingested batch, not per record: a per-item blocking queue cost a lock round trip per record.</summary>
+    private readonly Action<List<(Operation, List<RuleHit>?)>, List<StreamRecord>?> _toAnalysis;
     private readonly Action<Record> _release;
-    private readonly BlockingCollection<Record> _queue = new(new ConcurrentQueue<Record>());
+    private readonly BlockingCollection<List<Record>> _queue = new(new ConcurrentQueue<List<Record>>());
     private readonly Dedup _dedup = new(1 << 18);
     private readonly Dictionary<(string, long), ConnState> _state = [];
     private readonly Queue<(string, long)> _stateOrder = new();
-    private const int MaxConnState = 100_000;
+    private const int MaxConnState = 100_000, MaxValues = 256;
     private Thread? _thread;
 
     public long Duplicates, DecodeFailures, Processed;
 
     public Partition(CollectorOptions options, ConnectionRegistry conns, ProducerRegistry producers,
-        Action<Operation, List<RuleHit>?> toAnalysis, Action<StreamRecord> streamToAnalysis, Action<Record> release)
+        Action<List<(Operation, List<RuleHit>?)>, List<StreamRecord>?> toAnalysis, Action<Record> release)
     {
         _options = options;
         _conns = conns;
         _producers = producers;
         _toAnalysis = toAnalysis;
-        _streamToAnalysis = streamToAnalysis;
         _release = release;
     }
 
@@ -59,7 +59,8 @@ internal sealed class Partition
         _thread.Start();
     }
 
-    public void Post(Record r) => _queue.Add(r);
+    /// <summary>This partition's share of one ingested batch, in arrival order.</summary>
+    public void Post(List<Record> batch) => _queue.Add(batch);
 
     public void Complete() => _queue.CompleteAdding();
 
@@ -67,41 +68,50 @@ internal sealed class Partition
 
     private void Loop()
     {
-        foreach (var r in _queue.GetConsumingEnumerable())
+        foreach (var batch in _queue.GetConsumingEnumerable())
         {
-            var forwarded = false; // a forwarded record keeps its queue charge until the analysis stage is done with it
-            try
+            var ops = new List<(Operation, List<RuleHit>?)>(batch.Count);
+            List<StreamRecord>? streams = null;
+            foreach (var r in batch)
             {
-                switch (r)
+                var forwarded = false; // a forwarded record keeps its queue charge until the analysis stage is done with it
+                try
                 {
-                    case OpRecord op: forwarded = OnOp(op); break;
-                    case StreamRecord s:
-                        if (!_dedup.Seen(Dedup.Key(s.Src, "stream", s.Member, s.ServerConnectionId ?? -1, s.RequestId, s.Ts)))
-                        {
-                            _streamToAnalysis(s);
-                            forwarded = true;
-                        }
-                        break;
+                    switch (r)
+                    {
+                        case OpRecord op:
+                            if (OnOp(op) is { } done) { ops.Add(done); forwarded = true; }
+                            break;
+                        case StreamRecord s:
+                            if (!_dedup.Seen(Dedup.Key(s.Src, "stream", s.Member, s.ServerConnectionId ?? -1, s.RequestId, s.Ts)))
+                            {
+                                (streams ??= []).Add(s);
+                                forwarded = true;
+                            }
+                            break;
+                    }
                 }
-                Interlocked.Increment(ref Processed);
+                catch (Exception e)
+                {
+                    Console.Error.WriteLine($"partition: {e.GetType().Name}: {e.Message}");
+                }
+                finally
+                {
+                    if (!forwarded) _release(r);
+                }
             }
-            catch (Exception e)
-            {
-                Console.Error.WriteLine($"partition: {e.GetType().Name}: {e.Message}");
-            }
-            finally
-            {
-                if (!forwarded) _release(r);
-            }
+            Interlocked.Add(ref Processed, batch.Count);
+            // ops first: a stream record never precedes its op in a proxy's output, so this keeps causality
+            if (ops.Count > 0 || streams != null) _toAnalysis(ops, streams);
         }
     }
 
-    private bool OnOp(OpRecord r)
+    private (Operation, List<RuleHit>?)? OnOp(OpRecord r)
     {
         if (_dedup.Seen(Dedup.Key(r.Src, "op", r.Member, r.ServerConnectionId ?? -r.ConnSeq, r.RequestId, r.Ts)))
         {
             Interlocked.Increment(ref Duplicates);
-            return false;
+            return null;
         }
         var op = new Operation { Id = Ulid.New(r.Ts / 1000), Op = r, ReplyCount = r.HasReply ? 1 : 0 };
         if (_conns.Get(r.Src, r.ConnSeq) is { } conn)
@@ -113,8 +123,8 @@ internal sealed class Partition
         BsonDocument? cmd = null;
         if (r.Cmd != null)
         {
-            try { cmd = BsonSerializer.Deserialize<BsonDocument>(r.Cmd); }
-            catch (Exception) { Interlocked.Increment(ref DecodeFailures); }
+            try { cmd = FastBson.Decode(r.Cmd); }
+            catch (FormatException) { Interlocked.Increment(ref DecodeFailures); }
         }
         if (cmd != null)
         {
@@ -132,8 +142,7 @@ internal sealed class Partition
         op.Unbounded = cmd != null && IsUnbounded(r.Command, cmd);
         op.AwaitsByDesign = AwaitsByDesign(r.Command, cmd);
 
-        _toAnalysis(op, DataCommands.Contains(r.Command) ? ConnectionRules(op) : null);
-        return true;
+        return (op, DataCommands.Contains(r.Command) ? ConnectionRules(op) : null);
     }
 
     private static bool IsRedacted(string command) => command is "authenticate" or "saslStart" or "saslContinue" or "getnonce" or "createUser" or "updateUser" or "copydbgetnonce" or "copydbsaslstart" or "copydb";
@@ -189,10 +198,14 @@ internal sealed class Partition
         // the same values ≥ M times within 1 s on one connection
         if (op.ValueHash is { } vh)
         {
-            if (st.Values.Count > 64)
-                foreach (var stale in st.Values.Where(kv => r.Ts - kv.Value.FirstTs > 1_000_000).Select(kv => kv.Key).ToList())
-                    st.Values.Remove(stale);
+            // expire from the front: entries older than 1 s, and never more than MaxValues per connection
+            while (st.ValueOrder.TryPeek(out var oldest) && (r.Ts - oldest.FirstTs > 1_000_000 || st.ValueOrder.Count >= MaxValues))
+            {
+                st.ValueOrder.Dequeue();
+                if (st.Values.TryGetValue(oldest.Hash, out var cur) && cur.FirstTs == oldest.FirstTs) st.Values.Remove(oldest.Hash);
+            }
             var (first, n) = st.Values.TryGetValue(vh, out var e) && r.Ts - e.FirstTs <= 1_000_000 ? e : (r.Ts, 0);
+            if (n == 0) st.ValueOrder.Enqueue((vh, first));
             st.Values[vh] = (first, ++n);
             // scoped by shape, not by value: one alert per repeated value floods the list (03 §5.2 note)
             if (n == _options.RepeatedQueryCount)

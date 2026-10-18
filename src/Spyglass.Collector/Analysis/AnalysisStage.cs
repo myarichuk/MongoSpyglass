@@ -14,8 +14,7 @@ namespace Spyglass.Collector.Analysis;
 internal sealed class AnalysisStage
 {
     private abstract record Item;
-    private sealed record OpItem(Operation Op, List<RuleHit>? Hits) : Item;
-    private sealed record StreamItem(StreamRecord Record) : Item;
+    private sealed record BatchItem(List<(Operation Op, List<RuleHit>? Hits)> Ops, List<StreamRecord>? Streams) : Item;
     /// <summary>Work from another thread (the API) that must run where the state lives.</summary>
     private sealed record CommandItem(Action Run) : Item;
 
@@ -73,8 +72,11 @@ internal sealed class AnalysisStage
         _thread.Start();
     }
 
-    public void Post(Operation op, List<RuleHit>? hits) => _queue.Add(new OpItem(op, hits));
-    public void Post(StreamRecord s) => _queue.Add(new StreamItem(s));
+    /// <summary>One partition batch: its ops (in order), then its stream records.</summary>
+    public void Post(List<(Operation, List<RuleHit>?)> ops, List<StreamRecord>? streams) => _queue.Add(new BatchItem(ops, streams));
+
+    /// <summary>A single op (tests).</summary>
+    internal void Post(Operation op, List<RuleHit>? hits) => Post([(op, hits)], null);
 
     /// <summary>Runs <paramref name="f"/> on the analysis thread (the state is single-threaded) and returns its result.</summary>
     public Task<T> Invoke<T>(Func<T> f)
@@ -102,14 +104,28 @@ internal sealed class AnalysisStage
         {
             if (_queue.TryTake(out var item, 100))
             {
-                try { Handle(item); }
-                catch (Exception e) { Console.Error.WriteLine($"analysis: {e.GetType().Name}: {e.Message}"); }
-                finally
+                if (item is BatchItem b)
                 {
-                    if (item is OpItem oi) _release(oi.Op.Op);
-                    else if (item is StreamItem si) _release(si.Record);
+                    foreach (var (op, hits) in b.Ops)
+                    {
+                        try { OnOp(op, hits); }
+                        catch (Exception e) { Console.Error.WriteLine($"analysis: {e.GetType().Name}: {e.Message}"); }
+                        finally { _release(op.Op); }
+                    }
+                    if (b.Streams != null)
+                        foreach (var s in b.Streams)
+                        {
+                            try { OnStream(s); }
+                            catch (Exception e) { Console.Error.WriteLine($"analysis: {e.GetType().Name}: {e.Message}"); }
+                            finally { _release(s); }
+                        }
+                    Interlocked.Add(ref Processed, b.Ops.Count);
                 }
-                Interlocked.Increment(ref Processed);
+                else if (item is CommandItem(var run))
+                {
+                    run();
+                    Flush();
+                }
             }
             var now = Environment.TickCount64;
             if (now >= nextFlush || _tickRequested)
@@ -125,16 +141,6 @@ internal sealed class AnalysisStage
             }
         }
         Flush();
-    }
-
-    private void Handle(Item item)
-    {
-        switch (item)
-        {
-            case OpItem(var op, var hits): OnOp(op, hits); break;
-            case StreamItem(var s): OnStream(s); break;
-            case CommandItem(var run): run(); Flush(); break;
-        }
     }
 
     private void OnOp(Operation op, List<RuleHit>? connectionHits)
@@ -210,7 +216,8 @@ internal sealed class AnalysisStage
                 Hit(h.Rule, h.ScopeKey, Scope(op, shape: true, app: true), op, h.Summary);
             }
 
-        _live.Publish(new LiveEvent("op.created", Json.Write(w => Json.OpSummary(w, op)), op));
+        if (_live.Subscribers > 0) // nobody watching: no JSON per op
+            _live.Publish(new LiveEvent("op.created", Json.Write(w => Json.OpSummary(w, op)), op));
         _writer.Enqueue(op);
     }
 
@@ -283,7 +290,8 @@ internal sealed class AnalysisStage
         if (s.CursorId == 0 && op.Op.Reply?.CursorId is { } opened and not 0)
             Cursors.Close(s.Src, s.Member, opened, "exhausted", s.Ts);
         _ops.Update(op.Id, op.ReplyCount, op.Alerts);
-        _live.Publish(new LiveEvent("op.updated", Json.Write(w => Json.OpSummary(w, op)), op));
+        if (_live.Subscribers > 0)
+            _live.Publish(new LiveEvent("op.updated", Json.Write(w => Json.OpSummary(w, op)), op));
     }
 
     private void Flush()

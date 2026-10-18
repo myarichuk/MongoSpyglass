@@ -1,7 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
 using MongoDB.Bson;
-using MongoDB.Bson.IO;
 
 namespace Spyglass.Collector.Shapes;
 
@@ -26,20 +25,19 @@ public static class ShapeNormalizer
     private static readonly HashSet<string> LeafTags =
         ["?number", "?string", "?objectId", "?date", "?bool", "?null", "?binData", "?uuid", "?regex", "?redacted", "?timestamp", "?other", "?document", "?array"];
 
-    private static readonly JsonWriterSettings Relaxed = new() { OutputMode = JsonOutputMode.RelaxedExtendedJson, Indent = false };
 
     /// <param name="valuesPreserved">false when the proxy ran <c>values: shape</c>: no valueHash (03 §4).</param>
     public static ShapeResult Normalize(string command, string? db, string? coll, BsonDocument? cmd, bool cmdTruncated, bool valuesPreserved)
     {
         var ctx = new Ctx(Mode.Shape);
         var shape = Build(ctx, command, db, coll, cmd);
-        var shapeJson = Canonical(shape);
+        var canonical = CanonicalJson.Bytes(shape);
+        var shapeHash = Hash(canonical);
+        var shapeJson = Encoding.UTF8.GetString(canonical);
         string? valueHash = null;
         if (valuesPreserved && !cmdTruncated && cmd != null)
-        {
-            valueHash = Hash(Canonical(Build(new Ctx(Mode.Value), command, db, coll, cmd)));
-        }
-        return new ShapeResult(shape, Hash(shapeJson), valueHash, ctx.InCard, shapeJson);
+            valueHash = Hash(CanonicalJson.Bytes(Build(new Ctx(Mode.Value), command, db, coll, cmd)));
+        return new ShapeResult(shape, shapeHash, valueHash, ctx.InCard, shapeJson);
     }
 
     private static BsonDocument Build(Ctx c, string command, string? db, string? coll, BsonDocument? cmd)
@@ -313,20 +311,13 @@ public static class ShapeNormalizer
 
     // ---- canonical form ------------------------------------------------------------------------
 
-    /// <summary>Relaxed Extended JSON with keys sorted at every level (03 §4).</summary>
-    public static string Canonical(BsonValue v) => Sorted(v).ToJson(Relaxed);
+    /// <summary>Compact relaxed Extended JSON with keys sorted at every level (03 §4).</summary>
+    public static string Canonical(BsonValue v) => CanonicalJson.String(v);
 
-    private static BsonValue Sorted(BsonValue v) => v switch
-    {
-        BsonDocument d => new BsonDocument(d.Elements.OrderBy(e => e.Name, StringComparer.Ordinal).Select(e => new BsonElement(e.Name, Sorted(e.Value)))),
-        BsonArray a => new BsonArray(a.Select(Sorted)),
-        _ => v,
-    };
-
-    private static string Hash(string canonical)
+    private static string Hash(ReadOnlySpan<byte> canonical)
     {
         Span<byte> h = stackalloc byte[32];
-        SHA256.HashData(Encoding.UTF8.GetBytes(canonical), h);
+        SHA256.HashData(canonical, h);
         return Convert.ToHexStringLower(h[..8]);
     }
 }

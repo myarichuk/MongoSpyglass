@@ -53,7 +53,7 @@ public sealed class Collector : IAsyncDisposable
         _analysis = new AnalysisStage(options, _writer, aggregates, alerts, ops, Live, Release, NowUs);
         _partitions = new Partition[options.Workers];
         for (var i = 0; i < _partitions.Length; i++)
-            _partitions[i] = new Partition(options, Connections, Producers, _analysis.Post, _analysis.Post, Release);
+            _partitions[i] = new Partition(options, Connections, Producers, _analysis.Post, Release);
         _sweep = new Timer(_ => Connections.Sweep(), null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
     }
 
@@ -89,6 +89,7 @@ public sealed class Collector : IAsyncDisposable
         var now = NowUs();
         var maxTs = now + (long)Options.MaxFutureSkew.TotalMicroseconds;
         int accepted = 0, rejected = 0, ignored = 0, syntax = 0;
+        var perPartition = new List<Record>?[_partitions.Length]; // one hand-off per partition per POST
         foreach (var range in body.Split((byte)'\n'))
         {
             var line = body[range].TrimEnd((byte)'\r');
@@ -117,9 +118,11 @@ public sealed class Collector : IAsyncDisposable
                 Interlocked.Increment(ref RedactionRejected);
                 continue;
             }
-            Route(r);
+            Route(r, perPartition);
             accepted++;
         }
+        for (var i = 0; i < perPartition.Length; i++)
+            if (perPartition[i] is { } batch) _partitions[i].Post(batch);
         Interlocked.Add(ref RecordsAccepted, accepted);
         Interlocked.Add(ref RecordsRejected, rejected);
         Interlocked.Add(ref RecordsIgnored, ignored);
@@ -132,7 +135,7 @@ public sealed class Collector : IAsyncDisposable
         return new IngestResult(204, accepted, rejected, ignored);
     }
 
-    private void Route(Record r)
+    private void Route(Record r, List<Record>?[] perPartition)
     {
         switch (r)
         {
@@ -142,19 +145,19 @@ public sealed class Collector : IAsyncDisposable
             case ContextRecord: Interlocked.Increment(ref ContextRecords); return; // M2: the join
             case OpRecord op:
                 Charge(op);
-                PartitionFor(op.Src, op.Member, op.ServerConnectionId ?? -op.ConnSeq).Post(op);
+                (perPartition[PartitionFor(op.Src, op.Member, op.ServerConnectionId ?? -op.ConnSeq)] ??= []).Add(op);
                 return;
             case StreamRecord s:
                 Charge(s);
-                PartitionFor(s.Src, s.Member, s.ServerConnectionId ?? -1).Post(s);
+                (perPartition[PartitionFor(s.Src, s.Member, s.ServerConnectionId ?? -1)] ??= []).Add(s);
                 return;
         }
     }
 
     private void Charge(Record r) => Interlocked.Add(ref _charged, r.Size);
 
-    private Partition PartitionFor(string proxyId, string member, long sid) =>
-        _partitions[(int)((uint)HashCode.Combine(proxyId, member, sid) % (uint)_partitions.Length)];
+    private int PartitionFor(string proxyId, string member, long sid) =>
+        (int)((uint)HashCode.Combine(proxyId, member, sid) % (uint)_partitions.Length);
 
     /// <summary>03 §9 defence in depth: an auth command's body must be exactly the proxy's <c>{$redacted: name}</c>.</summary>
     private static bool RedactionHolds(OpRecord op)

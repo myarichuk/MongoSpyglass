@@ -33,7 +33,9 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
         _readCs = new SqliteConnectionStringBuilder(cs) { Mode = SqliteOpenMode.ReadOnly }.ToString();
         _write = new SqliteConnection(cs);
         _write.Open();
-        Exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=OFF;");
+        // the ops table carries five secondary indexes: a 64 MiB page cache keeps their hot pages resident
+        Exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=OFF; " +
+             "PRAGMA cache_size=-65536; PRAGMA mmap_size=268435456; PRAGMA temp_store=MEMORY;");
         Exec("""
             CREATE TABLE IF NOT EXISTS ops (
               id TEXT PRIMARY KEY, ts INTEGER NOT NULL, command TEXT NOT NULL, coll TEXT, status TEXT NOT NULL,

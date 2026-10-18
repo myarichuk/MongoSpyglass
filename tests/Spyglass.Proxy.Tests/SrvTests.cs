@@ -16,8 +16,8 @@ public sealed class SrvTests
 {
     private sealed class FakeDns : IDisposable
     {
-        private readonly UdpClient _udp;
-        private readonly TcpListener _tcp;
+        private readonly UdpClient _udp = null!;
+        private readonly TcpListener _tcp = null!;
         private readonly CancellationTokenSource _cts = new();
         public IPEndPoint Endpoint { get; }
         public Dictionary<(string Name, ushort Type), List<byte[]>> Answers { get; } = new();
@@ -26,11 +26,24 @@ public sealed class SrvTests
 
         public FakeDns()
         {
-            _udp = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
-            var port = ((IPEndPoint)_udp.Client.LocalEndPoint!).Port;
-            _tcp = new TcpListener(IPAddress.Loopback, port);
-            _tcp.Start();
-            Endpoint = new IPEndPoint(IPAddress.Loopback, port);
+            // UDP takes an ephemeral port; TCP must get the same number, which a parallel test can take in
+            // between: retry with a fresh pair
+            for (var attempt = 0; ; attempt++)
+            {
+                _udp = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+                var port = ((IPEndPoint)_udp.Client.LocalEndPoint!).Port;
+                _tcp = new TcpListener(IPAddress.Loopback, port);
+                try
+                {
+                    _tcp.Start();
+                    Endpoint = new IPEndPoint(IPAddress.Loopback, port);
+                    break;
+                }
+                catch (SocketException) when (attempt < 20)
+                {
+                    _udp.Dispose();
+                }
+            }
             _ = Task.Run(UdpLoop);
             _ = Task.Run(TcpLoop);
         }

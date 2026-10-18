@@ -97,7 +97,7 @@ public sealed class ShapeTests
         Assert.Equal(a.ShapeHash, b.ShapeHash);
         Assert.NotEqual(a.ValueHash, b.ValueHash);
         Assert.Equal(16, a.ShapeHash.Length);
-        Assert.Equal("""{ "cmd" : "find", "coll" : "orders", "db" : "shop", "filter" : { "customerId" : "?number" } }""", a.ShapeJson);
+        Assert.Equal("""{"cmd":"find","coll":"orders","db":"shop","filter":{"customerId":"?number"}}""", a.ShapeJson);
     }
 
     [Fact]

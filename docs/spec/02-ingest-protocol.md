@@ -389,7 +389,9 @@ tripwire for the negligible collision case in §3.1.
 ### 6.4 Duplicates
 
 Producers may resend after a timeout. The collector deduplicates by
-`(src, type, joinKey, ts)` within the 10-minute window.
+`(src, type, joinKey, ts)` within the 10-minute window, bounded by memory: 2^18 key hashes per
+partition (~8 MiB). That covers the whole window below ~440 records/s per partition, and about
+10 s at the 03 §11 rate. Producers resend within seconds (§5: one retry after 1 s).
 
 ### 6.5 Orphans
 
