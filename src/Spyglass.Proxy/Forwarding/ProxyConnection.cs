@@ -115,6 +115,10 @@ internal sealed class ProxyConnection
                 Log.Warn($"conn {_ctx.ConnSeq} ({_member.Advertised}): invalid frame from {(firstIsClient ? "client" : "server")}, header {firstPump.InvalidFrameHeaderHex}; closing");
             }
         }
+        catch (OperationCanceledException) when (shutdown.IsCancellationRequested)
+        {
+            reason = CloseReason.ProxyShutdown;
+        }
         catch (Exception e)
         {
             Log.Error($"conn {_ctx.ConnSeq}: unexpected {e.GetType().Name}: {e.Message}");

@@ -5,6 +5,7 @@ using Spyglass.Proxy.Config;
 using Spyglass.Proxy.Diagnostics;
 using Spyglass.Proxy.Forwarding;
 using Spyglass.Proxy.Metrics;
+using Spyglass.Proxy.Observation;
 using Spyglass.Proxy.Topology;
 using Spyglass.Proxy.Wire;
 
@@ -41,6 +42,7 @@ public sealed class ProxyServer : IAsyncDisposable
     public DownstreamTls? DownstreamTls { get; }
     public TopologyManager Topology { get; }
     internal IConnectionObserver Observer { get; set; } = NullObserver.Instance;
+    internal Observer? Observation { get; private set; }
     public CancellationToken ShutdownToken => _shutdown.Token;
     public int OpenConnections => Volatile.Read(ref _openConnections);
     public bool Ready { get; private set; }
@@ -57,6 +59,10 @@ public sealed class ProxyServer : IAsyncDisposable
             Log.Warn(w);
         if (DownstreamTls is { } tls)
             Log.Info($"client TLS: {(tls.SelfSigned ? "self-signed" : "configured")} certificate, SHA-256 {tls.Sha256Fingerprint}");
+
+        Observation = new Observer(this);
+        Observation.Start();
+        Observer = Observation;
 
         if (Config.Metrics.Bind != null)
         {
@@ -181,6 +187,8 @@ public sealed class ProxyServer : IAsyncDisposable
         while (!_live.IsEmpty && DateTime.UtcNow < deadline)
             await Task.Delay(20).ConfigureAwait(false);
 
+        if (Observation != null)
+            await Observation.DisposeAsync().ConfigureAwait(false);
         if (_metricsServer != null)
             await _metricsServer.DisposeAsync().ConfigureAwait(false);
         _shutdown.Dispose();
