@@ -83,8 +83,9 @@ redacted command BSON.
 * `shape`: a canonical document;
 * `shapeHash`: the first 16 hex chars of SHA-256 over the canonical serialization: compact
   relaxed Extended JSON v2 (no whitespace), keys sorted by ordinal at every level, arrays in
-  order. The collector writes it itself rather than through the driver's JSON writer, which cost
-  more than the rest of stage 1 together. A differential test pins the property that matters:
+  order. The collector writes it itself, straight from the command's BSON bytes: no document is
+  decoded and no shape tree built (3.3 µs for shape and value, against 10.6 µs decoding a tree,
+  and the driver's JSON writer cost more than that). A differential test pins the property that matters:
   two commands get the same canonical bytes exactly when the driver's sorted relaxed EJSON is
   the same;
 * `valueHash`: the same, over the value-preserving normalization. It's not computed when

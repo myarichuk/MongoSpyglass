@@ -53,7 +53,36 @@ public sealed class OpRecord : Record
     public string? Lsid;
     public long? TxnNumber;
     public string? Comment;
-    public byte[]? Cmd;
+    /// <summary>
+    /// The base64 of <c>cmd</c> inside <see cref="Raw"/> (validated at parse). Decoded where it is used, into the caller's
+    /// buffer on the hot path: a decoded copy per op cost 1.3 µs at ingest and sat in the queue next to the line it came from.
+    /// </summary>
+    internal int CmdBase64Start, CmdBase64Length;
+    /// <summary>Set at parse only when the JSON string was escaped (not where the base64 sits verbatim in the line).</summary>
+    internal byte[]? CmdDecoded;
+    public bool HasCmd => CmdBase64Length > 0 || CmdDecoded != null;
+    /// <summary>The command's BSON, decoded on each call (API, tests); the hot path uses <see cref="DecodeCmd(ref byte[])"/>.</summary>
+    public byte[]? Cmd
+    {
+        get
+        {
+            if (CmdDecoded != null) return CmdDecoded;
+            if (CmdBase64Length == 0 || Raw == null) return null;
+            return Convert.FromBase64String(System.Text.Encoding.ASCII.GetString(Raw, CmdBase64Start, CmdBase64Length));
+        }
+    }
+
+    /// <summary>The command's BSON in <paramref name="buffer"/> (grown as needed, reused by the caller); empty if none.</summary>
+    internal ReadOnlySpan<byte> DecodeCmd(ref byte[] buffer)
+    {
+        if (CmdDecoded != null) return CmdDecoded;
+        if (CmdBase64Length == 0 || Raw == null) return default;
+        var src = Raw.AsSpan(CmdBase64Start, CmdBase64Length);
+        var max = System.Buffers.Text.Base64.GetMaxDecodedFromUtf8Length(src.Length);
+        if (buffer.Length < max) buffer = new byte[Math.Max(max, buffer.Length * 2)];
+        System.Buffers.Text.Base64.DecodeFromUtf8(src, buffer, out _, out var written);
+        return buffer.AsSpan(0, written);
+    }
     public bool CmdTruncated;
     public List<(string Identifier, int Count)>? SeqDocs;
     public string? Compressor;

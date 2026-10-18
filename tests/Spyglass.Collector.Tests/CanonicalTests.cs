@@ -12,7 +12,7 @@ namespace Spyglass.Collector.Tests;
 /// </summary>
 public sealed class CanonicalTests
 {
-    private static BsonValue RandomValue(Random r, int depth)
+    internal static BsonValue RandomValue(Random r, int depth)
     {
         var kind = r.Next(depth > 3 ? 14 : 16);
         return kind switch
@@ -36,7 +36,7 @@ public sealed class CanonicalTests
         };
     }
 
-    private static BsonDocument RandomDoc(Random r, int depth)
+    internal static BsonDocument RandomDoc(Random r, int depth)
     {
         var d = new BsonDocument();
         foreach (var name in Enumerable.Range(0, r.Next(1, 5)).Select(_ => ((char)('a' + r.Next(5))).ToString() + (r.Next(3) == 0 ? "$" : "")).Distinct())

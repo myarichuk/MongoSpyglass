@@ -273,21 +273,36 @@ public sealed class Server : IAsyncDisposable
         }
         var length = c.Request.ContentLength;
         if (length > Options.MaxBodyBytes) { c.Response.StatusCode = 413; return; }
-        using var ms = new MemoryStream(length is { } l ? (int)l : 64 * 1024);
+        // pooled: a batch is up to 1 MiB, a fresh buffer per POST was a large-object-heap allocation (gen2 churn), and
+        // Ingest copies what it keeps
+        var body = System.Buffers.ArrayPool<byte>.Shared.Rent(length is { } l ? (int)l : 64 * 1024);
+        IngestResult r;
         try
         {
-            var buf = new byte[64 * 1024];
-            int n;
-            while ((n = await c.Request.Body.ReadAsync(buf, c.RequestAborted).ConfigureAwait(false)) > 0)
+            var n = 0;
+            try
             {
-                if (ms.Length + n > Options.MaxBodyBytes) { c.Response.StatusCode = 413; return; }
-                ms.Write(buf, 0, n);
+                int read;
+                while ((read = await c.Request.Body.ReadAsync(body.AsMemory(n), c.RequestAborted).ConfigureAwait(false)) > 0)
+                {
+                    n += read;
+                    if (n > Options.MaxBodyBytes) { c.Response.StatusCode = 413; return; }
+                    if (n == body.Length)
+                    {
+                        var bigger = System.Buffers.ArrayPool<byte>.Shared.Rent(Math.Min(body.Length * 2, Options.MaxBodyBytes + 1));
+                        body.AsSpan(0, n).CopyTo(bigger);
+                        System.Buffers.ArrayPool<byte>.Shared.Return(body);
+                        body = bigger;
+                    }
+                }
             }
+            catch (BadHttpRequestException) { c.Response.StatusCode = 413; return; }
+            r = Collector.Ingest(body.AsSpan(0, n), c.Request.Headers.ContentEncoding.ToString(), c.Request.Headers["X-Spyglass-Producer"].FirstOrDefault());
         }
-        catch (BadHttpRequestException) { c.Response.StatusCode = 413; return; }
-
-        var r = Collector.Ingest(ms.GetBuffer().AsSpan(0, (int)ms.Length), c.Request.Headers.ContentEncoding.ToString(),
-            c.Request.Headers["X-Spyglass-Producer"].FirstOrDefault());
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(body);
+        }
         c.Response.StatusCode = r.Status;
         if (r.Rejected > 0) c.Response.Headers["X-Spyglass-Rejected"] = r.Rejected.ToString(System.Globalization.CultureInfo.InvariantCulture);
         if (r.Status == 429) c.Response.Headers.RetryAfter = "1";

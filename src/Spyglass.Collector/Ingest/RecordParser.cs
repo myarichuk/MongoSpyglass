@@ -175,7 +175,15 @@ public static class RecordParser
         else if (x.ValueTextEquals("lsid"u8)) { x.Read(); op.Lsid = NStr(ref x); }
         else if (x.ValueTextEquals("txnNumber"u8)) { x.Read(); op.TxnNumber = NLong(ref x); }
         else if (x.ValueTextEquals("comment"u8)) { x.Read(); op.Comment = NStr(ref x); }
-        else if (x.ValueTextEquals("cmd"u8)) { x.Read(); op.Cmd = x.TokenType == JsonTokenType.Null ? null : x.GetBytesFromBase64(); }
+        else if (x.ValueTextEquals("cmd"u8))
+        {
+            x.Read();
+            if (x.TokenType == JsonTokenType.Null) return true;
+            if (x.TokenType != JsonTokenType.String) throw new Malformed("cmd is not a string");
+            if (x.ValueIsEscaped || x.HasValueSequence) op.CmdDecoded = x.GetBytesFromBase64(); // rare: decoded now
+            else if (!Base64.IsValid(x.ValueSpan) || x.ValueSpan.IndexOfAny(" \t\r\n"u8) >= 0) throw new Malformed("cmd is not base64"); // IsValid skips whitespace
+            else (op.CmdBase64Start, op.CmdBase64Length) = ((int)x.TokenStartIndex + 1, x.ValueSpan.Length); // after the opening quote
+        }
         else if (x.ValueTextEquals("cmdTruncated"u8)) { x.Read(); op.CmdTruncated = Bool(ref x); }
         else if (x.ValueTextEquals("compressor"u8)) { x.Read(); op.Compressor = NStr(ref x); }
         else if (x.ValueTextEquals("seqDocs"u8))

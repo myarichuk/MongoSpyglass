@@ -59,27 +59,53 @@ the spec had not:
 
 ## 03 §11 performance (4 vCPU shared with the load generator; `IngestBenchTests`, Release)
 
-| | measured | target |
-|---|---|---|
-| ingest accepted (HTTP + parse + routing) | 57–65k records/s | 50k ✅ |
-| analysed (stage 1 + stage 2) | 27–32k records/s | 50k ❌ (this box, client in-process) |
-| stored (SQLite, 5 secondary indexes) | ~20k rows/s; sampling (03 §7) takes over above that | — |
-| POST → live event, at ~10k records/s | p50 3–5 ms, p95 6–12 ms | ≤ 1 s ✅ |
-| collector CPU per record | partitions ~20 µs, analysis ~11 µs, storage ~25 µs, HTTP ~26 µs | — |
+| | first M1 build | after the post-M2 pass | target |
+|---|---|---|---|
+| ingest accepted (HTTP + parse + routing) | 57–65k records/s | 70–89k records/s | 50k ✅ |
+| analysed (stage 1 + stage 2) | 27–32k records/s | 42–53k records/s | 50k (on dedicated cores: below) |
+| stored (SQLite, 5 secondary indexes) | ~20k rows/s | 31–38k rows/s; sampling (03 §7) above that | — |
+| POST → live event, at ~10k records/s | p95 6–12 ms | p95 9–17 ms | ≤ 1 s ✅ |
+| allocated per record | 8.7 KB | 1.7 KB | — |
+| GC pause during the run | ~800 ms | ~200 ms | — |
+| join (engine, per op + cmd) | — | 0.78 µs, 95 B | ≤ 5 µs ✅ |
 
-What moved the numbers, each one measured:
+Per-record CPU, measured stage by stage in isolation (`PartitionCostTests`, `ShapeCostTests`):
+stage 1 ~6 µs (of which shape + value from the BSON bytes 3.3 µs, from 10.6 µs decoding a tree),
+parse + route 2–3 µs, analysis ~7 µs, storage ~13 µs.
 
-* **Partition CPU 55 → 20 µs/record.**
-  * A per-op LINQ scan in the `repeated-query` state (O(values per connection)) became a FIFO.
-  * BSON decode went 11 → 2.5 µs with a direct span decoder instead of `BsonSerializer`.
-  * Normalization went 15 → 7 µs with a canonical writer that sorts while it writes, instead of
-    a sorted copy plus the driver's JSON writer.
-* **Hand-offs:** one queue operation per POST per partition, not per record.
-* **No live-feed JSON is built when nobody subscribes.**
+**This machine slows the stages down when they run together.** Stage 1 costs ~6 µs a record alone,
+or beside any one other stage, and ~19 µs when ingest, stage 1 and analysis all run at once.
+Ruled out by experiment:
 
-The analysis ceiling needs measuring on a machine where the load generator doesn't share the
-cores. Storage below ingest rate is designed for (sampling keeps every slow, errored and
-alerted op; the aggregates stay complete).
+* GC: no collections during the measurement.
+* Shared counters: batching them changed nothing.
+* CPU time: ALU-only burner threads leave it alone.
+
+The normalizer alone slows 2.7× beside two memory-streaming threads (3.4 → 9.3 µs), so the VM's
+vCPUs share caches or memory bandwidth, and the stages move enough memory to do this to each
+other. Cutting allocation 5× was the lever on our side. The throughput ceiling on dedicated
+cores is still to be measured; the isolated costs put stage 1 at ~170k records/s per partition.
+
+What moved the numbers, each one measured (first M1 build, then this pass):
+
+* **Partition CPU 55 → 20 µs/record (M1).** A per-op LINQ scan became a FIFO; BSON decode 11 → 2.5 µs with a
+  span decoder; normalization 15 → 7 µs with a canonical writer that sorts while it writes.
+* **Shapes straight from the BSON bytes**: no document decoded, no shape tree built. Shape + value 10.6 → 3.3 µs,
+  4.7 KB → 0.1 KB. Differential-tested against the tree normalizer (now the tests' oracle) on 20,000 random
+  commands; the test caught one divergence in the rewrite before it shipped.
+* **SQLite rows bound through SQLitePCL** on a statement prepared once: Microsoft.Data.Sqlite allocated a
+  binder per parameter per row (1.2 KB a row). Storage ~23 → ~13 µs a row.
+* **Spin-free hand-offs**: `BlockingCollection` spins before it blocks; a stage that keeps up spun more as it got
+  cheaper. Replaced by a queue and an event that does not spin.
+* **Live-feed JSON only for a subscriber whose filter takes the op** (an open UI tab filtered to one collection was
+  serializing every op).
+* **Smaller items**: pooled request bodies (a 1 MiB LOH allocation per POST), `cmd` kept as base64 in the line
+  and decoded into a reused buffer, a per-record closure in the producer registry, collection-expression arrays
+  per call, ULIDs from a counter (the crypto RNG was 1.3 µs per op), cached shape-hash strings, shape JSON only for
+  shapes a partition has not sent yet.
+
+Storage below ingest rate is designed for (sampling keeps every slow, errored and alerted op; the
+aggregates stay complete).
 
 ## Deviations from the spec text (recorded in the specs)
 
@@ -92,8 +118,9 @@ alerted op; the aggregates stay complete).
 ## Open
 
 1. ~~M2: the join~~: done, `STATUS-M2.md`.
-2. Analysis throughput on dedicated cores. The next costs are allocation (~9 KB/record end to
-   end) and SQLite writes.
+2. Analysis throughput on dedicated cores: allocation is down to 1.7 KB/record and every stage is
+   measured in isolation (above). The number that remains is the ceiling on hardware that does not
+   slow co-running stages down.
 3. ~~A container image~~: `src/Spyglass.Collector/Dockerfile` (03 §12). Its build stage was replayed
    command for command and its output run as the container runs it; `docker build` itself still needs a
    machine with Docker.

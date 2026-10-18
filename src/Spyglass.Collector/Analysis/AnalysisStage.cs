@@ -24,7 +24,7 @@ internal sealed class AnalysisStage
     private sealed record CommandItem(Action Run) : Item;
 
     /// <summary>Releases an item's ingest-queue charge (03 §1): held from ingest until this stage is done with it.</summary>
-    private readonly Action<Record> _release;
+    private readonly Action<long> _release;
 
     private static readonly HashSet<string> CursorOpeners = ["find", "aggregate", "listCollections", "listIndexes"];
     private static readonly HashSet<string> Writes = ["insert", "update", "delete", "findAndModify", "findandmodify"];
@@ -42,7 +42,7 @@ internal sealed class AnalysisStage
     private readonly Dictionary<string, SkewWindow> _skew = [];
     private readonly HashSet<string> _touchedCallsites = [];
     private long _nextCallsiteTouchUs;
-    private readonly BlockingCollection<Item> _queue = new(new ConcurrentQueue<Item>());
+    private readonly WorkQueue<Item> _queue = new();
     private readonly Dictionary<(string, string, long, int), Operation> _streams = [];
     private readonly Queue<(string, string, long, int)> _streamOrder = new();
     private readonly Dictionary<(string?, string?), long> _collMaxReturned = [];
@@ -62,7 +62,7 @@ internal sealed class AnalysisStage
     public bool Alive => _thread?.IsAlive == true;
 
     public AnalysisStage(CollectorOptions options, StorageWriter writer, IAggregateStore aggregates, IAlertStore alertStore,
-        IOperationStore ops, LiveHub live, ProducerRegistry producers, Action<Record> release, Func<long> nowUs)
+        IOperationStore ops, LiveHub live, ProducerRegistry producers, Action<long> release, Func<long> nowUs)
     {
         _producers = producers;
         _options = options;
@@ -132,6 +132,7 @@ internal sealed class AnalysisStage
             {
                 if (item is BatchItem { Output: var b })
                 {
+                    long released = 0; // once per batch: the queue counter is a cache line ingest writes too
                     foreach (var (op, hits, final) in b.Ops)
                     {
                         try
@@ -141,18 +142,19 @@ internal sealed class AnalysisStage
                             else _waiting[op.Id] = op;
                         }
                         catch (Exception e) { Console.Error.WriteLine($"analysis: {e.GetType().Name}: {e.Message}"); }
-                        finally { _release(op.Op); }
+                        finally { released += op.Op.Size; }
                     }
                     if (b.Streams != null)
                         foreach (var s in b.Streams)
                         {
                             try { OnStream(s); }
                             catch (Exception e) { Console.Error.WriteLine($"analysis: {e.GetType().Name}: {e.Message}"); }
-                            finally { _release(s); }
+                            finally { released += s.Size; }
                         }
                     try { OnJoins(b); }
                     catch (Exception e) { Console.Error.WriteLine($"analysis: {e.GetType().Name}: {e.Message}"); }
                     Interlocked.Add(ref Processed, b.Ops.Count);
+                    _release(released);
                 }
                 else if (item is CommandItem(var run))
                 {
@@ -250,8 +252,7 @@ internal sealed class AnalysisStage
             }
 
         if (op.Ctx != null) Context(op);
-        if (_live.Subscribers > 0) // nobody watching: no JSON per op
-            _live.Publish(new LiveEvent("op.created", Json.Write(w => Json.OpSummary(w, op)), op));
+        _live.Publish("op.created", op); // JSON only for a subscriber that takes it
     }
 
     /// <summary>Nothing more will join this op: store it.</summary>
@@ -271,8 +272,7 @@ internal sealed class AnalysisStage
                 {
                     Volatile.Write(ref op.Ctx, ctx);
                     Context(op);
-                    if (_live.Subscribers > 0) // 03 §3.2: the live row is patched in place
-                        _live.Publish(new LiveEvent("op.updated", Json.Write(w => Json.OpSummary(w, op)), op));
+                    _live.Publish("op.updated", op); // 03 §3.2: the live row is patched in place
                 }
                 Finalize(op);
             }
@@ -386,7 +386,7 @@ internal sealed class AnalysisStage
             op.Alerts ??= [];
             if (!op.Alerts.Contains(rule)) op.Alerts.Add(rule);
         }
-        _live.Publish(new LiveEvent(change.Opened ? "alert.opened" : "alert.updated", Json.Write(w => Json.Alert(w, change.Alert)), null));
+        _live.Publish(change.Opened ? "alert.opened" : "alert.updated", null, change.Alert, static a => Json.Write(w => Json.Alert(w, a)));
         _dirtyAlerts.Add(change.Alert);
     }
 
@@ -402,8 +402,7 @@ internal sealed class AnalysisStage
         if (s.CursorId == 0 && op.Op.Reply?.CursorId is { } opened and not 0)
             Cursors.Close(s.Src, s.Member, opened, "exhausted", s.Ts);
         if (op.Stored) _writer.Enqueue(new OpUpdate(op.Id, op.ReplyCount, op.Alerts?.ToList()));
-        if (_live.Subscribers > 0)
-            _live.Publish(new LiveEvent("op.updated", Json.Write(w => Json.OpSummary(w, op)), op));
+        _live.Publish("op.updated", op);
     }
 
     private void Flush()
@@ -439,7 +438,7 @@ internal sealed class AnalysisStage
         foreach (var a in Alerts.ResolveQuiet(nowUs))
         {
             _dirtyAlerts.Add(a);
-            _live.Publish(new LiveEvent("alert.updated", Json.Write(w => Json.Alert(w, a)), null));
+            _live.Publish("alert.updated", null, a, static x => Json.Write(w => Json.Alert(w, x)));
         }
         Alerts.Expire(nowUs, TimeSpan.FromDays(30));
         Flush();

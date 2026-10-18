@@ -1,7 +1,7 @@
-using System.Collections.Concurrent;
 using Spyglass.Collector.Analysis;
 using Spyglass.Collector.Api;
 using Spyglass.Collector.Model;
+using Spyglass.Collector.Pipeline;
 
 namespace Spyglass.Collector.Storage;
 
@@ -22,7 +22,7 @@ internal sealed class StorageWriter
     private readonly CollectorOptions _options;
     private readonly LiveHub _live;
     /// <summary>An <see cref="Operation"/>, <see cref="OpUpdate"/>, <see cref="CallsiteRecord"/>, callsite touches, or a barrier.</summary>
-    private readonly BlockingCollection<object> _queue = new(new ConcurrentQueue<object>());
+    private readonly WorkQueue<object> _queue = new();
     private readonly Func<long> _nowUs;
     private Thread? _thread;
     private long _seq;
@@ -155,7 +155,7 @@ internal sealed class StorageWriter
                 if (_live.Subscribers > 0)
                     foreach (var u in _updates)
                         if (u.Ctx != null && _store.Get(u.Id) is { } op) // late context: the op left memory when it was stored
-                            _live.Publish(new LiveEvent("op.updated", Json.Write(w => Json.OpSummary(w, op)), op));
+                            _live.Publish("op.updated", op);
             }
             var now = _nowUs();
             if (_newCallsites.Count > 0) _callsites.Upsert(_newCallsites, now);

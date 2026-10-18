@@ -126,6 +126,26 @@ public sealed class StoreTests : IDisposable
         Assert.Equal(1000, store.Count);
     }
 
+    /// <summary>The raw SQLitePCL insert binds "" as "" (an empty span would bind NULL) and absent values as NULL.</summary>
+    [Fact]
+    public void Insert_keeps_empty_strings_apart_from_null()
+    {
+        using var store = new SqliteStore(_dir);
+        Operation Make(int id, string? coll)
+        {
+            Assert.Equal(ParseResult.Ok, RecordParser.Parse(System.Text.Encoding.UTF8.GetBytes(Op(id, "find", coll: coll)), out var r, out _));
+            return new Operation { Id = Ulid.New(T0 / 1000 + id), Op = (OpRecord)r!, ShapeHash = "s", App = id == 1 ? "" : null };
+        }
+        var third = Make(3, "orders");
+        store.Append([Make(1, ""), Make(2, null), third]);
+        Assert.Equal([1], store.Query(new OpQuery { Coll = "" }).Select(o => o.Op.RequestId));
+        Assert.Equal([3], store.Query(new OpQuery { Coll = "orders" }).Select(o => o.Op.RequestId));
+        Assert.Equal([1], store.Query(new OpQuery { App = "" }).Select(o => o.Op.RequestId));
+        Assert.Equal(3, store.Count);
+        store.Append([third]); // the same id again: ignored, and not counted
+        Assert.Equal(3, store.Count);
+    }
+
     [Fact]
     public void Minute_buckets_roll_up_to_hours_after_48h()
     {

@@ -27,6 +27,32 @@ public sealed class IngestBenchTests
     private static readonly bool IsDebugBuild = false;
 #endif
 
+    /// <summary>GC allocation ticks (one per ~100 KB allocated) by type: where the bytes go.</summary>
+    private sealed class AllocListener : System.Diagnostics.Tracing.EventListener
+    {
+        public readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> Types = new();
+        public volatile bool Recording;
+
+        protected override void OnEventSourceCreated(System.Diagnostics.Tracing.EventSource source)
+        {
+            if (source.Name == "Microsoft-Windows-DotNETRuntime")
+                EnableEvents(source, System.Diagnostics.Tracing.EventLevel.Verbose, (System.Diagnostics.Tracing.EventKeywords)0x1 /* GC */);
+        }
+
+        protected override void OnEventWritten(System.Diagnostics.Tracing.EventWrittenEventArgs e)
+        {
+            if (!Recording || e.EventName != "GCAllocationTick_V4" || e.Payload == null) return;
+            var type = e.Payload[e.PayloadNames!.IndexOf("TypeName")] as string ?? "?";
+            Types.AddOrUpdate(type, 1, (_, n) => n + 1);
+        }
+
+        public string Top(int n)
+        {
+            var total = (double)Types.Values.Sum();
+            return string.Join("\n  ", Types.OrderByDescending(kv => kv.Value).Take(n).Select(kv => $"{kv.Value / total,6:P1} {kv.Key}"));
+        }
+    }
+
     /// <summary>CPU seconds per thread-name prefix (Linux /proc): which stage is the bottleneck.</summary>
     private static Dictionary<string, double> ThreadCpu()
     {
@@ -102,12 +128,16 @@ public sealed class IngestBenchTests
                     seen.TryAdd(e.Op!.Op.RequestId, Stopwatch.GetTimestamp());
             });
 
+            using var allocs = new AllocListener();
+            var analysed0 = server.Collector.Analysis.Processed;
             var proc = Process.GetCurrentProcess();
             var cpu0 = proc.TotalProcessorTime;
             var threads0 = ThreadCpu();
             var alloc0 = GC.GetTotalAllocatedBytes(precise: false);
+            var busy0 = server.Collector.Partitions.Sum(p => p.BusyTicks);
             var gc0 = (GC.CollectionCount(0), GC.CollectionCount(1), GC.CollectionCount(2));
             var sw = Stopwatch.StartNew();
+            allocs.Recording = true;
             var statuses = new System.Collections.Concurrent.ConcurrentBag<HttpStatusCode>();
             var sentAt = new System.Collections.Concurrent.ConcurrentDictionary<int, long>();
             var next = 0;
@@ -122,12 +152,16 @@ public sealed class IngestBenchTests
                 }
             })));
             var postSeconds = sw.Elapsed.TotalSeconds;
-            await server.Collector.DrainAsync(TimeSpan.FromSeconds(60));
+            // analysed: through stage 2 (DrainAsync would also wait for storage)
+            var analysedTarget = total - 2000 + batches.Count - 1;
+            while (server.Collector.Analysis.Processed - analysed0 < analysedTarget && sw.Elapsed < TimeSpan.FromSeconds(120)) await Task.Delay(5);
             var analysedSeconds = sw.Elapsed.TotalSeconds;
+            await server.Collector.DrainAsync(TimeSpan.FromSeconds(60));
             var deadline = DateTime.UtcNow.AddSeconds(60);
             while (server.Collector.Writer.Written - stored0 < total - 2000 + batches.Count - 1 && DateTime.UtcNow < deadline)
                 await Task.Delay(20);
             var storedSeconds = sw.Elapsed.TotalSeconds;
+            allocs.Recording = false;
             proc.Refresh();
             var cpu = (proc.TotalProcessorTime - cpu0).TotalMicroseconds;
             var threads = ThreadCpu();
@@ -143,6 +177,8 @@ public sealed class IngestBenchTests
                               $"collector+client CPU {cpu / records:F1} µs/record; live visibility p50 {visibility.ElementAtOrDefault(visibility.Length / 2):F0} ms p95 {p95:F0} ms; " +
                               $"429s {statuses.Count(s => s == HttpStatusCode.TooManyRequests)}; sampled {server.Collector.Writer.Sampled}; store {server.Collector.Ops.Count} ops");
             Console.WriteLine($"[ingest] {(System.Runtime.GCSettings.IsServerGC ? "server" : "workstation")} GC: {alloc / (double)records:F0} B allocated/record, gen0/1/2 collections {gcs.Item1}/{gcs.Item2}/{gcs.Item3}, GC pause {GC.GetTotalPauseDuration().TotalMilliseconds:F0} ms total");
+            Console.WriteLine($"[ingest] partitions busy {(server.Collector.Partitions.Sum(p => p.BusyTicks) - busy0) * 1e6 / Stopwatch.Frequency / records:F1} µs/record (work, not waiting)");
+            Console.WriteLine("[ingest] allocated by type (share of bytes):\n  " + allocs.Top(25));
             Console.WriteLine("[ingest] CPU µs/record by thread: " + string.Join(", ",
                 threads.Select(kv => (kv.Key, Us: (kv.Value - threads0.GetValueOrDefault(kv.Key)) * 1e6 / records)).OrderByDescending(x => x.Us).Select(x => $"{x.Key} {x.Us:F1}")));
 

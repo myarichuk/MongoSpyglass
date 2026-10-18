@@ -103,6 +103,10 @@ public class PipelineTests : IAsyncLifetime
         using var ms = new MemoryStream();
         using (var gz = new GZipStream(ms, CompressionLevel.Fastest, leaveOpen: true)) gz.Write(Batch(Op(2, "ping")));
         Assert.Equal(204, _c.Ingest(ms.ToArray(), "gzip", null).Status);
+        Assert.Equal(400, _c.Ingest(Batch("not gzip"), "gzip", null).Status);
+        using var big = new MemoryStream(); // compresses to almost nothing, inflates past the 1 MiB batch limit (02 §5)
+        using (var gz = new GZipStream(big, CompressionLevel.Fastest, leaveOpen: true)) gz.Write(new byte[Collector.MaxBatchBytes + 1]);
+        Assert.Equal(413, _c.Ingest(big.ToArray(), "gzip", null).Status);
         await _c.DrainAsync(TimeSpan.FromSeconds(5));
     }
 

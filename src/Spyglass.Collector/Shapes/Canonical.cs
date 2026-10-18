@@ -154,14 +154,17 @@ public static class FastBson
 public static class CanonicalJson
 {
     [ThreadStatic] private static ArrayBufferWriter<byte>? t_buffer;
+    [ThreadStatic] private static Utf8JsonWriter? t_writer;
 
     /// <summary>Canonical UTF-8 of <paramref name="v"/>, valid until this thread's next call.</summary>
     public static ReadOnlySpan<byte> Bytes(BsonValue v)
     {
         var buf = t_buffer ??= new ArrayBufferWriter<byte>(512);
         buf.ResetWrittenCount();
-        using (var w = new Utf8JsonWriter(buf, new JsonWriterOptions { SkipValidation = true }))
-            Write(w, v);
+        var w = t_writer ??= new Utf8JsonWriter(buf, new JsonWriterOptions { SkipValidation = true });
+        w.Reset(buf);
+        Write(w, v);
+        w.Flush();
         return buf.WrittenSpan;
     }
 

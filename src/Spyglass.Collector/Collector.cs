@@ -85,21 +85,35 @@ public sealed class Collector : IAsyncDisposable
         for (var i = 0; i < _partitions.Length; i++) _partitions[i].Start(i);
     }
 
-    private void Release(Record r) => Interlocked.Add(ref _charged, -r.Size);
+    private void Release(long bytes) => Interlocked.Add(ref _charged, -bytes);
 
     private bool ExportersActive(long nowUs) => nowUs - Volatile.Read(ref _lastContextUs) < ExporterIdleUs;
 
     /// <summary>Handles one POSTed batch. Never blocks on the pipeline (03 §1: answer within 50 ms).</summary>
     public IngestResult Ingest(ReadOnlySpan<byte> body, string? contentEncoding, string? producerHeader)
     {
-        byte[]? inflated = null;
-        if (contentEncoding is { } enc && enc.Contains("gzip", StringComparison.OrdinalIgnoreCase))
+        if (contentEncoding is not { } enc || !enc.Contains("gzip", StringComparison.OrdinalIgnoreCase))
+            return IngestPlain(body, producerHeader);
+        var pool = System.Buffers.ArrayPool<byte>.Shared;
+        byte[] compressed = pool.Rent(body.Length), inflated = pool.Rent(MaxBatchBytes + 1); // pooled: Ingest copies what it keeps
+        try
         {
-            try { inflated = Gunzip(body); }
+            body.CopyTo(compressed);
+            int n;
+            try { n = Gunzip(compressed.AsSpan(0, body.Length), inflated); }
             catch (InvalidDataException) { Interlocked.Increment(ref Batches400); return new IngestResult(400, 0, 0, 0, "bad gzip"); }
-            if (inflated == null) { Interlocked.Increment(ref Batches413); return new IngestResult(413, 0, 0, 0, "batch over 1 MiB uncompressed"); }
-            body = inflated;
+            if (n > MaxBatchBytes) { Interlocked.Increment(ref Batches413); return new IngestResult(413, 0, 0, 0, "batch over 1 MiB uncompressed"); }
+            return IngestPlain(inflated.AsSpan(0, n), producerHeader);
         }
+        finally
+        {
+            pool.Return(compressed);
+            pool.Return(inflated);
+        }
+    }
+
+    private IngestResult IngestPlain(ReadOnlySpan<byte> body, string? producerHeader)
+    {
         if (body.Length > MaxBatchBytes) { Interlocked.Increment(ref Batches413); return new IngestResult(413, 0, 0, 0, "batch over 1 MiB"); }
         if (body.Count((byte)'\n') + (body.Length > 0 && body[^1] != (byte)'\n' ? 1 : 0) > MaxBatchRecords) { Interlocked.Increment(ref Batches413); return new IngestResult(413, 0, 0, 0, "batch over 2000 records"); }
         if (Volatile.Read(ref _charged) > Options.QueueBytes * 9 / 10) { Interlocked.Increment(ref Batches429); return new IngestResult(429, 0, 0, 0, "ingest queue above 90%"); }
@@ -108,6 +122,13 @@ public sealed class Collector : IAsyncDisposable
         var maxTs = now + (long)Options.MaxFutureSkew.TotalMicroseconds;
         int accepted = 0, rejected = 0, ignored = 0, syntax = 0;
         var perPartition = new List<Record>?[_partitions.Length]; // one hand-off per partition per POST
+        // Shared counters are written once per POST, not per record: the ingest thread writing a line per record that
+        // the pipeline threads read per record made both 3-5x slower (measured: stage 1 at 20 µs a record beside
+        // ingest, 6.5 µs alone)
+        long charged = 0;
+        ProducerInfo? producer = null;
+        string? producerSrc = null;
+        var producerRecords = 0;
         foreach (var range in body.Split((byte)'\n'))
         {
             var line = body[range].TrimEnd((byte)'\r');
@@ -121,24 +142,32 @@ public sealed class Collector : IAsyncDisposable
                 continue;
             }
             var r = record!;
-            var producer = Producers.Touch(r.Src, producerHeader, now);
-            Interlocked.Increment(ref producer.Records);
+            if (!ReferenceEquals(r.Src, producerSrc) && r.Src != producerSrc) // a batch is almost always one src
+            {
+                if (producer != null) Interlocked.Add(ref producer.Records, producerRecords);
+                producer = Producers.Touch(r.Src, producerHeader, now);
+                producerSrc = r.Src;
+                producerRecords = 0;
+            }
+            producerRecords++;
             if (r.Ts > maxTs) // 03 §2: clamp, count per src
             {
                 r.Ts = now;
-                Interlocked.Increment(ref producer.ClockSkewed);
+                Interlocked.Increment(ref producer!.ClockSkewed);
                 Interlocked.Increment(ref ClockSkewed);
             }
             if (r is OpRecord op && !RedactionHolds(op))
             {
                 rejected++;
-                Interlocked.Increment(ref producer.Rejected);
+                Interlocked.Increment(ref producer!.Rejected);
                 Interlocked.Increment(ref RedactionRejected);
                 continue;
             }
-            Route(r, perPartition, now);
+            charged += Route(r, perPartition, now);
             accepted++;
         }
+        if (producer != null) Interlocked.Add(ref producer.Records, producerRecords);
+        if (charged > 0) Interlocked.Add(ref _charged, charged); // before the records are visible to the stages that release them
         for (var i = 0; i < perPartition.Length; i++)
             if (perPartition[i] is { } batch) _partitions[i].Post(batch);
         Interlocked.Add(ref RecordsAccepted, accepted);
@@ -153,49 +182,52 @@ public sealed class Collector : IAsyncDisposable
         return new IngestResult(204, accepted, rejected, ignored);
     }
 
-    private void Route(Record r, List<Record>?[] perPartition, long now)
+    /// <returns>the bytes the record is charged against the ingest queue (0 if it is not queued).</returns>
+    private long Route(Record r, List<Record>?[] perPartition, long now)
     {
         switch (r)
         {
-            case ConnRecord c: Connections.Apply(c); return;
-            case ProxyRecord p: Producers.Apply(p); return;
-            case StatsRecord s: Producers.Apply(s); return;
+            case ConnRecord c: Connections.Apply(c); return 0;
+            case ProxyRecord p: Producers.Apply(p); return 0;
+            case StatsRecord s: Producers.Apply(s); return 0;
             case CmdRecord c:
             {
-                Volatile.Write(ref _lastContextUs, now);
+                ContextSeen(now);
                 var p = Producers.Get(c.Src)!;
                 Interlocked.Increment(ref p.Cmds);
                 if (c.Key is not { } key) // 02 §3.3, §6.5: counted, never joinable
                 {
                     Interlocked.Increment(ref Join.OrphanNoKey);
                     Interlocked.Increment(ref p.Orphans);
-                    return;
+                    return 0;
                 }
-                Charge(c);
                 (perPartition[PartitionFor(key.ProxyId, key.Member, key.ServerConnectionId)] ??= []).Add(c);
-                return;
+                return c.Size;
             }
             case HelloRecord h:
-                Volatile.Write(ref _lastContextUs, now);
+                ContextSeen(now);
                 Producers.Apply(h);
-                return;
+                return 0;
             case CallsiteRecord cs:
-                Volatile.Write(ref _lastContextUs, now);
+                ContextSeen(now);
                 _writer.Enqueue(cs);
-                return;
-            case ContextRecord: Interlocked.Increment(ref ContextRecords); return; // uow, pool: M3 (03 §5.3)
+                return 0;
+            case ContextRecord: Interlocked.Increment(ref ContextRecords); return 0; // uow, pool: M3 (03 §5.3)
             case OpRecord op:
-                Charge(op);
                 (perPartition[PartitionFor(op.Src, op.Member, op.ServerConnectionId ?? -op.ConnSeq)] ??= []).Add(op);
-                return;
+                return op.Size;
             case StreamRecord s:
-                Charge(s);
                 (perPartition[PartitionFor(s.Src, s.Member, s.ServerConnectionId ?? -1)] ??= []).Add(s);
-                return;
+                return s.Size;
+            default: return 0;
         }
     }
 
-    private void Charge(Record r) => Interlocked.Add(ref _charged, r.Size);
+    /// <summary>Partitions read this per op: it is written at most once a second, not per exporter record.</summary>
+    private void ContextSeen(long now)
+    {
+        if (now - Volatile.Read(ref _lastContextUs) > 1_000_000) Volatile.Write(ref _lastContextUs, now);
+    }
 
     private int PartitionFor(string proxyId, string member, long sid) =>
         (int)((uint)HashCode.Combine(proxyId, member, sid) % (uint)_partitions.Length);
@@ -213,14 +245,17 @@ public sealed class Collector : IAsyncDisposable
         catch (Exception) { return false; }
     }
 
-    private static byte[]? Gunzip(ReadOnlySpan<byte> body)
+    /// <summary>Inflates into <paramref name="into"/> (MaxBatchBytes + 1 long); a result over MaxBatchBytes means too large.</summary>
+    private static unsafe int Gunzip(ReadOnlySpan<byte> body, byte[] into)
     {
-        using var gz = new GZipStream(new MemoryStream(body.ToArray()), CompressionMode.Decompress);
-        var buf = new byte[MaxBatchBytes + 1];
-        var n = 0;
-        int read;
-        while (n < buf.Length && (read = gz.Read(buf, n, buf.Length - n)) > 0) n += read;
-        return n > MaxBatchBytes ? null : buf.AsSpan(0, n).ToArray();
+        fixed (byte* p = body)
+        {
+            using var gz = new GZipStream(new UnmanagedMemoryStream(p, body.Length), CompressionMode.Decompress);
+            var n = 0;
+            int read;
+            while (n <= MaxBatchBytes && (read = gz.Read(into, n, MaxBatchBytes + 1 - n)) > 0) n += read;
+            return n;
+        }
     }
 
     /// <summary>

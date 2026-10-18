@@ -75,6 +75,9 @@ public sealed class ParserTests
 
 public sealed class ShapeTests
 {
+    /// <summary>The shape as a document again, to look into (the canonical form parses back).</summary>
+    private static BsonDocument Tree(ShapeResult r) => BsonDocument.Parse(r.ShapeJson!);
+
     private static ShapeResult S(BsonDocument cmd, bool values = true, bool truncated = false)
     {
         var name = cmd.GetElement(0).Name;
@@ -123,7 +126,7 @@ public sealed class ShapeTests
             ["tags"] = new BsonDocument("$size", 3),
             ["qty"] = new BsonDocument { ["$gt"] = 1, ["$lte"] = 9 },
         }));
-        var f = r.Shape["filter"].AsBsonDocument;
+        var f = Tree(r)["filter"].AsBsonDocument;
         Assert.Equal(new BsonArray { "?" }, f["status"]["$in"]);
         Assert.Equal(false, f["deleted"]["$exists"].AsBoolean);
         Assert.Equal("string", f["kind"]["$type"].AsString);
@@ -146,7 +149,7 @@ public sealed class ShapeTests
             ["pw"] = "$redacted",
         }));
         Assert.Equal(1500, r.InCardinality);
-        var f = r.Shape["filter"].AsBsonDocument;
+        var f = Tree(r)["filter"].AsBsonDocument;
         Assert.Equal("?string", f["note"].AsString);
         Assert.Equal("?uuid", f["blob"].AsString);
         Assert.Equal("?redacted", f["pw"].AsString);
@@ -178,7 +181,7 @@ public sealed class ShapeTests
             },
             ["cursor"] = new BsonDocument(),
         };
-        var s = S(agg).Shape["pipeline"].AsBsonArray;
+        var s = Tree(S(agg))["pipeline"].AsBsonArray;
         Assert.Equal("?string", s[0]["$match"]["status"].AsString);
         Assert.Equal("$cust", s[1]["$group"]["_id"].AsString);        // field paths are structure
         Assert.Equal("$amount", s[1]["$group"]["total"]["$sum"].AsString);
@@ -197,7 +200,7 @@ public sealed class ShapeTests
                 new BsonDocument { ["q"] = new BsonDocument("_id", 2), ["u"] = new BsonDocument("$set", new BsonDocument("s", "y")) },
             },
         };
-        var ups = S(cmd).Shape["updates"].AsBsonArray;
+        var ups = Tree(S(cmd))["updates"].AsBsonArray;
         Assert.Single(ups);
         Assert.Equal("?string", ups[0]["u"]["$set"]["s"].AsString);
     }
@@ -225,5 +228,115 @@ public sealed class SketchTests
         merged.Merge(round);
         Assert.Equal(2 * s.Count, merged.Count);
         Assert.Equal(s.Quantile(0.5), merged.Quantile(0.5));
+    }
+}
+
+/// <summary>Op ids (ULIDs): what the store's time-range queries and the uniqueness of rows depend on.</summary>
+public sealed class UlidTests
+{
+    [Fact]
+    public void Ids_sort_by_time_fall_in_their_millisecond_bounds_and_never_repeat()
+    {
+        const long ms = 1_700_000_000_123;
+        var a = Model.Ulid.New(ms);
+        Assert.Equal(26, a.Length);
+        Assert.All(a, ch => Assert.Contains(ch, "0123456789ABCDEFGHJKMNPQRSTVWXYZ"));
+        Assert.InRange(string.CompareOrdinal(a, Model.Ulid.Bound(ms, low: true)), 0, int.MaxValue);
+        Assert.InRange(string.CompareOrdinal(a, Model.Ulid.Bound(ms, low: false)), int.MinValue, 0);
+        Assert.True(string.CompareOrdinal(Model.Ulid.Bound(ms - 1, low: false), a) < 0);
+
+        // one thread, one millisecond: increasing; a later millisecond sorts after
+        var same = Enumerable.Range(0, 1000).Select(_ => Model.Ulid.New(ms)).ToList();
+        Assert.Equal(same.Order(StringComparer.Ordinal), same);
+        Assert.True(string.CompareOrdinal(Model.Ulid.New(ms + 1), same[^1]) > 0);
+
+        // threads seed independently: no collisions
+        var all = new System.Collections.Concurrent.ConcurrentBag<string>();
+        Parallel.For(0, 8, _ => { for (var i = 0; i < 50_000; i++) all.Add(Model.Ulid.New(ms)); });
+        Assert.Equal(all.Count, all.Distinct().Count());
+    }
+}
+
+/// <summary>The op record's <c>cmd</c>: kept as base64 inside the raw line, decoded where it is used.</summary>
+public sealed class CmdFieldTests
+{
+    private static readonly byte[] Bson = new MongoDB.Bson.BsonDocument { ["find"] = "orders", ["$db"] = "shop" }.ToBson();
+
+    private static (ParseResult, Model.OpRecord?) P(string cmdJson)
+    {
+        var line = $$"""{"type":"op","ts":1,"src":"s","member":"m","requestId":1,"connSeq":1,"command":"find","status":"ok","reqBytes":1,"cmd":{{cmdJson}}}""";
+        var r = RecordParser.Parse(System.Text.Encoding.UTF8.GetBytes(line), out var rec, out _);
+        return (r, rec as Model.OpRecord);
+    }
+
+    [Fact]
+    public void Verbatim_and_escaped_base64_decode_to_the_same_bytes()
+    {
+        var b64 = Convert.ToBase64String(Bson);
+        var (r1, plain) = P($"\"{b64}\"");
+        var (r2, escaped) = P($"\"{b64.Replace("A", "\\u0041")}\""); // a JSON-escaped string: decoded at parse
+        Assert.Equal((ParseResult.Ok, ParseResult.Ok), (r1, r2));
+        Assert.Equal(Bson, plain!.Cmd);
+        Assert.Equal(Bson, escaped!.Cmd);
+        var buf = new byte[1];
+        Assert.Equal(Bson, plain.DecodeCmd(ref buf).ToArray()); // the hot path: into a reused, grown buffer
+        Assert.True(buf.Length >= Bson.Length);
+        Assert.True(plain.HasCmd);
+        Assert.False(P("null").Item2!.HasCmd);
+    }
+
+    [Theory]
+    [InlineData("\"not base64!\"")]
+    [InlineData("\"QUJD RA==\"")]   // whitespace: Base64.IsValid would skip it
+    [InlineData("12")]
+    public void Malformed_cmd_rejects_the_record(string cmdJson) => Assert.Equal(ParseResult.Rejected, P(cmdJson).Item1);
+}
+
+/// <summary>The stage hand-off: no lost wakeups, completion drains, nothing spins.</summary>
+public sealed class WorkQueueTests
+{
+    [Fact]
+    public async Task Items_wake_a_waiting_taker_and_completion_drains()
+    {
+        var q = new Pipeline.WorkQueue<int>();
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        Assert.False(q.TryTake(out _, 50));
+        Assert.InRange(sw.ElapsedMilliseconds, 40, 2000);                // it waited, and returned on time
+
+        var taken = Task.Run(() => q.TryTake(out var v, 5000) ? v : -1);
+        await Task.Delay(50);
+        q.Add(7);
+        Assert.Equal(7, await taken.WaitAsync(TimeSpan.FromSeconds(5))); // woken, not timed out
+
+        q.Add(1);
+        q.CompleteAdding();
+        Assert.False(q.IsCompleted);                                     // an item is still in it
+        Assert.True(q.TryTake(out var last, 10) && last == 1);
+        Assert.True(q.IsCompleted);
+        Assert.Throws<InvalidOperationException>(() => q.Add(2));
+    }
+
+    [Fact]
+    public async Task Many_producers_one_consumer_lose_nothing()
+    {
+        var q = new Pipeline.WorkQueue<int>();
+        const int producers = 4, each = 50_000;
+        var sum = 0L;
+        var consumer = Task.Run(() =>
+        {
+            var n = 0;
+            while (n < producers * each)
+                if (q.TryTake(out var v, 1000)) { sum += v; n++; }
+        });
+        await Task.WhenAll(Enumerable.Range(0, producers).Select(p => Task.Run(() =>
+        {
+            for (var i = 1; i <= each; i++)
+            {
+                q.Add(i);
+                if (i % 1000 == 0) Thread.Sleep(1); // let the consumer drain and wait, so wakeups are exercised
+            }
+        })));
+        await consumer.WaitAsync(TimeSpan.FromSeconds(30));
+        Assert.Equal(producers * (long)each * (each + 1) / 2, sum);
     }
 }

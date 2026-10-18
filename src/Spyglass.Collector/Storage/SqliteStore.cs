@@ -1,5 +1,7 @@
+using System.Text;
 using System.Text.Json;
 using Microsoft.Data.Sqlite;
+using SQLitePCL;
 using Spyglass.Collector.Analysis;
 using Spyglass.Collector.Ingest;
 using Spyglass.Collector.Model;
@@ -86,51 +88,86 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
 
     // ---- operations ------------------------------------------------------------------------
 
+    private const string InsertSql = """
+        INSERT OR IGNORE INTO ops (id, ts, command, coll, status, app, driver, latency, shape, value_hash, reply_count, alerts, size, raw, ctx, uow)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+        """;
+
+    /// <summary>The op insert, prepared once (SQLITE_PREPARE_PERSISTENT) and bound through SQLitePCL directly (write lock held).</summary>
+    private sqlite3_stmt? _insert;
+
+    /// <summary>
+    /// The hot write: every stored op. Bound straight through SQLitePCL on a statement prepared once: Microsoft.Data.Sqlite
+    /// allocated a parameter binder per parameter per row, boxed every integer, and encoded every string into a new array
+    /// (1.2 KB a row). Strings go through a stack buffer, blobs as spans; SQLite copies both (SQLITE_TRANSIENT).
+    /// </summary>
     public void Append(IReadOnlyList<Operation> ops)
     {
         lock (_writeLock)
         {
+            var db = _write.Handle!;
+            if (_insert == null)
+                Check(raw.sqlite3_prepare_v3(db, InsertSql, 1 /* SQLITE_PREPARE_PERSISTENT */, out _insert), db);
+            var st = _insert;
             using var tx = _write.BeginTransaction();
-            using var cmd = _write.CreateCommand();
-            cmd.CommandText = """
-                INSERT OR IGNORE INTO ops (id, ts, command, coll, status, app, driver, latency, shape, value_hash, reply_count, alerts, size, raw, ctx, uow)
-                VALUES ($id, $ts, $command, $coll, $status, $app, $driver, $latency, $shape, $vh, $rc, $alerts, $size, $raw, $ctx, $uow)
-                """;
-            var p = new Dictionary<string, SqliteParameter>();
-            foreach (var n in (string[])["$id", "$ts", "$command", "$coll", "$status", "$app", "$driver", "$latency", "$shape", "$vh", "$rc", "$alerts", "$size", "$raw", "$ctx", "$uow"])
-                p[n] = cmd.Parameters.Add(n, SqliteType.Text);
-            cmd.Prepare();
             long inserted = 0, bytes = 0;
-            foreach (var o in ops)
+            try
             {
-                var ctx = Volatile.Read(ref o.Ctx);
-                var size = (o.Op.Raw?.Length ?? 0) + (ctx?.Raw?.Length ?? 0) + RowOverhead;
-                var r = o.Op;
-                p["$id"].Value = o.Id;
-                p["$ts"].Value = r.Ts;
-                p["$command"].Value = r.Command;
-                p["$coll"].Value = (object?)r.Coll ?? DBNull.Value;
-                p["$status"].Value = r.Status;
-                p["$app"].Value = (object?)o.App ?? DBNull.Value;
-                p["$driver"].Value = (object?)o.Driver ?? DBNull.Value;
-                p["$latency"].Value = (object?)r.ServerLatencyUs ?? DBNull.Value;
-                p["$shape"].Value = o.ShapeHash;
-                p["$vh"].Value = (object?)o.ValueHash ?? DBNull.Value;
-                p["$rc"].Value = o.ReplyCount;
-                p["$alerts"].Value = o.Alerts is { Count: > 0 } ? string.Join(',', o.Alerts) : DBNull.Value;
-                p["$raw"].Value = (object?)r.Raw ?? DBNull.Value;
-                p["$size"].Value = size;
-                p["$ctx"].Value = (object?)ctx?.Raw ?? DBNull.Value;
-                p["$uow"].Value = (object?)ctx?.UowId ?? DBNull.Value;
-                var n = cmd.ExecuteNonQuery();
-                inserted += n;
-                bytes += n * size;
+                foreach (var o in ops)
+                {
+                    var r = o.Op;
+                    var ctx = Volatile.Read(ref o.Ctx);
+                    var size = (r.Raw?.Length ?? 0) + (ctx?.Raw?.Length ?? 0) + RowOverhead;
+                    Text(st, 1, o.Id, db);
+                    Check(raw.sqlite3_bind_int64(st, 2, r.Ts), db);
+                    Text(st, 3, r.Command, db);
+                    Text(st, 4, r.Coll, db);
+                    Text(st, 5, r.Status, db);
+                    Text(st, 6, o.App, db);
+                    Text(st, 7, o.Driver, db);
+                    if (r.ServerLatencyUs is { } lat) Check(raw.sqlite3_bind_int64(st, 8, lat), db); else Check(raw.sqlite3_bind_null(st, 8), db);
+                    Text(st, 9, o.ShapeHash, db);
+                    Text(st, 10, o.ValueHash, db);
+                    Check(raw.sqlite3_bind_int64(st, 11, o.ReplyCount), db);
+                    Text(st, 12, o.Alerts is { Count: > 0 } ? string.Join(',', o.Alerts) : null, db);
+                    Check(raw.sqlite3_bind_int64(st, 13, size), db);
+                    Blob(st, 14, r.Raw, db);
+                    Blob(st, 15, ctx?.Raw, db);
+                    Text(st, 16, ctx?.UowId, db);
+                    var rc = raw.sqlite3_step(st);
+                    if (rc != raw.SQLITE_DONE) SqliteException.ThrowExceptionForRC(rc, db);
+                    var n = raw.sqlite3_changes(db);
+                    raw.sqlite3_reset(st);
+                    inserted += n;
+                    bytes += n * size;
+                }
+                tx.Commit();
             }
-            tx.Commit();
+            finally
+            {
+                raw.sqlite3_reset(st); // a failed step leaves it mid-execution: reset before the rollback
+            }
             Interlocked.Add(ref _count, inserted);
             Interlocked.Add(ref _bytes, bytes);
         }
     }
+
+    private static void Check(int rc, sqlite3 db)
+    {
+        if (rc != raw.SQLITE_OK) SqliteException.ThrowExceptionForRC(rc, db);
+    }
+
+    private static void Text(sqlite3_stmt st, int index, string? v, sqlite3 db)
+    {
+        if (v == null) { Check(raw.sqlite3_bind_null(st, index), db); return; }
+        // an empty span pins to a null pointer, which SQLite binds as NULL: "" goes through the string overload
+        if (v.Length == 0 || v.Length > 128) { Check(raw.sqlite3_bind_text(st, index, v), db); return; }
+        Span<byte> utf8 = stackalloc byte[128 * 3];
+        Check(raw.sqlite3_bind_text(st, index, utf8[..Encoding.UTF8.GetBytes(v, utf8)]), db);
+    }
+
+    private static void Blob(sqlite3_stmt st, int index, byte[]? v, sqlite3 db) =>
+        Check(v is { Length: > 0 } ? raw.sqlite3_bind_blob(st, index, v) : v == null ? raw.sqlite3_bind_null(st, index) : raw.sqlite3_bind_zeroblob(st, index, 0), db);
 
     public Operation? Get(string id)
     {
@@ -505,7 +542,11 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
 
     public void Dispose()
     {
-        lock (_writeLock) _write.Dispose();
+        lock (_writeLock)
+        {
+            _insert?.Dispose(); // sqlite3_finalize: before the connection closes
+            _write.Dispose();
+        }
         SqliteConnection.ClearAllPools();
     }
 }

@@ -1,5 +1,3 @@
-using System.Collections.Concurrent;
-using MongoDB.Bson;
 using Spyglass.Collector.Model;
 using Spyglass.Collector.Shapes;
 
@@ -12,7 +10,9 @@ public readonly record struct RuleHit(string Rule, string ScopeKey, string Summa
 internal sealed class PartitionOutput
 {
     /// <summary>New ops in arrival order. <c>Final</c>: nothing more will join it (store it now).</summary>
-    public readonly List<(Operation Op, List<RuleHit>? Hits, bool Final)> Ops = [];
+    public readonly List<(Operation Op, List<RuleHit>? Hits, bool Final)> Ops;
+
+    public PartitionOutput(int capacity = 0) => Ops = new(capacity);
     public List<StreamRecord>? Streams;
     /// <summary>Ops that were waiting for context: joined (<c>Ctx</c> set) or not.</summary>
     public List<(Operation Op, CmdRecord? Ctx)>? Finals;
@@ -50,26 +50,36 @@ internal sealed class Partition
     private readonly ProducerRegistry _producers;
     /// <summary>One hand-off per ingested batch, not per record: a per-item blocking queue cost a lock round trip per record.</summary>
     private readonly Action<PartitionOutput> _toAnalysis;
-    private readonly Action<Record> _release;
+    /// <summary>Returns ingest-queue bytes (03 §1): once per batch, not per record (the counter is shared with ingest).</summary>
+    private readonly Action<long> _release;
     private readonly Func<long> _nowUs;
     private readonly Func<long, bool> _exportersActive;
     private readonly JoinCounters _joinCounters;
     private readonly JoinEngine _join;
     /// <summary>A batch (<c>List&lt;Record&gt;</c>) or a barrier (<c>TaskCompletionSource</c>).</summary>
-    private readonly BlockingCollection<object> _queue = new(new ConcurrentQueue<object>());
+    private readonly WorkQueue<object> _queue = new();
     private readonly Dedup _dedup = new(1 << 18);
+    /// <summary>
+    /// Shapes this partition has sent the JSON of. The analysis stage needs it for a shape's first op only, and the first op
+    /// of any shape to reach it is some partition's first (each partition's hand-offs are FIFO).
+    /// </summary>
+    private readonly HashSet<string> _knownShapes = [];
+    /// <summary>The command BSON of the op being enriched, decoded here (reused).</summary>
+    private byte[] _cmdBuffer = new byte[4096];
     private readonly Dictionary<(string, long), ConnState> _state = [];
     private readonly Queue<(string, long)> _stateOrder = new();
     private const int MaxConnState = 100_000, MaxValues = 256;
     private Thread? _thread;
 
     public long Duplicates, DecodeFailures, Processed;
+    /// <summary>Stopwatch ticks spent on work (dequeue to hand-off), not waiting.</summary>
+    public long BusyTicks;
     /// <summary>Environment.TickCount64 at the loop's last turn (at least every 100 ms when healthy).</summary>
     public long LastBeat = Environment.TickCount64;
     public bool Alive => _thread?.IsAlive == true;
 
     public Partition(CollectorOptions options, ConnectionRegistry conns, ProducerRegistry producers, JoinCounters joinCounters,
-        Action<PartitionOutput> toAnalysis, Action<Record> release, Func<long> nowUs, Func<long, bool> exportersActive)
+        Action<PartitionOutput> toAnalysis, Action<long> release, Func<long> nowUs, Func<long, bool> exportersActive)
     {
         _options = options;
         _conns = conns;
@@ -113,12 +123,14 @@ internal sealed class Partition
             // wake at least every 100 ms: waiting ops and cmds expire on the clock, not on traffic
             _queue.TryTake(out var item, 100);
             Volatile.Write(ref LastBeat, Environment.TickCount64);
-            var output = new PartitionOutput();
+            var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+            var output = new PartitionOutput((item as List<Record>)?.Count ?? 0);
             var now = _nowUs();
             // expiry first: whatever ran out by now is final before records arriving now are matched against it
             _join.Expire(now, output);
             if (item is List<Record> batch)
             {
+                long released = 0;
                 foreach (var r in batch)
                 {
                     var forwarded = false; // a forwarded record keeps its queue charge until the analysis stage is done with it
@@ -147,13 +159,15 @@ internal sealed class Partition
                     }
                     finally
                     {
-                        if (!forwarded) _release(r);
+                        if (!forwarded) released += r.Size;
                     }
                 }
                 Interlocked.Add(ref Processed, batch.Count);
+                if (released > 0) _release(released);
             }
             // ops first: a stream record never precedes its op in a proxy's output, so this keeps causality
             if (!output.IsEmpty) _toAnalysis(output);
+            Interlocked.Add(ref BusyTicks, System.Diagnostics.Stopwatch.GetTimestamp() - t0);
             (item as TaskCompletionSource)?.TrySetResult();
         }
         var last = new PartitionOutput();
@@ -208,54 +222,72 @@ internal sealed class Partition
             op.Driver = conn.Driver;
         }
 
-        BsonDocument? cmd = null;
-        if (r.Cmd != null)
+        // the command is read in place, never decoded into a document (03 §4: the shape is written straight from the bytes)
+        ReadOnlySpan<byte> cmd = default;
+        if (r.HasCmd)
         {
-            try { cmd = FastBson.Decode(r.Cmd); }
-            catch (FormatException) { Interlocked.Increment(ref DecodeFailures); }
+            var bson = r.DecodeCmd(ref _cmdBuffer);
+            if (BsonSpan.Validate(bson)) cmd = bson;
+            else Interlocked.Increment(ref DecodeFailures);
         }
-        if (cmd != null)
+        if (!cmd.IsEmpty)
         {
-            if (r.Command == "getMore" && cmd.TryGetValue("getMore", out var gm) && gm.IsNumeric) op.GetMoreCursorId = gm.ToInt64();
-            if (r.Command == "killCursors" && cmd.TryGetValue("cursors", out var ids) && ids is BsonArray a)
-                op.KillCursorIds = a.Where(v => v.IsNumeric).Select(v => v.ToInt64()).ToList();
+            if (r.Command == "getMore" && BsonSpan.TryGet(cmd, "getMore"u8, out var gm) && gm.IsNumeric) op.GetMoreCursorId = Int64(gm);
+            if (r.Command == "killCursors" && BsonSpan.TryGet(cmd, "cursors"u8, out var ids) && ids.IsArray)
+            {
+                op.KillCursorIds = [];
+                foreach (var id in new BsonElements(ids.Value))
+                    if (id.IsNumeric && Int64(id) is { } v) op.KillCursorIds.Add(v);
+            }
         }
 
         var valuesPreserved = _producers.Get(r.Src)?.ValuesPreserved ?? true;
-        var shape = ShapeNormalizer.Normalize(r.Command, r.Db, r.Coll, cmd, r.CmdTruncated, valuesPreserved);
+        if (_knownShapes.Count > 100_000) _knownShapes.Clear(); // a bound; clearing only means JSON is sent again
+        // a getMore's own shape is replaced by its cursor's in the analysis stage, so its JSON may be used up on an op that
+        // never registers it: getMores always carry theirs (a few bytes: the command name and namespace)
+        var shape = ShapeNormalizer.Normalize(r.Command, r.Db, r.Coll, cmd, r.CmdTruncated, valuesPreserved, r.Command == "getMore" ? null : _knownShapes);
         op.ShapeHash = shape.ShapeHash;
         op.ValueHash = shape.ValueHash;
         op.ShapeJson = shape.ShapeJson;
         op.InCardinality = shape.InCardinality;
-        op.Unbounded = cmd != null && IsUnbounded(r.Command, cmd);
+        op.Unbounded = !cmd.IsEmpty && IsUnbounded(r.Command, cmd);
         op.AwaitsByDesign = AwaitsByDesign(r.Command, cmd);
 
         return (op, DataCommands.Contains(r.Command) ? ConnectionRules(op) : null);
     }
 
-    internal static bool AwaitsByDesign(string command, BsonDocument? cmd)
+    /// <summary>A numeric value as an int64; null if it does not fit (a decimal128 out of range).</summary>
+    private static long? Int64(in BsonEl e)
+    {
+        try { return BsonSpan.ToInt64(e); }
+        catch (OverflowException) { return null; }
+    }
+
+    /// <param name="cmd">validated command BSON, or empty.</param>
+    internal static bool AwaitsByDesign(string command, ReadOnlySpan<byte> cmd)
     {
         if (command is "hello" or "isMaster" or "ismaster") return true;
-        if (cmd == null) return false;
-        if (cmd.TryGetValue("tailable", out var t) && t.ToBoolean() || cmd.TryGetValue("awaitData", out var a) && a.ToBoolean()) return true;
-        return command == "aggregate" && cmd.TryGetValue("pipeline", out var p) && p is BsonArray { Count: > 0 } stages &&
-               stages[0] is BsonDocument { ElementCount: > 0 } first && first.GetElement(0).Name == "$changeStream";
+        if (cmd.IsEmpty) return false;
+        if (BsonSpan.TryGet(cmd, "tailable"u8, out var t) && BsonSpan.ToBoolean(t) || BsonSpan.TryGet(cmd, "awaitData"u8, out var a) && BsonSpan.ToBoolean(a)) return true;
+        return command == "aggregate" && BsonSpan.TryGet(cmd, "pipeline"u8, out var p) && p.IsArray && BsonSpan.First(p.Value, out var stage0) &&
+               stage0.IsDocument && BsonSpan.First(stage0.Value, out var first) && first.NameIs("$changeStream"u8);
     }
 
     /// <summary>03 §5.2 unbounded-scan input: no filter and no limit, or an aggregate without a leading $match/$limit.</summary>
-    internal static bool IsUnbounded(string command, BsonDocument cmd)
+    internal static bool IsUnbounded(string command, ReadOnlySpan<byte> cmd)
     {
-        static bool Empty(BsonDocument c, string f) => !c.TryGetValue(f, out var v) || v is BsonDocument { ElementCount: 0 };
-        static bool NoLimit(BsonDocument c) => !c.TryGetValue("limit", out var l) || (l.IsNumeric && l.ToInt64() == 0);
-        return command switch
+        static bool Empty(ReadOnlySpan<byte> c, ReadOnlySpan<byte> f) => !BsonSpan.TryGet(c, f, out var v) || v.IsDocument && BsonSpan.Count(v.Value) == 0;
+        static bool NoLimit(ReadOnlySpan<byte> c) => !BsonSpan.TryGet(c, "limit"u8, out var l) || l.IsNumeric && Int64(l) == 0;
+        switch (command)
         {
-            "find" => Empty(cmd, "filter") && NoLimit(cmd),
-            "count" => Empty(cmd, "query") && NoLimit(cmd),
-            "aggregate" => cmd.TryGetValue("pipeline", out var p) && p is BsonArray stages &&
-                           (stages.Count == 0 || stages[0] is not BsonDocument { ElementCount: > 0 } first ||
-                            first.GetElement(0).Name is not ("$match" or "$limit" or "$collStats" or "$indexStats" or "$currentOp")),
-            _ => false,
-        };
+            case "find": return Empty(cmd, "filter"u8) && NoLimit(cmd);
+            case "count": return Empty(cmd, "query"u8) && NoLimit(cmd);
+            case "aggregate":
+                if (!BsonSpan.TryGet(cmd, "pipeline"u8, out var p) || !p.IsArray) return false;
+                if (!BsonSpan.First(p.Value, out var stage0) || !stage0.IsDocument || !BsonSpan.First(stage0.Value, out var first)) return true;
+                return !(first.NameIs("$match"u8) || first.NameIs("$limit"u8) || first.NameIs("$collStats"u8) || first.NameIs("$indexStats"u8) || first.NameIs("$currentOp"u8));
+            default: return false;
+        }
     }
 
     /// <summary>n-plus-one-suspected and repeated-query (suspected) on one connection (03 §5.2).</summary>

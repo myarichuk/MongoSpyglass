@@ -76,15 +76,27 @@ public static class Ulid
         return new string(c);
     }
 
+    /// <summary>
+    /// Per thread: 80 bits seeded once from the system RNG, then incremented. Ids need uniqueness and order, not
+    /// unpredictability; the crypto RNG per id was 1.3 µs, a quarter of stage 1's non-shape work. Within one thread the
+    /// ids of one millisecond are increasing, as the ULID spec's monotonic variant has them.
+    /// </summary>
+    [ThreadStatic] private static UInt128 t_random;
+
     public static string New(long unixMs)
     {
-        Span<byte> b = stackalloc byte[16];
-        for (var i = 5; i >= 0; i--) { b[i] = (byte)unixMs; unixMs >>= 8; }
-        RandomNumberGenerator.Fill(b[6..]);
-        Span<char> c = stackalloc char[26];
+        if (t_random == 0)
+        {
+            Span<byte> seed = stackalloc byte[16];
+            RandomNumberGenerator.Fill(seed);
+            t_random = System.Buffers.Binary.BinaryPrimitives.ReadUInt128BigEndian(seed) | 1;
+        }
+        var random = t_random = (t_random + 1) & ((UInt128.One << 80) - 1);
         // 128 bits → 26 chars, 5 bits each, most significant first (the first char carries 3 bits)
-        var hi = ((UInt128)System.Buffers.Binary.BinaryPrimitives.ReadUInt64BigEndian(b) << 64) | System.Buffers.Binary.BinaryPrimitives.ReadUInt64BigEndian(b[8..]);
-        for (var i = 25; i >= 0; i--) { c[i] = Alphabet[(int)(hi & 31)]; hi >>= 5; }
-        return new string(c);
+        var v = ((UInt128)(ulong)(unixMs & 0xFFFF_FFFF_FFFF) << 80) | random;
+        return string.Create(26, v, static (c, x) =>
+        {
+            for (var i = 25; i >= 0; i--) { c[i] = Alphabet[(int)(x & 31)]; x >>= 5; }
+        });
     }
 }

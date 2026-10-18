@@ -102,8 +102,9 @@ public sealed class ProducerRegistry
 
     public ProducerInfo Touch(string src, string? producerHeader, long nowUs)
     {
-        var p = _producers.GetOrAdd(src, s => new ProducerInfo { Src = s, FirstSeen = nowUs });
-        p.LastSeen = nowUs;
+        // static lambda + argument: a capturing lambda allocated its closure on every call (every record)
+        var p = _producers.TryGetValue(src, out var found) ? found : _producers.GetOrAdd(src, static (s, now) => new ProducerInfo { Src = s, FirstSeen = now }, nowUs);
+        if (p.LastSeen != nowUs) p.LastSeen = nowUs; // a shared line: not rewritten with the same value
         if (producerHeader != null && p.Kind == "unknown") p.Kind = producerHeader;
         return p;
     }
