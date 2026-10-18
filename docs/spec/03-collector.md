@@ -278,7 +278,16 @@ before aggregates are ever dropped.
 
 ## 8. API (REST + SSE, JSON)
 
-Base path `/api/v1`. All endpoints require auth (§9) except `/healthz`.
+Base path `/api/v1`. All endpoints require auth (§9) except `/healthz` and `/readyz`, which report
+states and counts only.
+
+| Path | 200 when | 503 when |
+|---|---|---|
+| `GET /healthz` (liveness; the container HEALTHCHECK) | every stage is turning and storage is writing | a partition or the analysis stage hasn't turned for 30 s, the storage writer for 120 s (its longest legitimate step is one retention chunk), or storage writes have failed for 60 s with no success |
+| `GET /readyz` | live, and not shedding ingest | not live, or the ingest queue is above 90 % (ingest answers 429) |
+
+Both return `{status, live, ready, checks: {<name>: {ok, detail}}}`. Load is a readiness matter, not a
+liveness one: restarting a collector that sheds load loses its in-memory state and fixes nothing.
 
 | Method & path | Purpose |
 |---|---|
@@ -340,3 +349,35 @@ circuit state.
 | Op visible in the live feed after the proxy flush | ≤ 1 s (p95) |
 | Join CPU per op | ≤ 5 µs (measured: 0.78 µs per op + cmd pair, `JoinBenchTests`) |
 | Memory | bounded by configured queues plus UoW/join state limits; worst case logged at startup |
+
+## 12. Container
+
+`src/Spyglass.Collector/Dockerfile` (build context: the repository root).
+
+* **Base:** `mcr.microsoft.com/dotnet/runtime-deps:10.0-noble-chiseled`. No shell, no package manager, no
+  shared framework, non-root (`$APP_UID`). The app is self-contained, trimmed and ReadyToRun.
+* **Size:** ~57 MB of app on a ~13 MB base. Of the app, 11 MB is the UI with its precompressed `.br`/`.gz`
+  siblings; ReadyToRun accounts for 13 MB.
+* **Trimming:** the collector's own JSON is source-generated or written by hand. MongoDB.Bson isn't
+  trim-annotated, so it is kept whole. The trimmed publish has no warnings, and the build was driven
+  end to end: join, UI, and a restart that reloads shapes, alerts and callsites.
+* **ReadyToRun:** the HEALTHCHECK probe is a fresh process every 30 s. ReadyToRun takes it from 0.2 s to
+  0.05 s of CPU (from 0.4 s with `HttpClient`, before the probe moved to a raw socket). It also cuts
+  startup from 1.2 s to 0.4 s. Idle RSS is ~54 MB.
+* **Health:** `HEALTHCHECK CMD ["/app/spyglass-collector", "healthcheck"]` GETs `/healthz` on the
+  `SPYGLASS_BIND` listener (a wildcard is probed on loopback), and exits 0 or 1.
+* **UI serving:** a fingerprinted asset (`_framework/*.<10 chars>.*`) is `immutable` for a year; everything
+  else is `no-cache` with an ETag. `.br` is served when the browser accepts it, otherwise `.gz`. Browsers
+  offer brotli only over HTTPS, so plain-HTTP deployments get gzip. The 3.0 MB runtime travels as 0.98 MB
+  (brotli) or 1.2 MB (gzip).
+* **Configuration:** `SPYGLASS_*` environment variables. The image sets `SPYGLASS_BIND=0.0.0.0:8080` and
+  `SPYGLASS_DATA=/data` (a volume). A non-loopback bind needs password or header auth (§9), so a
+  `docker run` passes `SPYGLASS_TOKEN` and `SPYGLASS_ADMIN_PASSWORD` (or `SPYGLASS_AUTH_HEADER`).
+* **Multi-arch:** the SDK stage runs on the build platform and publishes for `TARGETARCH`; crossgen2
+  cross-compiles. The NuGet cache is a BuildKit cache mount, and restore sits on its own layer.
+
+```sh
+docker build -f src/Spyglass.Collector/Dockerfile -t spyglass-collector .
+docker run -d --name spyglass -p 8080:8080 -v spyglass-data:/data \
+  -e SPYGLASS_TOKEN=… -e SPYGLASS_ADMIN_PASSWORD=… spyglass-collector
+```

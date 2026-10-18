@@ -94,8 +94,9 @@ alerted op; the aggregates stay complete).
 1. ~~M2: the join~~: done, `STATUS-M2.md`.
 2. Analysis throughput on dedicated cores. The next costs are allocation (~9 KB/record end to
    end) and SQLite writes.
-3. A container image (the publish script produces the directory it would copy). Not built here:
-   there is no Docker in this environment.
+3. ~~A container image~~: `src/Spyglass.Collector/Dockerfile` (03 §12). Its build stage was replayed
+   command for command and its output run as the container runs it; `docker build` itself still needs a
+   machine with Docker.
 4. One full-suite Release run had one `EndToEndTests` failure whose message was lost. It has
    not reproduced in 9 runs since, nor in 5 standalone. The test names the missing keys if it
    recurs.

@@ -29,6 +29,12 @@ internal sealed class StorageWriter
     private int _ops;
 
     public long Written, Sampled, Pruned, Updated;
+    /// <summary>Environment.TickCount64 at the loop's last turn (every 250 ms, or between retention chunks).</summary>
+    public long LastBeat = Environment.TickCount64;
+    /// <summary>Environment.TickCount64 of the first failed write since the last good one; 0 while writes succeed.</summary>
+    public long FailingSince;
+    public string? LastError;
+    public bool Alive => _thread?.IsAlive == true;
 
     public StorageWriter(IOperationStore store, IAggregateStore aggregates, ICallsiteStore callsites, CollectorOptions options, Func<long> nowUs, LiveHub live)
     {
@@ -99,6 +105,7 @@ internal sealed class StorageWriter
         while (!_queue.IsCompleted)
         {
             var wait = (int)Math.Max(0, deadline - Environment.TickCount64);
+            Volatile.Write(ref LastBeat, Environment.TickCount64);
             if (_queue.TryTake(out var item, wait))
             {
                 Add(item);
@@ -153,10 +160,13 @@ internal sealed class StorageWriter
             var now = _nowUs();
             if (_newCallsites.Count > 0) _callsites.Upsert(_newCallsites, now);
             if (_touched.Count > 0) _callsites.Touch(_touched, now);
+            Volatile.Write(ref FailingSince, 0);
         }
         catch (Exception e)
         {
             Console.Error.WriteLine($"storage: {e.GetType().Name}: {e.Message} ({_batch.Count} ops, {_updates.Count} updates lost)");
+            LastError = $"{e.GetType().Name}: {e.Message}";
+            if (Volatile.Read(ref FailingSince) == 0) Volatile.Write(ref FailingSince, Environment.TickCount64);
         }
         _batch.Clear();
         _updates.Clear();
@@ -171,7 +181,8 @@ internal sealed class StorageWriter
         try
         {
             var now = _nowUs();
-            Interlocked.Add(ref Pruned, _store.Prune(now - (long)_options.OpRetention.TotalMicroseconds, _options.OpStoreBytes));
+            Interlocked.Add(ref Pruned, _store.Prune(now - (long)_options.OpRetention.TotalMicroseconds, _options.OpStoreBytes,
+                () => Volatile.Write(ref LastBeat, Environment.TickCount64)));
             _aggregates.Rollup(now);
             _callsites.PruneCallsites(now - (long)TimeSpan.FromDays(30).TotalMicroseconds);
         }

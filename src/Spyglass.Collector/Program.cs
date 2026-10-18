@@ -1,5 +1,9 @@
 using Spyglass.Collector;
 
+// container HEALTHCHECK (the image has no shell or curl): spyglass-collector healthcheck [--bind host:port] [--path /healthz]
+if (args is ["healthcheck", ..])
+    return await HealthProbe.RunAsync(args[1..]);
+
 CollectorOptions options;
 try
 {

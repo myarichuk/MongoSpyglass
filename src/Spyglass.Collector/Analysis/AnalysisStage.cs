@@ -57,6 +57,9 @@ internal sealed class AnalysisStage
     public readonly CursorRegistry Cursors = new();
     public readonly AggregateBook Aggregates = new();
     public long Processed;
+    /// <summary>Environment.TickCount64 at the loop's last turn (at least every 100 ms when healthy).</summary>
+    public long LastBeat = Environment.TickCount64;
+    public bool Alive => _thread?.IsAlive == true;
 
     public AnalysisStage(CollectorOptions options, StorageWriter writer, IAggregateStore aggregates, IAlertStore alertStore,
         IOperationStore ops, LiveHub live, ProducerRegistry producers, Action<Record> release, Func<long> nowUs)
@@ -123,7 +126,9 @@ internal sealed class AnalysisStage
         var nextHousekeeping = Environment.TickCount64;
         while (!_queue.IsCompleted)
         {
-            if (_queue.TryTake(out var item, 100))
+            var took = _queue.TryTake(out var item, 100);
+            Volatile.Write(ref LastBeat, Environment.TickCount64);
+            if (took)
             {
                 if (item is BatchItem { Output: var b })
                 {

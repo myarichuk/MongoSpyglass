@@ -64,6 +64,9 @@ internal sealed class Partition
     private Thread? _thread;
 
     public long Duplicates, DecodeFailures, Processed;
+    /// <summary>Environment.TickCount64 at the loop's last turn (at least every 100 ms when healthy).</summary>
+    public long LastBeat = Environment.TickCount64;
+    public bool Alive => _thread?.IsAlive == true;
 
     public Partition(CollectorOptions options, ConnectionRegistry conns, ProducerRegistry producers, JoinCounters joinCounters,
         Action<PartitionOutput> toAnalysis, Action<Record> release, Func<long> nowUs, Func<long, bool> exportersActive)
@@ -109,6 +112,7 @@ internal sealed class Partition
         {
             // wake at least every 100 ms: waiting ops and cmds expire on the clock, not on traffic
             _queue.TryTake(out var item, 100);
+            Volatile.Write(ref LastBeat, Environment.TickCount64);
             var output = new PartitionOutput();
             var now = _nowUs();
             // expiry first: whatever ran out by now is final before records arriving now are matched against it

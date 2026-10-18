@@ -21,4 +21,14 @@
     <InternalsVisibleTo Include="Spyglass.Collector.Tests" />
   </ItemGroup>
 
+  <!-- The container build is self-contained and trimmed (src/Spyglass.Collector/Dockerfile). The collector's own JSON
+       is source-generated or written by hand; MongoDB.Bson is not trim-annotated, so it is kept whole, and IL2104
+       (warnings inside it) does not apply to code that is not trimmed. -->
+  <PropertyGroup Condition="'$(PublishTrimmed)' == 'true'">
+    <NoWarn>$(NoWarn);IL2104</NoWarn>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(PublishTrimmed)' == 'true'">
+    <TrimmerRootAssembly Include="MongoDB.Bson" />
+  </ItemGroup>
+
 </Project>

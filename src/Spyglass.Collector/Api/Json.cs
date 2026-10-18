@@ -2,7 +2,6 @@ using System.Buffers;
 using System.Text.Json;
 using MongoDB.Bson;
 using MongoDB.Bson.IO;
-using MongoDB.Bson.Serialization;
 using Spyglass.Collector.Analysis;
 using Spyglass.Collector.Model;
 
@@ -163,7 +162,7 @@ public static class Json
         if (r.Cmd != null)
         {
             string ejson;
-            try { ejson = BsonSerializer.Deserialize<BsonDocument>(r.Cmd).ToJson(Shell); }
+            try { ejson = Shapes.FastBson.Decode(r.Cmd).ToJson(Shell); }
             catch (Exception) { ejson = "(undecodable)"; }
             w.WriteString("command_ejson", ejson);
         }

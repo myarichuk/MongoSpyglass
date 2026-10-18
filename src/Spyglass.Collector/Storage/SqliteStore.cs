@@ -15,7 +15,6 @@ namespace Spyglass.Collector.Storage;
 /// </summary>
 public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore, ICallsiteStore, IDisposable
 {
-    private static readonly JsonSerializerOptions JsonOptions = new() { IncludeFields = true };
     private const int PruneChunk = 5000;
 
     private readonly string _readCs;
@@ -225,37 +224,49 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
         }
     }
 
-    public int Prune(long olderThanUs, long maxBytes)
+    public int Prune(long olderThanUs, long maxBytes, Action? progress = null)
     {
+        // a chunk per write-lock hold: a day of ops is millions of rows, and the analysis stage's aggregate
+        // flush waits on the same lock
         var removed = 0;
-        lock (_writeLock)
+        var bound = Ulid.Bound(olderThanUs / 1000, low: true);
+        int deleted;
+        do
         {
-            removed += Delete("id < $bound", ("$bound", Ulid.Bound(olderThanUs / 1000, low: true)));
-            // size bound: oldest first, a proportional estimate at a time (rows differ in size), until it fits
-            while (_bytes > maxBytes && _count > 0)
+            lock (_writeLock)
+                deleted = Delete("id IN (SELECT id FROM ops WHERE id < $bound ORDER BY id LIMIT $n)", ("$bound", bound), ("$n", PruneChunk));
+            removed += deleted;
+            progress?.Invoke();
+        } while (deleted == PruneChunk);
+        // size bound: oldest first, a proportional estimate at a time (rows differ in size), until it fits
+        while (Interlocked.Read(ref _bytes) > maxBytes && Interlocked.Read(ref _count) > 0)
+        {
+            lock (_writeLock)
             {
                 var excess = (double)(_bytes - maxBytes) / _bytes;
                 var n = (int)Math.Clamp(Math.Ceiling(_count * excess), 1, PruneChunk);
-                var deleted = Delete("id IN (SELECT id FROM ops ORDER BY id LIMIT $n)", ("$n", n));
-                removed += deleted;
-                if (deleted == 0) break;
+                deleted = Delete("id IN (SELECT id FROM ops ORDER BY id LIMIT $n)", ("$n", n));
             }
-            if (removed > 0) Exec("PRAGMA wal_checkpoint(PASSIVE);");
+            removed += deleted;
+            progress?.Invoke();
+            if (deleted == 0) break;
         }
+        if (removed > 0)
+            lock (_writeLock) Exec("PRAGMA wal_checkpoint(PASSIVE);");
         return removed;
     }
 
-    private int Delete(string where, (string Name, object Value) p)
+    private int Delete(string where, params (string Name, object Value)[] ps)
     {
         using var size = _write.CreateCommand();
         size.CommandText = $"SELECT count(*), coalesce(sum(size), 0) FROM ops WHERE {where}";
-        size.Parameters.AddWithValue(p.Name, p.Value);
+        foreach (var p in ps) size.Parameters.AddWithValue(p.Name, p.Value);
         long rows, bytes;
         using (var rd = size.ExecuteReader()) { rd.Read(); rows = rd.GetInt64(0); bytes = rd.GetInt64(1); }
         if (rows == 0) return 0;
         using var del = _write.CreateCommand();
         del.CommandText = $"DELETE FROM ops WHERE {where}";
-        del.Parameters.AddWithValue(p.Name, p.Value);
+        foreach (var p in ps) del.Parameters.AddWithValue(p.Name, p.Value);
         var n = del.ExecuteNonQuery();
         Interlocked.Add(ref _count, -n);
         Interlocked.Add(ref _bytes, -bytes);
@@ -378,7 +389,7 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
                 using var cmd = _write.CreateCommand();
                 cmd.CommandText = "INSERT OR REPLACE INTO shapes (hash, data) VALUES ($h, $d)";
                 cmd.Parameters.AddWithValue("$h", s.ShapeHash);
-                cmd.Parameters.AddWithValue("$d", JsonSerializer.Serialize(s, JsonOptions));
+                cmd.Parameters.AddWithValue("$d", JsonSerializer.Serialize(s, StoreJson.Default.ShapeInfo));
                 cmd.ExecuteNonQuery();
             }
             tx.Commit();
@@ -391,7 +402,7 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
         using var cmd = c.CreateCommand();
         cmd.CommandText = "SELECT data FROM shapes WHERE hash = $h";
         cmd.Parameters.AddWithValue("$h", hash);
-        return cmd.ExecuteScalar() is string json ? JsonSerializer.Deserialize<ShapeInfo>(json, JsonOptions) : null;
+        return cmd.ExecuteScalar() is string json ? JsonSerializer.Deserialize(json, StoreJson.Default.ShapeInfo) : null;
     }
 
     public List<ShapeInfo> Shapes()
@@ -401,7 +412,7 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
         cmd.CommandText = "SELECT data FROM shapes";
         var list = new List<ShapeInfo>();
         using var rd = cmd.ExecuteReader();
-        while (rd.Read()) list.Add(JsonSerializer.Deserialize<ShapeInfo>(rd.GetString(0), JsonOptions)!);
+        while (rd.Read()) list.Add(JsonSerializer.Deserialize(rd.GetString(0), StoreJson.Default.ShapeInfo)!);
         return list;
     }
 
@@ -417,7 +428,7 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
                 using var cmd = _write.CreateCommand();
                 cmd.CommandText = "INSERT OR REPLACE INTO alerts (id, data) VALUES ($id, $d)";
                 cmd.Parameters.AddWithValue("$id", a.Id);
-                cmd.Parameters.AddWithValue("$d", JsonSerializer.Serialize(a, JsonOptions));
+                cmd.Parameters.AddWithValue("$d", JsonSerializer.Serialize(a, StoreJson.Default.Alert));
                 cmd.ExecuteNonQuery();
             }
             tx.Commit();
@@ -431,7 +442,7 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
         cmd.CommandText = "SELECT data FROM alerts";
         var list = new List<Alert>();
         using var rd = cmd.ExecuteReader();
-        while (rd.Read()) list.Add(JsonSerializer.Deserialize<Alert>(rd.GetString(0), JsonOptions)!);
+        while (rd.Read()) list.Add(JsonSerializer.Deserialize(rd.GetString(0), StoreJson.Default.Alert)!);
         return list;
     }
 
@@ -448,16 +459,13 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
                 using var cmd = _write.CreateCommand();
                 cmd.CommandText = "INSERT OR REPLACE INTO callsites (hash, data, last_used) VALUES ($h, $d, $t)";
                 cmd.Parameters.AddWithValue("$h", c.Callsite);
-                cmd.Parameters.AddWithValue("$d", JsonSerializer.Serialize(new StoredCallsite(c.Lang, c.Frames.Select(f => new StoredFrame(f.Fn, f.File, f.Line)).ToList())));
+                cmd.Parameters.AddWithValue("$d", JsonSerializer.Serialize(new StoredCallsite(c.Lang, c.Frames.Select(f => new StoredFrame(f.Fn, f.File, f.Line)).ToList()), StoreJson.Default.StoredCallsite));
                 cmd.Parameters.AddWithValue("$t", nowUs);
                 cmd.ExecuteNonQuery();
             }
             tx.Commit();
         }
     }
-
-    private sealed record StoredFrame(string Fn, string? File, int? Line);
-    private sealed record StoredCallsite(string? Lang, List<StoredFrame> Frames);
 
     public void Touch(IReadOnlyCollection<string> hashes, long nowUs)
     {
@@ -480,7 +488,7 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
         using var cmd = c.CreateCommand();
         cmd.CommandText = "SELECT data FROM callsites WHERE hash = $h";
         cmd.Parameters.AddWithValue("$h", hash);
-        if (cmd.ExecuteScalar() is not string json || JsonSerializer.Deserialize<StoredCallsite>(json) is not { } s) return null;
+        if (cmd.ExecuteScalar() is not string json || JsonSerializer.Deserialize(json, StoreJson.Default.StoredCallsite) is not { } s) return null;
         return new CallsiteRecord { Callsite = hash, Lang = s.Lang, Frames = s.Frames.Select(f => (f.Fn, f.File, f.Line)).ToList() };
     }
 

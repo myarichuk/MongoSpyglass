@@ -1,0 +1,13 @@
+# Build context for src/Spyglass.Collector/Dockerfile (and the legacy MongoSpyglass.Service one):
+# sources only, never build output, caches or local tooling.
+**/bin/
+**/obj/
+**/node_modules/
+**/.vs/
+**/.idea/
+.git/
+artifacts/
+tools/mongod/.cache/
+tests/node-conformance/node_modules/
+**/*.nettrace
+**/*.etlx

@@ -1,7 +1,6 @@
 using System.IO.Compression;
 using System.Text;
 using MongoDB.Bson;
-using MongoDB.Bson.Serialization;
 using Spyglass.Collector.Analysis;
 using Spyglass.Collector.Ingest;
 using Spyglass.Collector.Model;
@@ -9,6 +8,15 @@ using Spyglass.Collector.Pipeline;
 using Spyglass.Collector.Storage;
 
 namespace Spyglass.Collector;
+
+/// <summary>One health check: <paramref name="Ok"/> false fails <see cref="HealthReport.Live"/> if <paramref name="Liveness"/>, else only readiness.</summary>
+public readonly record struct HealthCheck(string Name, bool Ok, bool Liveness, string Detail);
+
+/// <summary>
+/// <c>/healthz</c> (live: every stage is turning and storage is writing; a restart may help otherwise) and
+/// <c>/readyz</c> (ready: also not shedding ingest with 429s).
+/// </summary>
+public sealed record HealthReport(bool Live, bool Ready, IReadOnlyList<HealthCheck> Checks);
 
 /// <summary>Outcome of one ingest POST (02 §5).</summary>
 public readonly record struct IngestResult(int Status, int Accepted, int Rejected, int Ignored, string? Error = null);
@@ -199,7 +207,7 @@ public sealed class Collector : IAsyncDisposable
         if (op.Cmd == null) return true;
         try
         {
-            var d = BsonSerializer.Deserialize<BsonDocument>(op.Cmd);
+            var d = Shapes.FastBson.Decode(op.Cmd);
             return d.ElementCount == 1 && d.GetElement(0).Name == "$redacted";
         }
         catch (Exception) { return false; }
@@ -225,6 +233,29 @@ public sealed class Collector : IAsyncDisposable
         if (await Task.WhenAny(all, Task.Delay(timeout)).ConfigureAwait(false) != all) return;
         await _analysis.Invoke(() => { _analysis.Housekeeping(NowUs()); return 0; }).ConfigureAwait(false);
         await _writer.Barrier().ConfigureAwait(false);
+    }
+
+    public HealthReport Health()
+    {
+        var now = Environment.TickCount64;
+        var checks = new List<HealthCheck>();
+        string Age(long beat) => $"last turn {(now - Volatile.Read(ref beat)) / 1000.0:F1} s ago";
+        void Stage(string name, bool alive, long beat, TimeSpan stall) =>
+            checks.Add(new HealthCheck(name, alive && now - Volatile.Read(ref beat) < stall.TotalMilliseconds, true, alive ? Age(beat) : "thread not running"));
+
+        for (var i = 0; i < _partitions.Length; i++) Stage($"partition-{i}", _partitions[i].Alive, _partitions[i].LastBeat, Options.HealthStageStall);
+        Stage("analysis", _analysis.Alive, _analysis.LastBeat, Options.HealthStageStall);
+        Stage("storage-writer", _writer.Alive, _writer.LastBeat, Options.HealthWriterStall);
+        var failing = Volatile.Read(ref _writer.FailingSince);
+        checks.Add(new HealthCheck("storage", failing == 0 || now - failing < Options.HealthStorageFailing.TotalMilliseconds, true,
+            failing == 0 ? "writes succeeding" : $"writes failing for {(now - failing) / 1000.0:F0} s: {_writer.LastError}"));
+        var queued = QueuedBytes;
+        checks.Add(new HealthCheck("ingest-queue", queued <= Options.QueueBytes * 9 / 10, false,
+            $"{queued * 100.0 / Options.QueueBytes:F1} % of {Options.QueueBytes / 1048576} MiB (429 above 90 %)"));
+        checks.Add(new HealthCheck("storage-backlog", true, false,
+            $"{_writer.Backlog} ops" + (_writer.Backlog > StorageWriter.Capacity / 2 ? ", sampling (03 §7)" : "")));
+        var live = checks.All(c => c.Ok || !c.Liveness);
+        return new HealthReport(live, live && checks.All(c => c.Ok), checks);
     }
 
     public string RenderMetrics()

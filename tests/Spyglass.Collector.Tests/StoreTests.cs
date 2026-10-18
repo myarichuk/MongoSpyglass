@@ -1,3 +1,5 @@
+using Spyglass.Collector.Model;
+using Spyglass.Collector.Ingest;
 using MongoDB.Bson;
 using Spyglass.Collector.Analysis;
 using Spyglass.Collector.Storage;
@@ -104,6 +106,24 @@ public sealed class StoreTests : IDisposable
         Assert.InRange(kept.Count, 450, 550);                        // about half, not everything
         Assert.Equal(9199, kept.Max());                              // the newest survive (last batch: 9000..9199)
         store.Dispose();
+    }
+
+    /// <summary>Retention deletes in chunks, releasing the write lock between them (a day of ops is millions of rows).</summary>
+    [Fact]
+    public void Retention_runs_in_chunks()
+    {
+        using var store = new SqliteStore(_dir);
+        var ops = new List<Operation>();
+        for (var i = 0; i < 12_000; i++)
+        {
+            Assert.Equal(ParseResult.Ok, RecordParser.Parse(System.Text.Encoding.UTF8.GetBytes(Op(i, "find", ts: T0 + i * 1000L)), out var r, out _));
+            ops.Add(new Operation { Id = Ulid.New((T0 + i * 1000L) / 1000), Op = (OpRecord)r!, ShapeHash = "s" });
+        }
+        store.Append(ops);
+        var chunks = 0;
+        Assert.Equal(11_000, store.Prune(T0 + 11_000_000L, long.MaxValue, () => chunks++));
+        Assert.Equal(3, chunks);                                     // 5000 + 5000 + 1000
+        Assert.Equal(1000, store.Count);
     }
 
     [Fact]

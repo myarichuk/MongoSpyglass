@@ -66,14 +66,16 @@ public sealed class Server : IAsyncDisposable
     private void Map(string? uiRoot)
     {
         var app = _app;
-        app.MapGet("/healthz", () => Results.Text("ok"));
+        // no auth (03 §8): states and counts only
+        app.MapGet("/healthz", () => Health(live: true));
+        app.MapGet("/readyz", () => Health(live: false));
         app.MapPost("/ingest/v0", Ingest);
 
         var api = app.MapGroup("/api/v1");
         api.AddEndpointFilter(async (ctx, next) => Authorized(ctx.HttpContext) ? await next(ctx) : Results.Unauthorized());
         app.MapPost("/api/v1/login", (Delegate)Login); // outside the filter: it is how one gets authorized
         app.MapPost("/api/v1/logout", Logout);
-        api.MapGet("/whoami", (HttpContext c) => Results.Json(new { auth = Options.Auth.ToString().ToLowerInvariant(), user = User(c) }));
+        api.MapGet("/whoami", (HttpContext c) => Obj(("auth", Options.Auth.ToString().ToLowerInvariant()), ("user", User(c))));
         api.MapGet("/ops", Ops);
         api.MapGet("/ops/{id}", Op);
         api.MapGet("/shapes", Shapes);
@@ -88,30 +90,108 @@ public sealed class Server : IAsyncDisposable
         api.MapGet("/live", Live);
         api.MapPost("/export", Export);
         api.MapGet("/metrics", () => Results.Text(Collector.RenderMetrics(), "text/plain; version=0.0.4"));
-        api.MapGet("/uows", () => Results.Json(new { items = Array.Empty<object>(), note = "units of work are M3 (03 §5.3); joined ops carry uowId and filter with /ops?uow=" }));
+        api.MapGet("/uows", () => Raw(Json.Write(w =>
+        {
+            w.WriteStartObject();
+            w.WriteStartArray("items");
+            w.WriteEndArray();
+            w.WriteString("note", "units of work are M3 (03 §5.3); joined ops carry uowId and filter with /ops?uow=");
+            w.WriteEndObject();
+        })));
 
         if (uiRoot != null && File.Exists(Path.Combine(uiRoot, "index.html")))
+            MapUi(app, Path.GetFullPath(uiRoot));
+    }
+
+    private const string Csp =
+        "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'";
+
+    /// <summary>Blazor's fingerprinted assets (<c>name.0123456789.wasm</c>): their content never changes under that name.</summary>
+    private static readonly System.Text.RegularExpressions.Regex Fingerprinted = new(@"^_framework/.+\.[a-z0-9]{10}\.(wasm|js|dat|json)$",
+        System.Text.RegularExpressions.RegexOptions.Compiled | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+
+    private static void UiHeaders(HttpResponse r, string relativePath)
+    {
+        r.Headers["X-Content-Type-Options"] = "nosniff";
+        r.Headers["Content-Security-Policy"] = Csp;
+        r.Headers.CacheControl = Fingerprinted.IsMatch(relativePath) ? "public, max-age=31536000, immutable" : "no-cache";
+    }
+
+    /// <summary>
+    /// The SPA (03 §10): static files, the build's precompressed <c>.br</c>/<c>.gz</c> siblings when the browser takes
+    /// them (the runtime is 6.5 MB raw, 2.3 MB brotli), immutable caching for fingerprinted assets, and
+    /// <c>index.html</c> for client-side routes.
+    /// </summary>
+    private static void MapUi(WebApplication app, string root)
+    {
+        var files = new Microsoft.Extensions.FileProviders.PhysicalFileProvider(root);
+        var types = new Microsoft.AspNetCore.StaticFiles.FileExtensionContentTypeProvider();
+        app.Use(async (c, next) =>
         {
-            var files = new Microsoft.Extensions.FileProviders.PhysicalFileProvider(Path.GetFullPath(uiRoot));
-            app.UseDefaultFiles(new DefaultFilesOptions { FileProvider = files });
-            app.UseStaticFiles(new StaticFileOptions
+            var req = c.Request;
+            if ((HttpMethods.IsGet(req.Method) || HttpMethods.IsHead(req.Method)) && req.Path.Value is { Length: > 1 } path &&
+                !req.Path.StartsWithSegments("/api") && !req.Path.StartsWithSegments("/ingest"))
             {
-                FileProvider = files,
-                ServeUnknownFileTypes = true, // .wasm, .dat, .blat
-                OnPrepareResponse = c =>
+                var rel = path[1..];
+                var accepted = req.GetTypedHeaders().AcceptEncoding;
+                foreach (var (token, ext) in (ReadOnlySpan<(string, string)>)[("br", ".br"), ("gzip", ".gz")])
                 {
-                    c.Context.Response.Headers["X-Content-Type-Options"] = "nosniff";
-                    c.Context.Response.Headers["Content-Security-Policy"] =
-                        "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'";
-                },
-            });
-            app.MapFallback(async c =>
+                    if (!accepted.Any(a => string.Equals(a.Value.Value, token, StringComparison.OrdinalIgnoreCase) && (a.Quality ?? 1) > 0)) continue;
+                    var f = files.GetFileInfo(rel + ext);
+                    if (!f.Exists || f.IsDirectory) continue;
+                    var res = c.Response;
+                    UiHeaders(res, rel);
+                    res.Headers.Vary = "Accept-Encoding";
+                    var etag = $"\"{f.LastModified.UtcTicks:x}-{f.Length:x}-{token}\"";
+                    res.Headers.ETag = etag;
+                    if (req.Headers.IfNoneMatch.Contains(etag)) { res.StatusCode = StatusCodes.Status304NotModified; return; }
+                    res.Headers.ContentEncoding = token;
+                    res.ContentType = types.TryGetContentType(rel, out var ct) ? ct : "application/octet-stream";
+                    res.ContentLength = f.Length;
+                    if (HttpMethods.IsGet(req.Method)) await res.SendFileAsync(f).ConfigureAwait(false);
+                    return;
+                }
+            }
+            await next(c).ConfigureAwait(false);
+        });
+        app.UseDefaultFiles(new DefaultFilesOptions { FileProvider = files });
+        app.UseStaticFiles(new StaticFileOptions
+        {
+            FileProvider = files,
+            ServeUnknownFileTypes = true, // .wasm, .dat, .blat
+            OnPrepareResponse = c => UiHeaders(c.Context.Response, c.Context.Request.Path.Value?.TrimStart('/') ?? ""),
+        });
+        app.MapFallback(async c =>
+        {
+            if (c.Request.Path.StartsWithSegments("/api")) { c.Response.StatusCode = 404; return; }
+            UiHeaders(c.Response, "index.html");
+            c.Response.ContentType = "text/html; charset=utf-8";
+            await c.Response.SendFileAsync(Path.Combine(root, "index.html")).ConfigureAwait(false);
+        });
+    }
+
+    private IResult Health(bool live)
+    {
+        var h = Collector.Health();
+        var ok = live ? h.Live : h.Ready;
+        var body = Json.Write(w =>
+        {
+            w.WriteStartObject();
+            w.WriteString("status", ok ? "ok" : "failing");
+            w.WriteBoolean("live", h.Live);
+            w.WriteBoolean("ready", h.Ready);
+            w.WriteStartObject("checks");
+            foreach (var c in h.Checks)
             {
-                if (c.Request.Path.StartsWithSegments("/api")) { c.Response.StatusCode = 404; return; }
-                c.Response.ContentType = "text/html; charset=utf-8";
-                await c.Response.SendFileAsync(Path.Combine(uiRoot, "index.html")).ConfigureAwait(false);
-            });
-        }
+                w.WriteStartObject(c.Name);
+                w.WriteBoolean("ok", c.Ok);
+                w.WriteString("detail", c.Detail);
+                w.WriteEndObject();
+            }
+            w.WriteEndObject();
+            w.WriteEndObject();
+        });
+        return Results.Text(Encoding.UTF8.GetString(body), "application/json", Encoding.UTF8, ok ? 200 : 503);
     }
 
     // ---- auth (03 §9) -----------------------------------------------------------------------
@@ -147,7 +227,7 @@ public sealed class Server : IAsyncDisposable
 
     private async Task<IResult> Login(HttpContext c)
     {
-        if (Options.Auth != AuthMode.Password) return Results.Json(new { auth = Options.Auth.ToString().ToLowerInvariant() });
+        if (Options.Auth != AuthMode.Password) return Obj(("auth", Options.Auth.ToString().ToLowerInvariant()));
         string? password = null;
         if (c.Request.HasFormContentType) password = (await c.Request.ReadFormAsync().ConfigureAwait(false))["password"];
         else
@@ -171,14 +251,14 @@ public sealed class Server : IAsyncDisposable
         {
             HttpOnly = true, SameSite = SameSiteMode.Strict, Secure = c.Request.IsHttps, Path = "/", MaxAge = SessionLifetime,
         });
-        return Results.Json(new { ok = true });
+        return Obj(("ok", true));
     }
 
     private IResult Logout(HttpContext c)
     {
         if (c.Request.Cookies[SessionCookie] is { } sid) _sessions.TryRemove(sid, out _);
         c.Response.Cookies.Delete(SessionCookie);
-        return Results.Json(new { ok = true });
+        return Obj(("ok", true));
     }
 
     // ---- ingest (02 §5) ---------------------------------------------------------------------
@@ -220,6 +300,20 @@ public sealed class Server : IAsyncDisposable
     private static string? S(HttpRequest r, string name) => r.Query[name] is { Count: > 0 } v && v[0] is { Length: > 0 } s ? s : null;
 
     private static IResult Raw(byte[] json) => Results.Bytes(json, "application/json");
+
+    /// <summary>A flat JSON object of strings and booleans, without reflection (the container build is trimmed).</summary>
+    private static IResult Obj(params (string Name, object? Value)[] fields) => Raw(Json.Write(w =>
+    {
+        w.WriteStartObject();
+        foreach (var (name, value) in fields)
+            switch (value)
+            {
+                case null: w.WriteNull(name); break;
+                case bool b: w.WriteBoolean(name, b); break;
+                default: w.WriteString(name, value.ToString()); break;
+            }
+        w.WriteEndObject();
+    }));
 
     private IResult Ops(HttpRequest req)
     {
@@ -270,7 +364,7 @@ public sealed class Server : IAsyncDisposable
         if (o.Op.Cmd == null) return null;
         try
         {
-            var d = MongoDB.Bson.Serialization.BsonSerializer.Deserialize<MongoDB.Bson.BsonDocument>(o.Op.Cmd);
+            var d = Spyglass.Collector.Shapes.FastBson.Decode(o.Op.Cmd);
             return d.TryGetValue("getMore", out var v) && v.IsNumeric ? v.ToInt64() : null;
         }
         catch (Exception) { return null; }
@@ -439,7 +533,7 @@ public sealed class Server : IAsyncDisposable
 
     private async Task<IResult> Mute(string id, bool muted) =>
         await Collector.Analysis.Invoke(() => Collector.Analysis.Alerts.SetMuted(id, muted)).ConfigureAwait(false)
-            ? Results.Json(new { id, muted })
+            ? Obj(("id", id), ("muted", muted))
             : Results.NotFound();
 
     private IResult Cursors(HttpRequest req)

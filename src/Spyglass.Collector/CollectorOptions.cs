@@ -40,6 +40,13 @@ public sealed class CollectorOptions
     /// <summary>Finalized ops a late cmd can still merge into, per partition (02 §6.2, bounded like dedup).</summary>
     public int JoinFinalizedCapacity { get; set; } = 1 << 17;
 
+    // /healthz: a stage loop turns at least every 250 ms, so one that has not turned for this long is stuck
+    public TimeSpan HealthStageStall { get; set; } = TimeSpan.FromSeconds(30);
+    /// <summary>The writer's longest legitimate step is one retention chunk.</summary>
+    public TimeSpan HealthWriterStall { get; set; } = TimeSpan.FromSeconds(120);
+    /// <summary>Storage writes failing with no success for this long (a full disk, a broken file).</summary>
+    public TimeSpan HealthStorageFailing { get; set; } = TimeSpan.FromSeconds(60);
+
     // 03 §5.2 thresholds
     public long SlowShapeUs { get; set; } = 100_000;
     public int NPlusOneCount { get; set; } = 10;

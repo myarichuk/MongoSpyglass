@@ -22,8 +22,11 @@ public interface IOperationStore
     List<Operation> Query(OpQuery q);
     /// <summary>Changes to stored ops, applied in order: late context, further stream replies, alerts raised later.</summary>
     void Update(IReadOnlyList<OpUpdate> updates);
-    /// <summary>Retention (03 §7): older than <paramref name="olderThanUs"/>, then oldest first until under <paramref name="maxBytes"/>.</summary>
-    int Prune(long olderThanUs, long maxBytes);
+    /// <summary>
+    /// Retention (03 §7): older than <paramref name="olderThanUs"/>, then oldest first until under <paramref name="maxBytes"/>.
+    /// In chunks: <paramref name="progress"/> runs between them, and other writers get the store in between.
+    /// </summary>
+    int Prune(long olderThanUs, long maxBytes, Action? progress = null);
     long Count { get; }
 }
 
@@ -129,7 +132,7 @@ public sealed class MemoryStore : IOperationStore, IAggregateStore, IAlertStore,
         return n;
     }
 
-    public int Prune(long olderThanUs, long maxBytes)
+    public int Prune(long olderThanUs, long maxBytes, Action? progress = null)
     {
         var n = 0;
         while (_order.TryPeek(out var id) && (!_ops.TryGetValue(id, out var op) || op.Ts < olderThanUs) && _order.TryDequeue(out _))
