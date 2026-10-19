@@ -1,0 +1,102 @@
+using System.Security.Cryptography;
+
+namespace Spyglass.Collector.Model;
+
+/// <summary>
+/// The stored entity (03 §3.3): an <c>op</c> record, its connection's <c>conn</c> metadata, and, when an
+/// exporter reported the same command, its <c>cmd</c> record (the join, 02 §6).
+/// </summary>
+public sealed class Operation
+{
+    public required string Id;
+    public required OpRecord Op;
+
+    // enrichment
+    public string? App, Driver;
+    public string ShapeHash = "";
+    public string? ValueHash;
+    public string? ShapeJson;
+    public int InCardinality;
+    /// <summary>getMore: the cursor id from the command; killCursors: the ids listed.</summary>
+    public long? GetMoreCursorId;
+    public List<long>? KillCursorIds;
+    /// <summary>find/count/aggregate without a filter/limit or a leading $match/$limit (03 §5.2 unbounded-scan input).</summary>
+    public bool Unbounded;
+    /// <summary>
+    /// Waits on the server by design: hello-family monitoring (streaming hello holds for maxAwaitTimeMS),
+    /// tailable/awaitData cursors and change streams, and their getMores. Not slow, whatever its latency.
+    /// </summary>
+    public bool AwaitsByDesign;
+    /// <summary>"db.coll", or "db" for commands with no collection.</summary>
+    public string Ns => Op.Coll is { } c ? $"{Op.Db}.{c}" : Op.Db ?? "";
+    public int ReplyCount;
+    /// <summary>Alert rules this op raised (03 §8 op detail "linked alerts").</summary>
+    public List<string>? Alerts;
+
+    /// <summary>The joined <c>cmd</c> (02 §6), or null for a wire-only op. Written once, by the thread that joins it.</summary>
+    public CmdRecord? Ctx;
+    /// <summary>Handed to the storage writer (analysis thread only): later changes go as updates.</summary>
+    internal bool Stored;
+
+    /// <summary>03 §3.3: <c>client_us − (respLast − reqFirst)</c>, clamped ≥ 0.</summary>
+    public long? ClientOverheadUs => Ctx?.ClientUs is { } c ? Math.Max(0, c - (Op.RespLastUs ?? Op.ReqLastUs)) : null;
+
+    public JoinKey? Key => Op.ServerConnectionId is { } sid ? new JoinKey(Op.Src, Op.Member, sid, Op.RequestId) : null;
+
+    public long Ts => Op.Ts;
+    public long? ServerLatencyUs => Op.ServerLatencyUs;
+    public bool IsError => Op.Status == "error";
+    /// <summary>
+    /// Failed from the application's point of view: ok:0, or ok:1 with write errors or a write-concern error
+    /// (a duplicate key is ok:1 + writeErrors). What error-burst and the aggregates' error counts use.
+    /// </summary>
+    public bool Failed => IsError || Op.Reply is { WriteErrors: > 0 } or { WriteConcernError: true };
+    public string? FailureName => Op.Reply switch
+    {
+        { CodeName: { } cn } => cn,
+        { Code: { } code } => code.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        { WriteErrors: > 0 } => "WriteError",
+        { WriteConcernError: true } => "WriteConcernError",
+        _ => null,
+    };
+}
+
+/// <summary>ULIDs (Crockford base32, 48-bit ms time + 80 random bits): sortable by creation time.</summary>
+public static class Ulid
+{
+    private const string Alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+    /// <summary>The smallest (or largest) ULID of millisecond <paramref name="unixMs"/>: time ranges as key ranges.</summary>
+    public static string Bound(long unixMs, bool low)
+    {
+        Span<char> c = stackalloc char[26];
+        var t = (ulong)Math.Max(0, unixMs);
+        for (var i = 9; i >= 0; i--) { c[i] = Alphabet[(int)(t & 31)]; t >>= 5; }
+        c[10..].Fill(low ? '0' : 'Z');
+        return new string(c);
+    }
+
+    /// <summary>
+    /// Per thread: 80 bits seeded once from the system RNG, then incremented. Ids need uniqueness and order, not
+    /// unpredictability; the crypto RNG per id was 1.3 µs, a quarter of stage 1's non-shape work. Within one thread the
+    /// ids of one millisecond are increasing, as the ULID spec's monotonic variant has them.
+    /// </summary>
+    [ThreadStatic] private static UInt128 t_random;
+
+    public static string New(long unixMs)
+    {
+        if (t_random == 0)
+        {
+            Span<byte> seed = stackalloc byte[16];
+            RandomNumberGenerator.Fill(seed);
+            t_random = System.Buffers.Binary.BinaryPrimitives.ReadUInt128BigEndian(seed) | 1;
+        }
+        var random = t_random = (t_random + 1) & ((UInt128.One << 80) - 1);
+        // 128 bits → 26 chars, 5 bits each, most significant first (the first char carries 3 bits)
+        var v = ((UInt128)(ulong)(unixMs & 0xFFFF_FFFF_FFFF) << 80) | random;
+        return string.Create(26, v, static (c, x) =>
+        {
+            for (var i = 25; i >= 0; i--) { c[i] = Alphabet[(int)(x & 31)]; x >>= 5; }
+        });
+    }
+}

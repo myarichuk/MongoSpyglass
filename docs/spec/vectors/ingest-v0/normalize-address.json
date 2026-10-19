@@ -1,0 +1,19 @@
+{
+  "description": "02 §3.2 member address normalization: [input, expected]. Host lower-cased, no trailing dot, IPv6 in brackets in compressed form, port always present in decimal (default 27017).",
+  "cases": [
+    ["localhost:27017", "localhost:27017"],
+    ["LocalHost:27017", "localhost:27017"],
+    ["localhost", "localhost:27017"],
+    ["DB.Example.NET.", "db.example.net:27017"],
+    ["db.example.net.:27018", "db.example.net:27018"],
+    ["localhost:027017", "localhost:27017"],
+    ["127.0.0.1:27017", "127.0.0.1:27017"],
+    ["10.0.0.5", "10.0.0.5:27017"],
+    ["::1", "[::1]:27017"],
+    ["[::1]:27018", "[::1]:27018"],
+    ["[0:0:0:0:0:0:0:1]:27017", "[::1]:27017"],
+    ["[2001:DB8:0:0:0:0:0:1]:27017", "[2001:db8::1]:27017"],
+    ["2001:db8::1", "[2001:db8::1]:27017"],
+    ["[2001:db8::1]", "[2001:db8::1]:27017"]
+  ]
+}

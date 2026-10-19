@@ -1,0 +1,197 @@
+@page "/ops/{Id}"
+@inject Api Api
+@inject IJSRuntime JS
+@inject NavigationManager Nav
+
+<PageTitle>@(_op?.Command ?? "Operation") · Spyglass</PageTitle>
+@if (_missing)
+{
+    <p class="p-container-padding text-muted">Operation @Id is not in the store (retention, or never stored under backpressure).</p>
+}
+else if (_op is { } o)
+{
+    <div class="p-container-padding flex flex-col gap-4 max-w-6xl">
+        <header class="flex flex-wrap items-baseline gap-3">
+            <h1 class="h mono">@o.Command <span class="text-muted">@o.Ns</span></h1>
+            <StatusBadge Status="@o.Status" />
+            <span class="text-muted">@Fmt.Stamp(o.Ts)</span>
+            <span class="text-muted">@o.App</span>
+            <a href="shapes/@o.ShapeHash" class="mono text-ui-label-sm">shape @o.ShapeHash</a>
+        </header>
+
+        <section class="card p-container-padding" aria-label="Timing">
+            <h2 class="text-ui-label-sm uppercase text-muted mb-2">Timing</h2>
+            <div class="grid grid-cols-[12rem_1fr_6rem] gap-x-3 gap-y-1 items-center">
+                @if (o.Context is { PoolWaitUs: { } pw })
+                {
+                    <span>pool wait (driver)</span>
+                    <div class="relative h-3 bg-surface-3 rounded"><div class="absolute h-3 rounded bg-warn" style="left:0;width:@Width(0, pw)%"></div></div>
+                    <span class="num">@Fmt.Us(pw)</span>
+                }
+                @foreach (var (label, from, to, css) in Segments(o))
+                {
+                    <span>@label</span>
+                    <div class="relative h-3 bg-surface-3 rounded">
+                        <div class="absolute h-3 rounded @css" style="left:@Pct(from)%;width:@Width(from, to)%"></div>
+                    </div>
+                    <span class="num">@Fmt.Us(to - from)</span>
+                }
+            </div>
+            @if (o.Context is { ClientUs: { } cu } ctxT)
+            {
+                <div class="grid grid-cols-[12rem_1fr_6rem] gap-x-3 gap-y-1 items-center mt-1 pt-1 border-t border-line">
+                    <span>client total (driver)</span>
+                    <div class="relative h-3 bg-surface-3 rounded"><div class="absolute h-3 rounded bg-accent/40" style="left:0;width:@Width(0, cu)%"></div></div>
+                    <span class="num">@Fmt.Us(cu)</span>
+                    @if (ctxT.ClientOverheadUs is { } co)
+                    {
+                        <span class="text-muted">client overhead</span><span class="text-ui-label-sm text-muted">driver time outside the wire exchange (serialization, scheduling)</span><span class="num">@Fmt.Us(co)</span>
+                    }
+                </div>
+            }
+            <p class="text-ui-label-sm text-muted mt-2">Server latency = first reply byte − last request byte at the proxy: server time plus the proxy↔server network.
+                @(o.Context == null ? "Pool wait and client time need a driver exporter." : "")</p>
+        </section>
+
+        <div class="grid md:grid-cols-2 gap-4">
+            <section class="card p-container-padding" aria-label="Reply">
+                <h2 class="text-ui-label-sm uppercase text-muted mb-2">Reply</h2>
+                @if (o.Reply is { } r)
+                {
+                    <dl class="grid grid-cols-[10rem_1fr] gap-y-0.5">
+                        @foreach (var p in r.EnumerateObject())
+                        {
+                            <dt class="text-muted">@p.Name</dt><dd class="mono select-text">@p.Value.ToString()</dd>
+                        }
+                    </dl>
+                }
+                else { <p class="text-muted">No reply (@o.Status).</p> }
+            </section>
+            <section class="card p-container-padding" aria-label="Wire">
+                <h2 class="text-ui-label-sm uppercase text-muted mb-2">Wire</h2>
+                <dl class="grid grid-cols-[10rem_1fr] gap-y-0.5 mono">
+                    <dt class="text-muted">member</dt><dd>@o.Member</dd>
+                    <dt class="text-muted">server conn / request</dt><dd>@(o.ServerConnectionId?.ToString() ?? "–") / @o.RequestId</dd>
+                    <dt class="text-muted">opCode</dt><dd>@o.OpCode @o.Compressor</dd>
+                    <dt class="text-muted">bytes in / out</dt><dd>@Fmt.Bytes(o.ReqBytes) / @Fmt.Bytes(o.RespBytes)</dd>
+                    <dt class="text-muted">replies</dt><dd>@o.ReplyCount @(o.Stream ? "(moreToCome stream)" : "")</dd>
+                    <dt class="text-muted">session / txn</dt><dd>@(o.Lsid ?? "–") / @(o.TxnNumber?.ToString() ?? "–")</dd>
+                    @if (o.Comment != null) { <dt class="text-muted">comment</dt><dd>@o.Comment</dd> }
+                    @if (o.SeqDocs is { Count: > 0 }) { <dt class="text-muted">documents</dt><dd>@string.Join(", ", o.SeqDocs.Select(kv => $"{kv.Key}: {kv.Value}"))</dd> }
+                    <dt class="text-muted">driver</dt><dd>@o.Driver</dd>
+                </dl>
+            </section>
+        </div>
+
+        <section class="card p-container-padding" aria-label="Command">
+            <div class="flex items-center gap-2 mb-2">
+                <h2 class="text-ui-label-sm uppercase text-muted">Command (redacted by the proxy)</h2>
+                @if (o.CmdTruncated) { <span class="badge bg-warn/15 text-warn">truncated capture</span> }
+                <button class="btn ml-auto" @onclick="CopyMongosh">@(_copied ? "copied" : "copy as mongosh command")</button>
+            </div>
+            <pre class="mono whitespace-pre-wrap break-all select-text bg-surface p-2 rounded-lg max-h-96 overflow-auto">@(o.CommandEjson ?? "(not captured)")</pre>
+        </section>
+
+        @if (_alerts.Length > 0)
+        {
+            <section class="card p-container-padding" aria-label="Alerts">
+                <h2 class="text-ui-label-sm uppercase text-muted mb-2">Alerts</h2>
+                @foreach (var a in _alerts)
+                {
+                    <p><a href="alerts">@a.Rule</a> — @a.Summary</p>
+                }
+            </section>
+        }
+
+        @if (o.Cursor is { } c)
+        {
+            <section class="card p-container-padding" aria-label="Cursor">
+                <h2 class="text-ui-label-sm uppercase text-muted mb-2">Cursor @c.CursorId</h2>
+                <p>opened @Fmt.Stamp(c.OpenedTs) by <a href="ops/@c.OpenOpId">@c.OpenOpId</a>; @c.Documents documents over @c.GetMores getMores;
+                    @(c.ClosedReason != null ? $"closed ({c.ClosedReason}) {Fmt.Stamp(c.ClosedTs ?? 0)}" : $"open, last activity {Fmt.Stamp(c.LastActivityTs)}")</p>
+            </section>
+        }
+        @if (o.Context is { } x)
+        {
+            <section class="card p-container-padding" aria-label="Application context">
+                <h2 class="text-ui-label-sm uppercase text-muted mb-2">Application context (exporter)</h2>
+                <dl class="grid grid-cols-[10rem_1fr] gap-y-0.5">
+                    @if (x.Uow is { } u)
+                    {
+                        <dt class="text-muted">unit of work</dt>
+                        <dd><a href="@UowHref(u.Id)" class="badge bg-accent/15 text-accent" title="other operations of this unit of work">@(u.Name ?? u.Id)</a>
+                            <span class="text-muted text-ui-label-sm">@u.Kind · <span class="mono">@u.Id</span></span></dd>
+                    }
+                    <dt class="text-muted">driver operation</dt><dd class="mono">@(x.OperationId ?? "–") @(x.Attempt is > 1 ? $"(attempt {x.Attempt})" : "")</dd>
+                    <dt class="text-muted">driver status</dt><dd>@x.Status @(x.ErrorCode != null ? $"· {x.ErrorCode}" : "") @(x.ErrorLabels is { Length: > 0 } l ? string.Join(", ", l) : "")</dd>
+                    @if (x.Traceparent != null) { <dt class="text-muted">trace</dt><dd class="mono select-text">@x.Traceparent</dd> }
+                    <dt class="text-muted">exporter</dt><dd class="mono">@x.Src</dd>
+                </dl>
+                @if (x.Callsite != null)
+                {
+                    <h3 class="text-ui-label-sm uppercase text-muted mt-3 mb-1">Callsite <span class="mono normal-case">@x.Callsite</span></h3>
+                    @if (x.Frames is { Length: > 0 } frames)
+                    {
+                        <ol class="mono text-ui-label-sm">
+                            @foreach (var f in frames)
+                            {
+                                <li><span>@f.Fn</span> <span class="text-muted">@f.File@(f.Line is { } ln ? $":{ln}" : "")</span></li>
+                            }
+                        </ol>
+                    }
+                    else { <p class="text-muted text-ui-label-sm">frames not received yet</p> }
+                }
+            </section>
+        }
+        else
+        {
+            <p class="text-ui-label-sm text-muted">Wire-only: no exporter reported this command. Unit of work, callsite and client time come from a driver exporter.</p>
+        }
+    </div>
+}
+
+@code {
+    [Parameter] public string Id { get; set; } = "";
+    private OpDetailDto? _op;
+    private AlertDto[] _alerts = [];
+    private bool _missing, _copied;
+    private double _span = 1;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        var r = await Api.Op(Id);
+        _missing = r == null;
+        _op = r?.Op;
+        _alerts = r?.Alerts ?? [];
+        if (_op != null) _span = Math.Max(1, Math.Max(_op.Timings.RespLast ?? _op.Timings.ReqLast, Math.Max(_op.Context?.ClientUs ?? 0, _op.Context?.PoolWaitUs ?? 0)));
+    }
+
+    private static IEnumerable<(string, long, long, string)> Segments(OpDetailDto o)
+    {
+        var t = o.Timings;
+        yield return ("client → proxy (request)", t.ReqFirst, t.ReqLast, "bg-muted");
+        if (t.RespFirst is { } rf)
+        {
+            yield return ("proxy → server + server", t.ReqLast, rf, "bg-accent");
+            yield return ("server → client (reply)", rf, t.RespLast ?? rf, "bg-ok");
+        }
+    }
+
+    private string UowHref(string? id) => Nav.BaseUri + "?uow=" + Uri.EscapeDataString(id ?? "");
+
+    private string Pct(long us) => (100.0 * us / _span).ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
+    private string Width(long from, long to) => Math.Max(0.4, 100.0 * (to - from) / _span).ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
+
+    private async Task CopyMongosh()
+    {
+        if (_op?.CommandEjson is not { } cmd) return;
+        // the shell adds $db, the session and $clusterTime itself, and rejects a command that carries them
+        if (System.Text.Json.Nodes.JsonNode.Parse(cmd) is System.Text.Json.Nodes.JsonObject obj)
+        {
+            foreach (var k in (string[])["$db", "lsid", "$clusterTime", "txnNumber", "autocommit", "startTransaction"]) obj.Remove(k);
+            cmd = obj.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+        }
+        await JS.InvokeVoidAsync("spyglass.copy", $"db.getSiblingDB({JsonSerializer.Serialize(_op.Db ?? "admin")}).runCommand({cmd})");
+        _copied = true;
+    }
+}

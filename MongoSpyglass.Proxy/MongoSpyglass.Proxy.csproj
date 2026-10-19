@@ -13,7 +13,7 @@
     <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="*" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="*" />
     <PackageReference Include="Microsoft.IO.RecyclableMemoryStream" Version="2.3.2" />
-    <PackageReference Include="MongoDB.Bson" Version="2.19.1" />
+    <PackageReference Include="MongoDB.Bson" Version="3.12.0" />
     <PackageReference Include="Polly" Version="*" />
     <PackageReference Include="SharpArena" Version="0.10.3" />
     <PackageReference Include="Stateless" Version="5.14.0" />

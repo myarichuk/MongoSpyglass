@@ -1,0 +1,434 @@
+{
+  "description": "Pairs that must group together (same shapeHash) or apart.",
+  "cases": [
+    {
+      "name": "values-differ",
+      "same": true,
+      "a": {
+        "find": "orders",
+        "filter": {
+          "a": 1
+        },
+        "$db": "shop"
+      },
+      "b": {
+        "find": "orders",
+        "filter": {
+          "a": 2
+        },
+        "$db": "shop"
+      }
+    },
+    {
+      "name": "int-vs-double",
+      "same": true,
+      "a": {
+        "find": "orders",
+        "filter": {
+          "a": 1
+        },
+        "$db": "shop"
+      },
+      "b": {
+        "find": "orders",
+        "filter": {
+          "a": 1.5
+        },
+        "$db": "shop"
+      }
+    },
+    {
+      "name": "key-order",
+      "same": true,
+      "a": {
+        "find": "orders",
+        "filter": {
+          "a": 1,
+          "b": "x"
+        },
+        "$db": "shop"
+      },
+      "b": {
+        "find": "orders",
+        "filter": {
+          "b": "y",
+          "a": 2
+        },
+        "$db": "shop"
+      }
+    },
+    {
+      "name": "or-order",
+      "same": true,
+      "a": {
+        "find": "orders",
+        "filter": {
+          "$or": [
+            {
+              "a": 1
+            },
+            {
+              "b": 1
+            }
+          ]
+        },
+        "$db": "shop"
+      },
+      "b": {
+        "find": "orders",
+        "filter": {
+          "$or": [
+            {
+              "b": 2
+            },
+            {
+              "a": 2
+            }
+          ]
+        },
+        "$db": "shop"
+      }
+    },
+    {
+      "name": "in-length",
+      "same": true,
+      "a": {
+        "find": "orders",
+        "filter": {
+          "a": {
+            "$in": [
+              1
+            ]
+          }
+        },
+        "$db": "shop"
+      },
+      "b": {
+        "find": "orders",
+        "filter": {
+          "a": {
+            "$in": [
+              1,
+              2,
+              3,
+              4
+            ]
+          }
+        },
+        "$db": "shop"
+      }
+    },
+    {
+      "name": "limit-value",
+      "same": true,
+      "a": {
+        "find": "orders",
+        "filter": {
+          "a": 1
+        },
+        "limit": 1,
+        "$db": "shop"
+      },
+      "b": {
+        "find": "orders",
+        "filter": {
+          "a": 1
+        },
+        "limit": 50,
+        "$db": "shop"
+      }
+    },
+    {
+      "name": "limit-presence",
+      "same": false,
+      "a": {
+        "find": "orders",
+        "filter": {
+          "a": 1
+        },
+        "limit": 1,
+        "$db": "shop"
+      },
+      "b": {
+        "find": "orders",
+        "filter": {
+          "a": 1
+        },
+        "$db": "shop"
+      }
+    },
+    {
+      "name": "number-vs-string",
+      "same": false,
+      "a": {
+        "find": "orders",
+        "filter": {
+          "a": 1
+        },
+        "$db": "shop"
+      },
+      "b": {
+        "find": "orders",
+        "filter": {
+          "a": "1"
+        },
+        "$db": "shop"
+      }
+    },
+    {
+      "name": "sort-key-order",
+      "same": false,
+      "a": {
+        "find": "orders",
+        "filter": {
+          "a": 1
+        },
+        "sort": {
+          "ts": -1,
+          "_id": 1
+        },
+        "$db": "shop"
+      },
+      "b": {
+        "find": "orders",
+        "filter": {
+          "a": 1
+        },
+        "sort": {
+          "_id": 1,
+          "ts": -1
+        },
+        "$db": "shop"
+      }
+    },
+    {
+      "name": "hint-key-order",
+      "same": false,
+      "a": {
+        "find": "orders",
+        "filter": {
+          "a": 1
+        },
+        "hint": {
+          "a": 1,
+          "b": 1
+        },
+        "$db": "shop"
+      },
+      "b": {
+        "find": "orders",
+        "filter": {
+          "a": 1
+        },
+        "hint": {
+          "b": 1,
+          "a": 1
+        },
+        "$db": "shop"
+      }
+    },
+    {
+      "name": "project-inclusion",
+      "same": false,
+      "command": "aggregate",
+      "a": {
+        "aggregate": "orders",
+        "pipeline": [
+          {
+            "$project": {
+              "total": 1
+            }
+          }
+        ],
+        "cursor": {},
+        "$db": "shop"
+      },
+      "b": {
+        "aggregate": "orders",
+        "pipeline": [
+          {
+            "$project": {
+              "total": 0
+            }
+          }
+        ],
+        "cursor": {},
+        "$db": "shop"
+      }
+    },
+    {
+      "name": "project-expression-values",
+      "same": true,
+      "command": "aggregate",
+      "a": {
+        "aggregate": "orders",
+        "pipeline": [
+          {
+            "$project": {
+              "big": {
+                "$gt": [
+                  "$total",
+                  100
+                ]
+              }
+            }
+          }
+        ],
+        "cursor": {},
+        "$db": "shop"
+      },
+      "b": {
+        "aggregate": "orders",
+        "pipeline": [
+          {
+            "$project": {
+              "big": {
+                "$gt": [
+                  "$total",
+                  5
+                ]
+              }
+            }
+          }
+        ],
+        "cursor": {},
+        "$db": "shop"
+      }
+    },
+    {
+      "name": "sort-direction",
+      "same": false,
+      "a": {
+        "find": "orders",
+        "filter": {
+          "a": 1
+        },
+        "sort": {
+          "ts": 1
+        },
+        "$db": "shop"
+      },
+      "b": {
+        "find": "orders",
+        "filter": {
+          "a": 1
+        },
+        "sort": {
+          "ts": -1
+        },
+        "$db": "shop"
+      }
+    },
+    {
+      "name": "projection",
+      "same": false,
+      "a": {
+        "find": "orders",
+        "filter": {
+          "a": 1
+        },
+        "projection": {
+          "x": 1
+        },
+        "$db": "shop"
+      },
+      "b": {
+        "find": "orders",
+        "filter": {
+          "a": 1
+        },
+        "projection": {
+          "y": 1
+        },
+        "$db": "shop"
+      }
+    },
+    {
+      "name": "exists-literal",
+      "same": false,
+      "a": {
+        "find": "orders",
+        "filter": {
+          "a": {
+            "$exists": true
+          }
+        },
+        "$db": "shop"
+      },
+      "b": {
+        "find": "orders",
+        "filter": {
+          "a": {
+            "$exists": false
+          }
+        },
+        "$db": "shop"
+      }
+    },
+    {
+      "name": "field-path",
+      "same": false,
+      "a": {
+        "find": "orders",
+        "filter": {
+          "a": 1
+        },
+        "$db": "shop"
+      },
+      "b": {
+        "find": "orders",
+        "filter": {
+          "b": 1
+        },
+        "$db": "shop"
+      }
+    },
+    {
+      "name": "update-statement-count",
+      "same": true,
+      "a": {
+        "update": "orders",
+        "updates": [
+          {
+            "q": {
+              "_id": 1
+            },
+            "u": {
+              "$set": {
+                "s": "A"
+              }
+            }
+          }
+        ],
+        "$db": "shop"
+      },
+      "b": {
+        "update": "orders",
+        "updates": [
+          {
+            "q": {
+              "_id": 2
+            },
+            "u": {
+              "$set": {
+                "s": "B"
+              }
+            }
+          },
+          {
+            "q": {
+              "_id": 3
+            },
+            "u": {
+              "$set": {
+                "s": "C"
+              }
+            }
+          }
+        ],
+        "$db": "shop"
+      },
+      "command": "update"
+    }
+  ]
+}

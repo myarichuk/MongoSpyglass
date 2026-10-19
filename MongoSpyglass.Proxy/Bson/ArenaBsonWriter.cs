@@ -341,9 +341,10 @@ public unsafe struct ArenaBsonWriter(ArenaAllocator arena, int initialCapacity =
         {
             WriteDateTime(name, value.ToUniversalTime());
         }
-        else if (value.IsGuid)
+        else if (value is BsonBinaryData binary)
         {
-            WriteGuid(name, value.AsGuid);
+            // Preserve the original bytes and subtype; v3 GUID semantics would throw for legacy subtype 3
+            WriteBinary(name, binary.Bytes, (byte)binary.SubType);
         }
         else if (value.IsBsonNull)
         {

@@ -1,0 +1,2 @@
+{"type":"hello","ts":1700000000000000,"src":"3b6a9d20-0000-4000-8000-0000000000e1","exporter":"spyglass-dotnet","version":"0.1.0","schema":1,"runtime":"dotnet 10.0.1","driver":"mongo-csharp-driver 3.12.0","host":"orders-api-7d9f-x2","pid":4121,"app":"orders-api","appVersion":"2.14.0","sampling":{"callsites":"first+1/100"}}
+{"type":"hello","ts":1700000000000000,"src":"3b6a9d20-0000-4000-8000-0000000000e1","exporter":"spyglass-node"}

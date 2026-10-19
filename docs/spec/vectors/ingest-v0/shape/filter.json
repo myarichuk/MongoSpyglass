@@ -1,0 +1,652 @@
+{
+  "description": "03 §4.2: every operator rule of normFilter.",
+  "cases": [
+    {
+      "name": "or-sorted-deduplicated",
+      "rule": "§4.2 $or: clauses normalized, sorted by canonical form, deduplicated",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "$or": [
+            {
+              "b": 1
+            },
+            {
+              "a": "x"
+            },
+            {
+              "b": 2
+            }
+          ]
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "$or": [
+              {
+                "a": "?string"
+              },
+              {
+                "b": "?number"
+              }
+            ]
+          }
+        },
+        "shapeHash": "e3e3d95f51614cdf",
+        "valueHash": "33434d93148a242a",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "and-nested",
+      "rule": "§4.2 $and with a nested $or",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "$and": [
+            {
+              "x": {
+                "$gt": 1
+              }
+            },
+            {
+              "$or": [
+                {
+                  "z": 1
+                },
+                {
+                  "y": 1
+                }
+              ]
+            }
+          ]
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "$and": [
+              {
+                "$or": [
+                  {
+                    "y": "?number"
+                  },
+                  {
+                    "z": "?number"
+                  }
+                ]
+              },
+              {
+                "x": {
+                  "$gt": "?number"
+                }
+              }
+            ]
+          }
+        },
+        "shapeHash": "b5d1c988f9ed4d4b",
+        "valueHash": "49d6db699ad4089b",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "nor",
+      "rule": "§4.2 $nor",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "$nor": [
+            {
+              "a": 1
+            },
+            {
+              "a": 2
+            }
+          ]
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "$nor": [
+              {
+                "a": "?number"
+              }
+            ]
+          }
+        },
+        "shapeHash": "cbeccfd77b45fb70",
+        "valueHash": "b844a958ab3ebca6",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "in",
+      "rule": "§4.2 $in → [\"?\"], inCardinality = length",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "a": {
+            "$in": [
+              1,
+              2,
+              3
+            ]
+          }
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "a": {
+              "$in": [
+                "?"
+              ]
+            }
+          }
+        },
+        "shapeHash": "2c566f0cb7cf9383",
+        "valueHash": "fb8c90f868650b95",
+        "inCardinality": 3
+      }
+    },
+    {
+      "name": "nin",
+      "rule": "§4.2 $nin",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "a": {
+            "$nin": [
+              "x",
+              "y"
+            ]
+          }
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "a": {
+              "$nin": [
+                "?"
+              ]
+            }
+          }
+        },
+        "shapeHash": "fc8207f04fccec8f",
+        "valueHash": "b3d7430301913e84",
+        "inCardinality": 2
+      }
+    },
+    {
+      "name": "all",
+      "rule": "§4.2 $all",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "tags": {
+            "$all": [
+              "a",
+              "b",
+              "c",
+              "d"
+            ]
+          }
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "tags": {
+              "$all": [
+                "?"
+              ]
+            }
+          }
+        },
+        "shapeHash": "e75701d81b913976",
+        "valueHash": "139a9bf9c059d608",
+        "inCardinality": 4
+      }
+    },
+    {
+      "name": "in-max-cardinality",
+      "rule": "§4.2 inCardinality is the max over the command",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "a": {
+            "$in": [
+              1,
+              2
+            ]
+          },
+          "b": {
+            "$in": [
+              1,
+              2,
+              3,
+              4,
+              5
+            ]
+          }
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "a": {
+              "$in": [
+                "?"
+              ]
+            },
+            "b": {
+              "$in": [
+                "?"
+              ]
+            }
+          }
+        },
+        "shapeHash": "77aa102d3db8bb1b",
+        "valueHash": "144c843f973e8974",
+        "inCardinality": 5
+      }
+    },
+    {
+      "name": "exists",
+      "rule": "§4.2 $exists keeps its literal",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "a": {
+            "$exists": true
+          },
+          "b": {
+            "$exists": false
+          }
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "a": {
+              "$exists": true
+            },
+            "b": {
+              "$exists": false
+            }
+          }
+        },
+        "shapeHash": "fa6e5c9677e3a508",
+        "valueHash": "fa6e5c9677e3a508",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "type",
+      "rule": "§4.2 $type keeps its literal",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "a": {
+            "$type": "string"
+          }
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "a": {
+              "$type": "string"
+            }
+          }
+        },
+        "shapeHash": "162bab5e39861fc9",
+        "valueHash": "162bab5e39861fc9",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "regex-operator",
+      "rule": "§4.2 $regex and $options → ?regex (the Node driver's form; given as BSON hex, since Extended JSON reads it as a regex literal)",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": null,
+      "cmdHex": "590000000266696e6400070000006f7264657273000366696c746572002d000000036100250000000224726567657800040000005e61620002246f7074696f6e7300020000006900000002246462000500000073686f700000",
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "a": {
+              "$options": "?regex",
+              "$regex": "?regex"
+            }
+          }
+        },
+        "shapeHash": "c90d9ab4545ef5ba",
+        "valueHash": "55714b747576603f",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "elemMatch-operators",
+      "rule": "§4.2 $elemMatch over values",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "scores": {
+            "$elemMatch": {
+              "$gte": 80,
+              "$lt": 90
+            }
+          }
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "scores": {
+              "$elemMatch": {
+                "$gte": "?number",
+                "$lt": "?number"
+              }
+            }
+          }
+        },
+        "shapeHash": "7ffb1d2c064eea5d",
+        "valueHash": "c0ce862a69e26782",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "elemMatch-fields",
+      "rule": "§4.2 $elemMatch over documents: normFilter",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "items": {
+            "$elemMatch": {
+              "sku": "x",
+              "qty": {
+                "$gt": 1
+              }
+            }
+          }
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "items": {
+              "$elemMatch": {
+                "qty": {
+                  "$gt": "?number"
+                },
+                "sku": "?string"
+              }
+            }
+          }
+        },
+        "shapeHash": "f6374f248b740eeb",
+        "valueHash": "79bec621b54ee43f",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "not",
+      "rule": "§4.2 $not: its operand normalized",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "a": {
+            "$not": {
+              "$gt": 5
+            }
+          }
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "a": {
+              "$not": {
+                "$gt": "?number"
+              }
+            }
+          }
+        },
+        "shapeHash": "01eac8fea020d1f3",
+        "valueHash": "960085a9315eeac7",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "not-regex",
+      "rule": "§4.2 $not over a regex",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "a": {
+            "$not": {
+              "$regularExpression": {
+                "pattern": "^x",
+                "options": ""
+              }
+            }
+          }
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "a": {
+              "$not": "?regex"
+            }
+          }
+        },
+        "shapeHash": "b4996e81b98b42fb",
+        "valueHash": "753f71dd9894a519",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "size",
+      "rule": "§4.2 $size → ?number",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "a": {
+            "$size": 3
+          }
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "a": {
+              "$size": "?number"
+            }
+          }
+        },
+        "shapeHash": "9c2d6ed6a4fb7a5e",
+        "valueHash": "2b18c1ba916d0312",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "range",
+      "rule": "§4.2 other operators: the leaf tag of the operand",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "a": {
+            "$gte": 1,
+            "$lt": {
+              "$date": {
+                "$numberLong": "1700000000000"
+              }
+            }
+          },
+          "b": {
+            "$ne": null
+          }
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "a": {
+              "$gte": "?number",
+              "$lt": "?date"
+            },
+            "b": {
+              "$ne": "?null"
+            }
+          }
+        },
+        "shapeHash": "318681c1ea68b54c",
+        "valueHash": "49b68cf9b571175a",
+        "inCardinality": 0
+      }
+    },
+    {
+      "name": "keys-sorted",
+      "rule": "§4.2 keys sorted: order-insensitive grouping",
+      "command": "find",
+      "db": "shop",
+      "coll": "orders",
+      "cmd": {
+        "find": "orders",
+        "filter": {
+          "b": 1,
+          "a": "x"
+        },
+        "$db": "shop"
+      },
+      "expected": {
+        "shape": {
+          "cmd": "find",
+          "coll": "orders",
+          "db": "shop",
+          "filter": {
+            "a": "?string",
+            "b": "?number"
+          }
+        },
+        "shapeHash": "674b0986faa6796f",
+        "valueHash": "01adf60a7012fcf6",
+        "inCardinality": 0
+      }
+    }
+  ]
+}

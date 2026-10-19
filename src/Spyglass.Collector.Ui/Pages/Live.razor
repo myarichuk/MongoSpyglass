@@ -1,0 +1,172 @@
+@page "/"
+@implements IAsyncDisposable
+@inject Api Api
+@inject NavigationManager Nav
+@inject IJSRuntime JS
+
+<PageTitle>Live · Spyglass</PageTitle>
+<div class="flex flex-col h-full">
+    <header class="flex flex-wrap items-end gap-2 p-container-padding border-b border-line">
+        <h1 class="h mr-4">Live</h1>
+        <form class="flex flex-wrap items-end gap-2" @onsubmit="Apply" @onsubmit:preventDefault>
+            <Field Label="app"><input class="input w-36" @bind="_app" /></Field>
+            <Field Label="collection"><input class="input w-36" @bind="_coll" /></Field>
+            <Field Label="command"><input class="input w-28" @bind="_command" /></Field>
+            <Field Label="status">
+                <select class="input" @bind="_status">
+                    <option value="">any</option><option>ok</option><option>error</option><option>unacknowledged</option><option>connection_closed</option>
+                </select>
+            </Field>
+            <Field Label="min latency (ms)"><input class="input w-24" type="number" min="0" step="any" @bind="_minMs" /></Field>
+            @if (Uow != null) { <Field Label="unit of work"><span class="badge bg-accent/15 text-accent mono">@Uow <a href="@Nav.GetUriWithQueryParameter("uow", (string?)null)" title="clear">✕</a></span></Field> }
+            <button class="btn" type="submit">Apply</button>
+        </form>
+        <div class="ml-auto flex items-center gap-2 text-ui-label-sm text-muted">
+            <span class="@(_connected ? "text-ok" : "text-warn")">● @(_connected ? "streaming" : "connecting")</span>
+            @if (_paused)
+            {
+                <button class="btn text-warn" @onclick="Resume">Paused · @_pending new · resume</button>
+            }
+        </div>
+    </header>
+    <div class="flex-1 overflow-auto" @ref="_scroller" @onscroll="OnScroll">
+        <table class="tbl" aria-label="Live operations">
+            <thead><tr>
+                <th>time</th><th>app</th><th>command</th><th>namespace</th><th class="num">server latency</th><th class="num">client latency</th>
+                <th class="num">docs</th><th class="num">bytes</th><th>status</th><th>UoW</th><th></th>
+            </tr></thead>
+            <tbody>
+                @foreach (var o in _rows)
+                {
+                    <tr data-href="ops/@o.Id" tabindex="0" @key="o.Id" @onclick="() => Open(o.Id)">
+                        <td class="mono text-muted">@Fmt.Clock(o.Ts)</td>
+                        <td>@o.App</td>
+                        <td class="mono"><a href="ops/@o.Id" @onclick:stopPropagation>@o.Command</a></td>
+                        <td class="mono">@o.Ns</td>
+                        <td class="num">@Fmt.Us(o.ServerLatencyUs)</td>
+                        <td class="num" title="@(o.PoolWaitUs is { } pw ? $"incl. {Fmt.Us(pw)} pool wait" : null)">@(o.Joined ? Fmt.Us(o.ClientUs) : "")</td>
+                        <td class="num">@(o.NReturned?.ToString() ?? "")</td>
+                        <td class="num">@Fmt.Bytes(o.RespBytes)</td>
+                        <td><StatusBadge Status="@o.Status" /> @if (o.CodeName != null) { <span class="text-bad text-ui-label-sm">@o.CodeName</span> }</td>
+                        <td>@if (o.UowName != null || o.UowId != null) { <a class="badge bg-accent/15 text-accent" href="?uow=@Uri.EscapeDataString(o.UowId ?? "")" title="@o.UowId" @onclick:stopPropagation>@(o.UowName ?? "uow")</a> }</td>
+                        <td>@if (o.Alerts is { Length: > 0 } a) { <span class="badge bg-warn/15 text-warn" title="@string.Join(", ", a)">⚠ @a.Length</span> }</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+        @if (_rows.Count == 0 && _loaded)
+        {
+            <p class="p-container-padding text-muted">No operations yet. Point a driver at the proxy; operations show up here as they happen.</p>
+        }
+    </div>
+</div>
+
+@code {
+    private const int MaxRows = 500;
+    [SupplyParameterFromQuery] public string? App { get; set; }
+    [SupplyParameterFromQuery] public string? Coll { get; set; }
+    [SupplyParameterFromQuery] public string? Command { get; set; }
+    [SupplyParameterFromQuery] public string? Status { get; set; }
+    [SupplyParameterFromQuery] public double? MinMs { get; set; }
+    [SupplyParameterFromQuery] public string? Uow { get; set; }
+
+    private string? _app, _coll, _command, _status;
+    private double? _minMs;
+    private readonly List<OpSummary> _rows = [];
+    private readonly List<OpSummary> _buffer = [];
+    private ElementReference _scroller;
+    private CancellationTokenSource? _cts;
+    private bool _connected, _paused, _loaded;
+    private int _pending;
+    private string _query = "";
+
+    protected override async Task OnParametersSetAsync()
+    {
+        (_app, _coll, _command, _status, _minMs) = (App, Coll, Command, Status, MinMs);
+        var q = new List<string>();
+        void Add(string k, string? v) { if (!string.IsNullOrWhiteSpace(v)) q.Add($"{k}={Uri.EscapeDataString(v)}"); }
+        Add("app", App); Add("coll", Coll); Add("command", Command); Add("status", Status); Add("uow", Uow);
+        if (MinMs is > 0) q.Add($"minLatencyUs={(long)(MinMs * 1000)}");
+        var query = string.Join('&', q);
+        if (query == _query && _cts != null) return;
+        _query = query;
+
+        if (_cts != null) await _cts.CancelAsync();
+        _cts = new CancellationTokenSource();
+        _rows.Clear();
+        _buffer.Clear();
+        _pending = 0;
+        _paused = false;
+        var page = await Api.Ops(query + (query.Length > 0 ? "&" : "") + "limit=100");
+        if (page != null) _rows.AddRange(page.Items);
+        _loaded = true;
+        _ = Stream(_cts.Token);
+    }
+
+    private async Task Stream(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                _connected = true;
+                StateHasChanged();
+                await foreach (var (ev, data) in Api.Live(_query, ct))
+                {
+                    if (!ev.StartsWith("op.", StringComparison.Ordinal)) continue;
+                    var op = JsonSerializer.Deserialize<OpSummary>(data, Api.Json)!;
+                    if (ev == "op.updated")
+                    {
+                        var i = _rows.FindIndex(r => r.Id == op.Id);
+                        if (i >= 0) _rows[i] = op;
+                    }
+                    else if (_paused) { _buffer.Insert(0, op); _pending++; }
+                    else Prepend(op);
+                    StateHasChanged();
+                }
+            }
+            catch (OperationCanceledException) { return; }
+            catch (Exception) { }
+            _connected = false;
+            StateHasChanged();
+            try { await Task.Delay(2000, ct); } catch (OperationCanceledException) { return; }
+        }
+    }
+
+    private void Prepend(OpSummary op)
+    {
+        _rows.Insert(0, op);
+        if (_rows.Count > MaxRows) _rows.RemoveRange(MaxRows, _rows.Count - MaxRows);
+    }
+
+    private async Task OnScroll()
+    {
+        var top = await JS.InvokeAsync<double>("spyglass.scrollTop", _scroller);
+        if (top > 4 && !_paused) _paused = true;
+        else if (top <= 4 && _paused) Resume();
+    }
+
+    private void Resume()
+    {
+        _paused = false;
+        _rows.InsertRange(0, _buffer.Take(MaxRows));
+        if (_rows.Count > MaxRows) _rows.RemoveRange(MaxRows, _rows.Count - MaxRows);
+        _buffer.Clear();
+        _pending = 0;
+    }
+
+    private void Apply() => Nav.NavigateTo(Nav.GetUriWithQueryParameters(new Dictionary<string, object?>
+    {
+        ["app"] = Nullify(_app), ["coll"] = Nullify(_coll), ["command"] = Nullify(_command), ["status"] = Nullify(_status), ["minMs"] = _minMs is > 0 ? _minMs : null,
+        ["uow"] = Uow,
+    }));
+
+    private static string? Nullify(string? s) => string.IsNullOrWhiteSpace(s) ? null : s.Trim();
+
+    private void Open(string id) => Nav.NavigateTo($"ops/{id}");
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_cts != null) await _cts.CancelAsync();
+    }
+}

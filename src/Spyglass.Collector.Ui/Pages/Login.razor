@@ -1,0 +1,27 @@
+@page "/login"
+@layout BareLayout
+@inject Api Api
+@inject NavigationManager Nav
+
+<PageTitle>Sign in · Spyglass</PageTitle>
+<form class="card p-6 w-80 flex flex-col gap-3" @onsubmit="Submit" @onsubmit:preventDefault>
+    <h1 class="font-display-mono text-display-mono text-accent">spyglass</h1>
+    <label class="text-ui-label-sm text-muted" for="pw">Admin password</label>
+    <input id="pw" class="input" type="password" autocomplete="current-password" @bind="_password" autofocus />
+    @if (_error) { <p class="text-bad text-ui-label-sm" role="alert">Wrong password.</p> }
+    <button class="btn justify-center" type="submit" disabled="@_busy">Sign in</button>
+</form>
+
+@code {
+    [SupplyParameterFromQuery(Name = "return")] public string? Return { get; set; }
+    private string _password = "";
+    private bool _error, _busy;
+
+    private async Task Submit()
+    {
+        _busy = true;
+        _error = !await Api.Login(_password);
+        _busy = false;
+        if (!_error) Nav.NavigateTo(string.IsNullOrEmpty(Return) || Return.StartsWith("login") ? "" : Return);
+    }
+}

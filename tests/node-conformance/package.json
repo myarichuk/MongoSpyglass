@@ -1,0 +1,11 @@
+{
+  "name": "spyglass-node-conformance",
+  "private": true,
+  "description": "Drives the Node.js driver through spyglass-proxy for the 06 §2 conformance suite (invoked by tests/Spyglass.Proxy.Tests/NodeDriverTests.cs).",
+  "type": "module",
+  "dependencies": {
+    "mongodb-floor": "npm:mongodb@6.4.0",
+    "mongodb-6": "npm:mongodb@6.21.0",
+    "mongodb-7": "npm:mongodb@7.7.0"
+  }
+}

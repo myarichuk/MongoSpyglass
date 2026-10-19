@@ -1,0 +1,91 @@
+@page "/shapes"
+@inject Api Api
+@inject NavigationManager Nav
+
+<PageTitle>Shapes · Spyglass</PageTitle>
+<div class="flex flex-col h-full">
+    <header class="flex flex-wrap items-end gap-2 p-container-padding border-b border-line">
+        <h1 class="h mr-4">Shapes</h1>
+        <Field Label="range">
+            <select class="input" value="@(Range ?? "1h")" @onchange="e => Go(range: e.Value?.ToString())">
+                @foreach (var o in TimeRange.Options) { <option value="@o.Key">@o.Label</option> }
+            </select>
+        </Field>
+        <Field Label="sort by">
+            <select class="input" value="@(Sort ?? "totalTime")" @onchange="e => Go(sort: e.Value?.ToString())">
+                <option value="totalTime">total time</option><option value="p95">p95</option><option value="count">count</option><option value="errors">errors</option>
+            </select>
+        </Field>
+        <form class="flex items-end gap-2" @onsubmit="() => Go()" @onsubmit:preventDefault>
+            <Field Label="app"><input class="input w-36" @bind="_app" /></Field>
+            <Field Label="collection"><input class="input w-36" @bind="_coll" /></Field>
+            <button class="btn" type="submit">Apply</button>
+        </form>
+    </header>
+    <div class="flex-1 overflow-auto">
+        <table class="tbl" aria-label="Shapes">
+            <thead><tr>
+                <th>shape</th><th class="num">count</th><th class="num">errors</th><th class="num">total time</th><th class="num">p50</th>
+                <th class="num">p95</th><th class="num">p99</th><th class="num">max</th><th class="num">docs</th><th>p95 trend</th>
+            </tr></thead>
+            <tbody>
+                @foreach (var s in _rows)
+                {
+                    <tr data-href="shapes/@s.ShapeHash" tabindex="0" @key="s.ShapeHash" @onclick="() => Open(s.ShapeHash)">
+                        <td class="max-w-[38rem] truncate">
+                            <a class="mono" href="shapes/@s.ShapeHash?range=@(Range ?? "1h")" @onclick:stopPropagation>@s.Command @s.Ns</a>
+                            <span class="mono text-muted ml-2">@Preview(s.Shape)</span>
+                        </td>
+                        <td class="num">@s.Count</td>
+                        <td class="num @(s.Errors > 0 ? "text-bad" : "")">@s.Errors</td>
+                        <td class="num">@Fmt.Us(s.TotalTimeUs)</td>
+                        <td class="num">@Fmt.Us(s.P50Us)</td>
+                        <td class="num">@Fmt.Us(s.P95Us)</td>
+                        <td class="num">@Fmt.Us(s.P99Us)</td>
+                        <td class="num">@Fmt.Us(s.MaxUs)</td>
+                        <td class="num">@s.Returned</td>
+                        <td><Sparkline Values="@(s.Series?.Select(p => p[2]).ToList())" /></td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+        @if (_loaded && _rows.Length == 0) { <p class="p-container-padding text-muted">No operations in this range.</p> }
+    </div>
+</div>
+
+@code {
+    [SupplyParameterFromQuery] public string? Range { get; set; }
+    [SupplyParameterFromQuery] public string? Sort { get; set; }
+    [SupplyParameterFromQuery] public string? App { get; set; }
+    [SupplyParameterFromQuery] public string? Coll { get; set; }
+    private string? _app, _coll;
+    private ShapeRow[] _rows = [];
+    private bool _loaded;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        (_app, _coll) = (App, Coll);
+        var q = $"{TimeRange.Query(Range)}&sort={Sort ?? "totalTime"}";
+        if (!string.IsNullOrWhiteSpace(App)) q += "&app=" + Uri.EscapeDataString(App);
+        if (!string.IsNullOrWhiteSpace(Coll)) q += "&coll=" + Uri.EscapeDataString(Coll);
+        _rows = (await Api.Shapes(q))?.Items ?? [];
+        _loaded = true;
+    }
+
+    /// <summary>The shape minus cmd/db/coll, compact: what makes this shape this shape.</summary>
+    public static string Preview(JsonElement shape)
+    {
+        if (shape.ValueKind != JsonValueKind.Object) return "";
+        var parts = shape.EnumerateObject().Where(p => p.Name is not ("cmd" or "db" or "coll")).Select(p => $"{p.Name}: {p.Value.GetRawText()}");
+        var s = string.Join(", ", parts);
+        return s.Length > 160 ? s[..160] + "…" : s;
+    }
+
+    private void Go(string? range = null, string? sort = null) => Nav.NavigateTo(Nav.GetUriWithQueryParameters(new Dictionary<string, object?>
+    {
+        ["range"] = range ?? Range, ["sort"] = sort ?? Sort,
+        ["app"] = string.IsNullOrWhiteSpace(_app) ? null : _app, ["coll"] = string.IsNullOrWhiteSpace(_coll) ? null : _coll,
+    }));
+
+    private void Open(string hash) => Nav.NavigateTo($"shapes/{hash}?range={Range ?? "1h"}");
+}

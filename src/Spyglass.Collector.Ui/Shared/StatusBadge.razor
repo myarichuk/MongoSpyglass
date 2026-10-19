@@ -1,0 +1,11 @@
+<span class="badge @Css">@Status</span>
+@code {
+    [Parameter] public string Status { get; set; } = "";
+    private string Css => Status switch
+    {
+        "ok" => "bg-ok/15 text-ok",
+        "error" => "bg-bad/15 text-bad",
+        "unacknowledged" => "bg-warn/15 text-warn",
+        _ => "bg-surface-3 text-muted",
+    };
+}

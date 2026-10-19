@@ -1,0 +1,54 @@
+@page "/cursors"
+@inject Api Api
+@inject NavigationManager Nav
+
+<PageTitle>Cursors · Spyglass</PageTitle>
+<div class="flex flex-col h-full">
+    <header class="flex items-end gap-3 p-container-padding border-b border-line">
+        <h1 class="h mr-4">Cursors</h1>
+        <div class="flex gap-1" role="tablist">
+            <button role="tab" aria-selected="@(_state == "open")" class="btn @(_state == "open" ? "bg-surface-3" : "")" @onclick="@(() => Nav.NavigateTo("cursors?state=open"))">open</button>
+            <button role="tab" aria-selected="@(_state == "closed")" class="btn @(_state == "closed" ? "bg-surface-3" : "")" @onclick="@(() => Nav.NavigateTo("cursors?state=closed"))">closed</button>
+        </div>
+        @if (_state == "closed")
+        {
+            <span class="text-ui-label-sm text-muted ml-4">@string.Join(" · ", _rows.GroupBy(c => c.ClosedReason).Select(g => $"{g.Key}: {g.Count()}"))</span>
+        }
+    </header>
+    <div class="flex-1 overflow-auto">
+        <table class="tbl" aria-label="Cursors">
+            <thead><tr><th>cursor</th><th>app</th><th>namespace</th><th>opened</th><th class="num">age</th><th class="num">docs</th><th class="num">getMores</th><th>@(_state == "open" ? "last activity" : "closed")</th><th>shape</th></tr></thead>
+            <tbody>
+                @foreach (var c in _rows)
+                {
+                    <tr data-href="ops/@c.OpenOpId" tabindex="0" @key="(c.ProxyId, c.CursorId)">
+                        <td class="mono"><a href="ops/@c.OpenOpId">@c.CursorId</a></td>
+                        <td>@c.App</td>
+                        <td class="mono">@c.Db.@c.Coll</td>
+                        <td class="mono text-muted">@Fmt.Stamp(c.OpenedTs)</td>
+                        <td class="num">@Fmt.Ago(c.OpenedTs, c.ClosedTs ?? _now)</td>
+                        <td class="num">@c.Documents</td>
+                        <td class="num">@c.GetMores</td>
+                        <td>@(c.ClosedReason ?? Fmt.Ago(c.LastActivityTs, _now) + " ago")</td>
+                        <td><a class="mono" href="shapes/@c.ShapeHash">@c.ShapeHash</a></td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+        @if (_rows.Length == 0) { <p class="p-container-padding text-muted">No @_state cursors.</p> }
+    </div>
+</div>
+
+@code {
+    [SupplyParameterFromQuery] public string? State { get; set; }
+    private string _state = "open";
+    private CursorDto[] _rows = [];
+    private long _now;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        _state = State == "closed" ? "closed" : "open";
+        _now = Fmt.NowUs();
+        _rows = await Api.Cursors(_state);
+    }
+}

@@ -1,0 +1,10 @@
+<Router AppAssembly="@typeof(App).Assembly">
+    <Found Context="routeData">
+        <RouteView RouteData="@routeData" DefaultLayout="@typeof(MainLayout)" />
+        <FocusOnNavigate RouteData="@routeData" Selector="h1" />
+    </Found>
+    <NotFound>
+        <PageTitle>Not found · Spyglass</PageTitle>
+        <LayoutView Layout="@typeof(MainLayout)"><p class="p-container-padding text-muted">Nothing here.</p></LayoutView>
+    </NotFound>
+</Router>

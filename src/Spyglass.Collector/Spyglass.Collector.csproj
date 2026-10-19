@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>spyglass-collector</AssemblyName>
+    <RootNamespace>Spyglass.Collector</RootNamespace>
+    <Version>0.1.0</Version>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 03 §7: embedded SQLite. 03 §4: shapes are computed from the redacted command BSON. -->
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />
+    <PackageReference Include="MongoDB.Bson" Version="3.12.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Spyglass.Collector.Tests" />
+  </ItemGroup>
+
+  <!-- The container build is self-contained and trimmed (src/Spyglass.Collector/Dockerfile). The collector's own JSON
+       is source-generated or written by hand; MongoDB.Bson is not trim-annotated, so it is kept whole, and IL2104
+       (warnings inside it) does not apply to code that is not trimmed. -->
+  <PropertyGroup Condition="'$(PublishTrimmed)' == 'true'">
+    <NoWarn>$(NoWarn);IL2104</NoWarn>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(PublishTrimmed)' == 'true'">
+    <TrimmerRootAssembly Include="MongoDB.Bson" />
+  </ItemGroup>
+
+</Project>

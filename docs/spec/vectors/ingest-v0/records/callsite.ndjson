@@ -1,0 +1,2 @@
+{"type":"callsite","ts":1700000000000000,"src":"3b6a9d20-0000-4000-8000-0000000000e1","callsite":"9c1e33a70b2f44d1","lang":"dotnet","frames":[{"fn":"OrdersRepository.GetByIdAsync","file":"src/Orders/OrdersRepository.cs","line":42},{"fn":"OrdersController.Get","file":"src/Orders/OrdersController.cs","line":18}]}
+{"type":"callsite","ts":1700000000000000,"src":"3b6a9d20-0000-4000-8000-0000000000e1","callsite":"0000000000000001","frames":[{"fn":"main"}]}
