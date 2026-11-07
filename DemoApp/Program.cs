@@ -4,28 +4,17 @@ var builder = WebApplication.CreateBuilder(args);
 
 // Add services to the container.
 
-// Register MongoClient as a singleton
-builder.Services.AddSingleton<IMongoClient>(sp =>
-{
-    return new MongoClient("mongodb://mongospyglass:27018");
-});
+// The connection string points at the spyglass proxy, not at MongoDB (docker-compose.yml). appName is how the
+// collector's UI attributes operations to a service.
+builder.Services.AddSingleton<IMongoClient>(_ =>
+    new MongoClient(builder.Configuration["Mongo:ConnectionString"] ?? "mongodb://localhost:27018/?appName=demoapp"));
 
 builder.Services.AddControllers();
-// Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
-builder.Services.AddOpenApi();
 
 var app = builder.Build();
 
-// Configure the HTTP request pipeline.
-if (app.Environment.IsDevelopment())
-{
-    app.MapOpenApi();
-}
-
 app.UseDefaultFiles();
 app.UseStaticFiles();
-
-app.UseHttpsRedirection();
 
 app.UseAuthorization();
 

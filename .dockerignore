@@ -1,4 +1,4 @@
-# Build context for src/Spyglass.Collector/Dockerfile (and the legacy MongoSpyglass.Service one):
+# Build context for src/Spyglass.Collector/Dockerfile and src/Spyglass.Proxy/Dockerfile:
 # sources only, never build output, caches or local tooling.
 **/bin/
 **/obj/

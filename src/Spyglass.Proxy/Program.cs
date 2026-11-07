@@ -9,6 +9,10 @@ using Spyglass.Proxy.Diagnostics;
 if (Environment.GetEnvironmentVariable("DOTNET_SYSTEM_NET_SOCKETS_INLINE_COMPLETIONS") == null)
     Environment.SetEnvironmentVariable("DOTNET_SYSTEM_NET_SOCKETS_INLINE_COMPLETIONS", "1");
 
+// container HEALTHCHECK (the image has no shell or curl): spyglass-proxy healthcheck [--bind host:port] [--path /readyz]
+if (args is ["healthcheck", ..])
+    return await HealthProbe.RunAsync(args[1..]);
+
 if (args is ["--help"] or ["-h"])
 {
     Console.WriteLine("""
@@ -18,6 +22,8 @@ if (args is ["--help"] or ["-h"])
           --upstream.uri mongodb://db1:27017,db2:27017/?replicaSet=rs0 --listen.basePort 27017
         or as an environment variable: SPYGLASS_UPSTREAM__URI, SPYGLASS_LISTEN__BASEPORT, ...
         Precedence: flags > environment > file.
+
+        spyglass-proxy healthcheck [--path /readyz]   GET the metrics listener; exit 0 on 200 (container HEALTHCHECK)
         """);
     return 0;
 }

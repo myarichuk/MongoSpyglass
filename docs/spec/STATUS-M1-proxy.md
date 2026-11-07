@@ -135,4 +135,4 @@ slots). At under 3 % of the per-frame forwarding cost, it isn't worth it now.
    was a smaller part of export cost than the first estimate said.
 3. Dedicated tests: tap-digest byte transparency, half-close / death mid-reply, pending-at-close.
 4. Nightly-only: PLAIN/LDAP, MONGODB-AWS, X.509 documented failure, SRV end-to-end, perf on pinned cores.
-5. Delete the old `MongoSpyglass.Proxy` once the collector replaces `MongoSpyglass.Service`.
+5. ~~Delete the old `MongoSpyglass.Proxy` once the collector replaces `MongoSpyglass.Service`~~ done, with the rest of the previous code.

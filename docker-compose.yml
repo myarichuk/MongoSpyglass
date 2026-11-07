@@ -1,27 +1,66 @@
-#file: noinspection SpellCheckingInspection
-version: '3.8'
+# The whole stack on one machine: MongoDB, the proxy in front of it, the collector with its UI, and a demo
+# service whose connection string points at the proxy. Nothing here is tuned; it is for seeing the product.
+#
+#   SPYGLASS_TOKEN=... SPYGLASS_ADMIN_PASSWORD=... docker compose up --build
+#
+#   UI            http://localhost:8080          (password: SPYGLASS_ADMIN_PASSWORD)
+#   demo service  http://localhost:5000          (its traffic shows up in the UI as app "demoapp")
+#   proxy         mongodb://localhost:27018/?appName=me   for your own mongosh / driver
+#   metrics       http://localhost:9187/metrics  (proxy, Prometheus text)   http://localhost:8080/api/v1/metrics (collector)
+#
+# Point another service at it by changing its connection string to the proxy and setting appName, which is how
+# the UI tells services apart (a driver without appName shows up under the driver's name).
+#
+# The upstream here is a standalone mongod. For a replica set the proxy needs one published port per member
+# (listen.basePort, +1, +2, ...) and listen.advertiseHost must be the name clients reach the proxy by, because the
+# proxy rewrites the hosts in hello replies to its own listeners (01 §5).
 
 services:
   mongodb:
-    image: mongo:latest
-    ports:
-      - "27017:27017"
+    image: mongo:8.0
+    command: ["mongod", "--bind_ip_all"]
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ ping: 1 }).ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
-  mongospyglass:
+  spyglass-collector:
     build:
       context: .
-      dockerfile: MongoSpyglass.Service/Dockerfile
+      dockerfile: src/Spyglass.Collector/Dockerfile
     ports:
       - "8080:8080"
-      - "27018:27018"
     environment:
-      - ASPNETCORE_ENVIRONMENT=Development
-      - Proxy__MongoDbServer=mongodb
-      - Proxy__MongoDbPort=27017
-      - Proxy__IncomingPort=27018
-      - RavenDB__DataDir=/var/lib/ravendb
+      SPYGLASS_TOKEN: ${SPYGLASS_TOKEN:-dev-ingest-token}
+      SPYGLASS_ADMIN_PASSWORD: ${SPYGLASS_ADMIN_PASSWORD:-spyglass}
+      # SPYGLASS_OP_RETENTION_HOURS: "24"
+      # SPYGLASS_SLOW_SHAPE_MS: "100"
+    volumes:
+      - spyglass-data:/data
+
+  spyglass-proxy:
+    build:
+      context: .
+      dockerfile: src/Spyglass.Proxy/Dockerfile
+    ports:
+      - "27018:27017"   # the proxy's listener, for clients on the host (mongodb itself is not published)
+      - "9187:9187"     # /metrics, /healthz, /readyz
+    environment:
+      SPYGLASS_UPSTREAM__URI: mongodb://mongodb:27017/?directConnection=true
+      SPYGLASS_LISTEN__ADVERTISEHOST: spyglass-proxy
+      SPYGLASS_LISTEN__BASEPORT: "27017"
+      SPYGLASS_COLLECTOR__ENDPOINT: http://spyglass-collector:8080/ingest/v0
+      SPYGLASS_COLLECTOR__TOKEN: ${SPYGLASS_TOKEN:-dev-ingest-token}
+      # capture.values: full | truncated (default: values cut at 64 chars) | shape (no values leave the proxy)
+      # SPYGLASS_CAPTURE__VALUES: shape
     depends_on:
-      - mongodb
+      mongodb:
+        condition: service_healthy
+      spyglass-collector:
+        condition: service_started
 
   demoapp:
     build:
@@ -30,7 +69,11 @@ services:
     ports:
       - "5000:8080"
     environment:
-      - ASPNETCORE_ENVIRONMENT=Development
+      ASPNETCORE_ENVIRONMENT: Development
+      Mongo__ConnectionString: mongodb://spyglass-proxy:27017/?appName=demoapp
     depends_on:
-      - mongodb
-      - mongospyglass
+      - spyglass-proxy
+
+volumes:
+  mongo-data:
+  spyglass-data:

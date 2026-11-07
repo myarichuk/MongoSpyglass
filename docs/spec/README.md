@@ -158,8 +158,11 @@ change, not an implementation detail.
 
 ---
 
-## 6. What carries over from the current code
+## 6. What carried over from the previous code
 
-| Keep | Rewrite | Delete |
-|---|---|---|
-| Frame-length validation idea; OP_MSG section walking; `BsonUtils` display parsing; the harness in `tools/ReviewHarness`; UI information architecture and Tailwind theme | `MongoDbProxy` (becomes cut-through, 01 §3); BSON scanning (becomes a streaming scanner, 01 §10) | NRules engine and all rules; `TrafficMonitorService`; per-operation RavenDB documents and attachments; Autofac, Polly, Stateless and Roslyn references; `WeatherForecast*` |
+Done. The previous `MongoSpyglass.Proxy` and `MongoSpyglass.Service` projects, their tests, `Playground`,
+`Benchmarks` and the review harness in `tools/ReviewHarness` were deleted once `src/Spyglass.*` replaced them.
+What was kept: the frame-length validation idea and OP_MSG section walking (as the streaming scanners of 01 §10),
+the UI information architecture and the Tailwind theme (`tailwind.config.js`), and the end-to-end A/B idea of the
+harness (as `tools/ProxyBench`). The review that motivated the rewrite is `docs/review/2026-10-17-architecture-review.md`;
+its findings are about code that no longer exists.

@@ -1,6 +1,6 @@
 {
   "scripts": {
-    "build:css": "tailwindcss -i ./tailwind.input.css -o ./MongoSpyglass.Service/wwwroot/css/app.css --minify"
+    "build:css": "tailwindcss -c src/Spyglass.Collector.Ui/tailwind.config.js -i src/Spyglass.Collector.Ui/wwwroot/css/input.css -o src/Spyglass.Collector.Ui/wwwroot/css/app.css --minify"
   },
   "devDependencies": {
     "tailwindcss": "3.4.1",
