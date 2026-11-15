@@ -15,6 +15,7 @@ catch (ArgumentException e)
     return 2;
 }
 
+foreach (var w in options.Warnings) Console.Error.WriteLine($"spyglass-collector: warning: {w}");
 var ui = Path.Combine(AppContext.BaseDirectory, "wwwroot");
 await using var server = await Server.StartAsync(options, Directory.Exists(ui) ? ui : null);
 Console.WriteLine($"spyglass-collector {typeof(Server).Assembly.GetName().Version?.ToString(3)} listening on {server.BaseAddress} " +

@@ -21,7 +21,15 @@ POST /ingest/v0 ─▶ validate ─▶ dedup ─▶ join (02 §6) ─▶ enrich 
 * Unknown `type`s are ignored. Unknown fields are kept in the raw record and otherwise
   ignored.
 * Records missing required fields (02 §4) are rejected individually, and the count is
-  returned in `X-Spyglass-Rejected`.
+  returned in `X-Spyglass-Rejected`. So are malformed ones: a line that is not valid UTF-8 (checked
+  once per line, so every string field is treated alike), has bytes after its closing brace, holds a
+  value of the wrong JSON type (including a nested value where a boolean is expected, and a
+  non-object element in `frames` or `members`), or has an int32 field (`code`, `nReturned`,
+  `reqBytes`, `requestId`, `seq`, `respBytes`, `attempt`, `schema`, a frame's `line`, …) outside
+  the int32 range. Values are rejected, never wrapped or clamped.
+* Any record from an exporter (`cmd`, `hello`, `callsite`, `stats`, `uow`, `pool`) shows it is alive
+  for the 10-minute exporter-idle rule of 02 §6.2. `uow` and `pool` are only counted (M3); their fields are
+  not kept.
 * `ts` more than 5 minutes in the future (relative to collector time) is clamped and counted
   as clock skew per `src`. It's shown on the Proxies/Exporters page.
 
@@ -132,8 +140,8 @@ The shape always includes `cmd` (command name), `db`, `coll`.
 
 | Command | Shape adds |
 |---|---|
-| `find` | `filter: normFilter`, `sort` (keys, order and directions kept, as `[[key, dir], …]`), `projection` (keys and inclusion kept), `limit`/`skip`/`batchSize` presence as `"?"`, `hint` (kept; a key pattern as `[[key, dir], …]`), `collation.locale` (kept) |
-| `aggregate` | `pipeline`: per stage, `{<stageName>: normStage}`. `$match` → normFilter. `$sort` as `[[key, dir], …]`. `$project`: inclusion flags kept, expressions with leaves tagged. `$group._id` structure kept with leaves tagged. Accumulator operators kept. `$lookup` keeps `from`/`localField`/`foreignField`/`as` and normalizes its sub-pipeline. `$limit`/`$skip` → `"?"`. Unknown stages: leaves tagged. |
+| `find` | `filter: normFilter`, `sort` (keys, order and directions kept, as `[[key, dir], …]`), `projection` (keys and inclusion flags kept; operator operands such as `$elemMatch`, `$slice` and `$meta` tagged as in `$project`), `limit`/`skip`/`batchSize` presence as `"?"`, `hint` (kept; a key pattern as `[[key, dir], …]`), `collation.locale` (kept) |
+| `aggregate` | `pipeline`: per stage, `{<stageName>: normStage}`. `$match` → normFilter. `$sort` as `[[key, dir], …]`. `$project`: inclusion flags kept, expressions with leaves tagged. `$group._id` structure kept with leaves tagged. Accumulator operators kept. `$lookup` keeps `from`/`localField`/`foreignField`/`as` and normalizes its sub-pipeline; `$unionWith` keeps `coll` and normalizes its `pipeline` the same way; each value of `$facet` is a pipeline. `$limit`/`$skip` → `"?"`. Unknown stages: leaves tagged, except that an array of literals of one kind (`$addFields: {x: {$in: ["$s", [1, 2, 3]]}}`) is the one tag, whatever its length, and counts toward `inCardinality` like `$in`. |
 | `update` | `updates[]` → per statement `{q: normFilter, u: <operator names → field names → tag>, upsert, multi}`. Pipeline-style `u` is normalized like an aggregate pipeline. Statements deduplicated by canonical form. |
 | `delete` | `deletes[]` → per statement `{q: normFilter, limit}` |
 | `findAndModify` | `query`, `sort`, `update` (as above), `remove`/`new`/`upsert` flags |
@@ -298,12 +306,12 @@ liveness one: restarting a collector that sheds load loses its in-memory state a
 | `GET /shapes/{hash}` | Shape detail: normalized shape, latency series, examples (slowest 10 plus latest 10), callsites |
 | `GET /uows?from&to&name&minOps&minTimeUs` | Units of work |
 | `GET /uows/{id}` | UoW detail: ordered op list (HR-profiler "statements in this request" view) |
-| `GET /alerts?state=open\|resolved&rule` · `POST /alerts/{id}/mute` | Alerts |
+| `GET /alerts?state=open\|resolved&rule&limit` (default 1000, at most 5000) · `POST /alerts/{id}/mute` | Alerts |
 | `GET /cursors?state=open\|closed&reason` | Cursors |
 | `GET /connections` · `GET /apps` | Live connections and apps (from `conn` records) |
 | `GET /producers` | Proxies and exporters: version, last seen, drops, skew; per exporter `join {cmds, joined, orphans, conflicts, rate, skew_us}` |
-| `GET /live?app&coll&command&status&minLatencyUs&uow` | SSE stream: `op.created`, `op.updated`, `alert.opened`, `alert.updated` |
-| `POST /export?from&to&…` | NDJSON download of ops and alerts for offline sharing |
+| `GET /live?app&coll&command&status&minLatencyUs&uow` | SSE stream: `op.created`, `op.updated`, `alert.opened`, `alert.updated`; `dropped` (`{dropped, total}`) when a slow reader's buffer overflowed and events were lost |
+| `POST /export?from&to&…` | NDJSON download of ops and alerts for offline sharing. At most 100 000 ops: a `{"type":"truncated","limit":100000}` line follows the last op when there may be more. Stops when the client disconnects |
 | `GET /metrics` | collector self-telemetry (Prometheus) |
 
 ## 9. Security
@@ -316,6 +324,29 @@ liveness one: restarting a collector that sheds load loses its in-memory state a
     oauth2-proxy and similar.
 
   There is no anonymous mode except `SPYGLASS_AUTH=none` *and* a loopback bind.
+* **Settings** (env `SPYGLASS_*` or `--name value`; an unknown `SPYGLASS_*` name is a warning on stderr, not an
+  error, because the proxy and the exporters read the same prefix from a shared env file):
+
+  | Setting | Meaning |
+  |---|---|
+  | `SPYGLASS_TOKEN` | ingest bearer token. Required (non-empty) unless `SPYGLASS_INGEST_INSECURE=1` |
+  | `SPYGLASS_AUTH` | `password` (default), `header` or `none` |
+  | `SPYGLASS_ADMIN_PASSWORD` | the password for `password` mode |
+  | `SPYGLASS_AUTH_HEADER` | the header name for `header` mode (`X-Forwarded-User`). Setting it selects `header` mode; with a different `SPYGLASS_AUTH` the collector refuses to start |
+  | `SPYGLASS_TRUSTED_PROXIES` (alias `SPYGLASS_AUTH_HEADER_TRUSTED_PROXIES`) | comma-separated CIDRs or addresses of the reverse proxies. Default: loopback (`127.0.0.0/8,::1/128`) |
+  | `SPYGLASS_BIND`, `SPYGLASS_DATA`, `SPYGLASS_QUEUE_BYTES`, `SPYGLASS_MAX_BODY_BYTES`, `SPYGLASS_WORKERS`, `SPYGLASS_OP_RETENTION_HOURS`, `SPYGLASS_OP_STORE_BYTES`, `SPYGLASS_CURSOR_TIMEOUT_SECONDS`, `SPYGLASS_SLOW_SHAPE_MS` | as named; see `CollectorOptions.cs` |
+
+* **Header auth is only as good as the peer check.** `X-Forwarded-User` is believed only on a connection whose
+  TCP peer is in `SPYGLASS_TRUSTED_PROXIES`; from anyone else the request is 401. With the default
+  (loopback) the proxy must run on the same host; behind a container network list the proxy's
+  address or network (`SPYGLASS_TRUSTED_PROXIES=172.18.0.0/16`). The same list decides whether
+  `X-Forwarded-Proto: https` is believed: the session cookie is `Secure` on a TLS connection, or when
+  a trusted proxy says the client used TLS.
+* **Login hardening.** `POST /api/v1/login` reads at most 4 KiB (413 beyond), answers 401 to a body that
+  is not `{"password": "<string>"}`, and backs off guessing: after 5 failures from one address that address
+  gets 429 with `Retry-After` for 2^(n-6) s (at most 15 min); more than 60 failures a minute from
+  anywhere make every address wait out the minute (so an attack can lock the legitimate user out for a
+  minute; HTTP Basic failures count too). A success clears the address.
 * **Binding:** API and UI bind to loopback by default.
 * **Data:** stored data is already redacted by the proxy (I7). The collector MUST NOT accept
   `op` records whose `cmd` decodes to a redacted-command name with a non-redacted body

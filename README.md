@@ -69,7 +69,10 @@ spyglass-proxy --upstream.uri "mongodb://db1:27017,db2:27017,db3:27017/?replicaS
 **Collector** (`src/Spyglass.Collector` + `src/Spyglass.Collector.Ui`). SQLite in `SPYGLASS_DATA`, 24 h of
 operations by default, aggregates kept 30 days. `SPYGLASS_TOKEN` authenticates ingest; the UI uses
 `SPYGLASS_ADMIN_PASSWORD`, or `SPYGLASS_AUTH_HEADER=X-Forwarded-User` behind an authenticating reverse proxy.
-It speaks plain HTTP: terminate TLS in front of it.
+The header is believed only from `SPYGLASS_TRUSTED_PROXIES` (CIDRs or addresses, default loopback), so in a
+container network set it to the proxy's network (for example `SPYGLASS_TRUSTED_PROXIES=172.18.0.0/16`); the same
+list lets an `X-Forwarded-Proto: https` mark the session cookie `Secure`. An empty `SPYGLASS_TOKEN` is refused,
+and unknown `SPYGLASS_*` names (the proxy's and exporters') only warn. It speaks plain HTTP: terminate TLS in front of it.
 
 ```sh
 docker build -f src/Spyglass.Collector/Dockerfile -t spyglass-collector .

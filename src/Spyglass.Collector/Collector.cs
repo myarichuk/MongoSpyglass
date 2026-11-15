@@ -95,19 +95,17 @@ public sealed class Collector : IAsyncDisposable
         if (contentEncoding is not { } enc || !enc.Contains("gzip", StringComparison.OrdinalIgnoreCase))
             return IngestPlain(body, producerHeader);
         var pool = System.Buffers.ArrayPool<byte>.Shared;
-        byte[] compressed = pool.Rent(body.Length), inflated = pool.Rent(MaxBatchBytes + 1); // pooled: Ingest copies what it keeps
+        var inflated = pool.Rent(MaxBatchBytes + 1); // pooled: Ingest copies what it keeps
         try
         {
-            body.CopyTo(compressed);
             int n;
-            try { n = Gunzip(compressed.AsSpan(0, body.Length), inflated); }
+            try { n = Gunzip(body, inflated); }
             catch (InvalidDataException) { Interlocked.Increment(ref Batches400); return new IngestResult(400, 0, 0, 0, "bad gzip"); }
             if (n > MaxBatchBytes) { Interlocked.Increment(ref Batches413); return new IngestResult(413, 0, 0, 0, "batch over 1 MiB uncompressed"); }
             return IngestPlain(inflated.AsSpan(0, n), producerHeader);
         }
         finally
         {
-            pool.Return(compressed);
             pool.Return(inflated);
         }
     }
@@ -189,7 +187,10 @@ public sealed class Collector : IAsyncDisposable
         {
             case ConnRecord c: Connections.Apply(c); return 0;
             case ProxyRecord p: Producers.Apply(p); return 0;
-            case StatsRecord s: Producers.Apply(s); return 0;
+            case StatsRecord s:
+                Producers.Apply(s);
+                if (Producers.Get(s.Src) is { Kind: not "proxy" }) ContextSeen(now); // 02 §6.2: any exporter record shows it is alive
+                return 0;
             case CmdRecord c:
             {
                 ContextSeen(now);
@@ -212,7 +213,10 @@ public sealed class Collector : IAsyncDisposable
                 ContextSeen(now);
                 _writer.Enqueue(cs);
                 return 0;
-            case ContextRecord: Interlocked.Increment(ref ContextRecords); return 0; // uow, pool: M3 (03 §5.3)
+            case ContextRecord:
+                ContextSeen(now);
+                Interlocked.Increment(ref ContextRecords); // uow, pool: M3 (03 §5.3)
+                return 0;
             case OpRecord op:
                 (perPartition[PartitionFor(op.Src, op.Member, op.ServerConnectionId ?? -op.ConnSeq)] ??= []).Add(op);
                 return op.Size;

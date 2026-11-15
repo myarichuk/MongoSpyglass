@@ -120,11 +120,12 @@ internal static class BsonSpan
         var len = I32(s, p);
         if (len < 5 || start + len > s.Length || s[start + len - 1] != 0) throw new FormatException("bad document length");
         p += 4;
-        while (p < start + len - 1)
+        var body = s[..(start + len - 1)]; // CA-4: no element may run past its own document (the normalizer walks nested slices alone)
+        while (p < body.Length)
         {
-            var type = s[p++];
-            CString(s, ref p);
-            ValidateValue(s, type, ref p, depth);
+            var type = body[p++];
+            CString(body, ref p);
+            ValidateValue(body, type, ref p, depth);
         }
         p = start + len;
     }
@@ -231,6 +232,13 @@ internal static class BsonSpan
         Decimal => Decimal128.ToInt32(Dec(e.Value)),
         _ => throw new FormatException("not a number"),
     };
+
+    /// <summary>ToInt32 for the numeric types that returns false instead of throwing (a decimal128 that is NaN or out of range).</summary>
+    public static bool TryToInt32(in BsonEl e, out int v)
+    {
+        try { v = ToInt32(e); return true; }
+        catch (Exception ex) when (ex is OverflowException or FormatException) { v = 0; return false; }
+    }
 
     /// <summary>BsonValue.ToBoolean.</summary>
     public static bool ToBoolean(in BsonEl e) => e.Type switch

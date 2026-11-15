@@ -25,6 +25,9 @@ public static class RecordParser
         error = null;
         try
         {
+            // 02 §4: UTF-8. Utf8JsonReader does not validate string contents, so one check per line keeps member/command/
+            // coll and event/exporter/callsite consistent: an invalid line is rejected, never stored with U+FFFD in it
+            if (!System.Text.Unicode.Utf8.IsValid(line)) { error = "invalid UTF-8"; return ParseResult.Rejected; }
             var type = FindType(line);
             Record? r = type switch
             {
@@ -85,7 +88,7 @@ public static class RecordParser
         while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
         {
             var nameStart = (int)reader.TokenStartIndex;
-            if (reader.ValueTextEquals("type"u8)) { reader.Read(); continue; }
+            if (reader.ValueTextEquals("type"u8)) { reader.Read(); reader.Skip(); continue; }
             if (reader.ValueTextEquals("ts"u8)) { reader.Read(); r.Ts = Long(ref reader); hasTs = true; continue; }
             if (reader.ValueTextEquals("src"u8)) { reader.Read(); r.Src = IStr(ref reader); hasSrc = true; continue; }
 
@@ -106,11 +109,15 @@ public static class RecordParser
             // unknown (or, for uow/pool records, every) field: keep it verbatim
             reader.Read();
             reader.Skip();
+            if (r is ContextRecord) continue; // uow, pool: only counted (M3), so no Extra string is built
             var end = (int)reader.BytesConsumed;
             extra ??= new StringBuilder("{");
             if (extra.Length > 1) extra.Append(',');
             extra.Append(Encoding.UTF8.GetString(line[nameStart..end]));
         }
+        // the loop ends on the closing brace; anything else is a malformed record, as is anything after it (03 §2)
+        if (reader.TokenType != JsonTokenType.EndObject) throw new Malformed("malformed record");
+        if (reader.Read()) throw new Malformed("trailing data");
         if (!hasTs) throw new Malformed("ts missing");
         if (!hasSrc || r.Src.Length == 0) throw new Malformed("src missing");
         seen.Check(r);
@@ -210,19 +217,19 @@ public static class RecordParser
         while (x.Read() && x.TokenType == JsonTokenType.PropertyName)
         {
             if (x.ValueTextEquals("ok"u8)) { x.Read(); f.Ok = NDouble(ref x); }
-            else if (x.ValueTextEquals("code"u8)) { x.Read(); f.Code = (int?)NLong(ref x); }
+            else if (x.ValueTextEquals("code"u8)) { x.Read(); f.Code = NInt(ref x); }
             else if (x.ValueTextEquals("codeName"u8)) { x.Read(); f.CodeName = NIStr(ref x); }
             else if (x.ValueTextEquals("errmsg"u8)) { x.Read(); f.Errmsg = NStr(ref x); }
             else if (x.ValueTextEquals("cursorId"u8)) { x.Read(); f.CursorId = CursorId(ref x); }
-            else if (x.ValueTextEquals("nReturned"u8)) { x.Read(); f.NReturned = (int?)NLong(ref x); }
+            else if (x.ValueTextEquals("nReturned"u8)) { x.Read(); f.NReturned = NInt(ref x); }
             else if (x.ValueTextEquals("n"u8)) { x.Read(); f.N = NLong(ref x); }
             else if (x.ValueTextEquals("nModified"u8)) { x.Read(); f.NModified = NLong(ref x); }
-            else if (x.ValueTextEquals("writeErrors"u8)) { x.Read(); f.WriteErrors = (int)(NLong(ref x) ?? 0); }
+            else if (x.ValueTextEquals("writeErrors"u8)) { x.Read(); f.WriteErrors = NInt(ref x) ?? 0; }
             else if (x.ValueTextEquals("writeConcernError"u8)) { x.Read(); f.WriteConcernError = Bool(ref x); }
-            else if (x.ValueTextEquals("upserted"u8)) { x.Read(); f.Upserted = (int)(NLong(ref x) ?? 0); }
-            else if (x.ValueTextEquals("cursorsKilled"u8)) { x.Read(); f.CursorsKilled = (int)(NLong(ref x) ?? 0); }
-            else if (x.ValueTextEquals("cursorsNotFound"u8)) { x.Read(); f.CursorsNotFound = (int)(NLong(ref x) ?? 0); }
-            else if (x.ValueTextEquals("parsed"u8)) { x.Read(); f.Parsed = x.TokenType != JsonTokenType.False; }
+            else if (x.ValueTextEquals("upserted"u8)) { x.Read(); f.Upserted = NInt(ref x) ?? 0; }
+            else if (x.ValueTextEquals("cursorsKilled"u8)) { x.Read(); f.CursorsKilled = NInt(ref x) ?? 0; }
+            else if (x.ValueTextEquals("cursorsNotFound"u8)) { x.Read(); f.CursorsNotFound = NInt(ref x) ?? 0; }
+            else if (x.ValueTextEquals("parsed"u8)) { x.Read(); f.Parsed = x.TokenType is JsonTokenType.True or JsonTokenType.False ? x.TokenType == JsonTokenType.True : throw new Malformed("parsed is not a boolean"); }
             else { x.Read(); x.Skip(); }
         }
         return f;
@@ -255,7 +262,7 @@ public static class RecordParser
         else if (x.ValueTextEquals("serverConnectionId"u8)) { x.Read(); s.ServerConnectionId = NLong(ref x); }
         else if (x.ValueTextEquals("requestId"u8)) { x.Read(); s.RequestId = Int(ref x); seen.RequestId = true; }
         else if (x.ValueTextEquals("seq"u8)) { x.Read(); s.Seq = Int(ref x); seen.Seq = true; }
-        else if (x.ValueTextEquals("respBytes"u8)) { x.Read(); s.RespBytes = (int)(NLong(ref x) ?? 0); }
+        else if (x.ValueTextEquals("respBytes"u8)) { x.Read(); s.RespBytes = NInt(ref x) ?? 0; }
         else if (x.ValueTextEquals("reply"u8))
         {
             x.Read();
@@ -279,7 +286,7 @@ public static class RecordParser
         else if (x.ValueTextEquals("status"u8)) { x.Read(); c.Status = IStr(ref x); seen.Status = true; }
         else if (x.ValueTextEquals("client_us"u8)) { x.Read(); c.ClientUs = NLong(ref x); }
         else if (x.ValueTextEquals("poolWait_us"u8)) { x.Read(); c.PoolWaitUs = NLong(ref x); }
-        else if (x.ValueTextEquals("attempt"u8)) { x.Read(); c.Attempt = (int?)NLong(ref x); }
+        else if (x.ValueTextEquals("attempt"u8)) { x.Read(); c.Attempt = NInt(ref x); }
         else if (x.ValueTextEquals("uow"u8))
         {
             x.Read();
@@ -332,7 +339,7 @@ public static class RecordParser
     {
         if (x.ValueTextEquals("exporter"u8)) { x.Read(); h.Exporter = Str(ref x); seen.Exporter = true; }
         else if (x.ValueTextEquals("version"u8)) { x.Read(); h.Version = NStr(ref x); }
-        else if (x.ValueTextEquals("schema"u8)) { x.Read(); h.Schema = (int)(NLong(ref x) ?? 0); }
+        else if (x.ValueTextEquals("schema"u8)) { x.Read(); h.Schema = NInt(ref x) ?? 0; }
         else if (x.ValueTextEquals("runtime"u8)) { x.Read(); h.Runtime = NStr(ref x); }
         else if (x.ValueTextEquals("driver"u8)) { x.Read(); h.Driver = NStr(ref x); }
         else if (x.ValueTextEquals("host"u8)) { x.Read(); h.Host = NStr(ref x); }
@@ -351,8 +358,9 @@ public static class RecordParser
         {
             x.Read();
             if (x.TokenType != JsonTokenType.StartArray) throw new Malformed("frames is not an array");
-            while (x.Read() && x.TokenType == JsonTokenType.StartObject)
+            while (x.Read() && x.TokenType != JsonTokenType.EndArray)
             {
+                if (x.TokenType != JsonTokenType.StartObject) throw new Malformed("frames element is not an object");
                 string fn = "";
                 string? file = null;
                 int? line = null;
@@ -360,7 +368,7 @@ public static class RecordParser
                 {
                     if (x.ValueTextEquals("fn"u8)) { x.Read(); fn = NStr(ref x) ?? ""; }
                     else if (x.ValueTextEquals("file"u8)) { x.Read(); file = NStr(ref x); }
-                    else if (x.ValueTextEquals("line"u8)) { x.Read(); line = (int?)NLong(ref x); }
+                    else if (x.ValueTextEquals("line"u8)) { x.Read(); line = NInt(ref x); }
                     else { x.Read(); x.Skip(); }
                 }
                 if (c.Frames.Count < 16) c.Frames.Add((fn, file, line)); // 02 §4.3: at most 16 user frames
@@ -374,15 +382,16 @@ public static class RecordParser
     private static bool Proxy(ref Utf8JsonReader x, ProxyRecord p)
     {
         if (x.ValueTextEquals("version"u8)) { x.Read(); p.Version = NStr(ref x) ?? ""; }
-        else if (x.ValueTextEquals("schema"u8)) { x.Read(); p.Schema = (int)(NLong(ref x) ?? 0); }
+        else if (x.ValueTextEquals("schema"u8)) { x.Read(); p.Schema = NInt(ref x) ?? 0; }
         else if (x.ValueTextEquals("topology"u8)) { x.Read(); p.Topology = NStr(ref x) ?? ""; }
         else if (x.ValueTextEquals("setName"u8)) { x.Read(); p.SetName = NStr(ref x); }
         else if (x.ValueTextEquals("members"u8))
         {
             x.Read();
             if (x.TokenType != JsonTokenType.StartArray) throw new Malformed("members is not an array");
-            while (x.Read() && x.TokenType == JsonTokenType.StartObject)
+            while (x.Read() && x.TokenType != JsonTokenType.EndArray)
             {
+                if (x.TokenType != JsonTokenType.StartObject) throw new Malformed("members element is not an object");
                 string member = "", upstream = "";
                 while (x.Read() && x.TokenType == JsonTokenType.PropertyName)
                 {
@@ -467,6 +476,9 @@ public static class RecordParser
         x.TokenType == JsonTokenType.Number && x.TryGetInt64(out var v) ? v : throw new Malformed("expected an integer");
 
     private static long? NLong(ref Utf8JsonReader x) => x.TokenType == JsonTokenType.Null ? null : Long(ref x);
+
+    /// <summary>int32 fields: a value outside the range is rejected, never wrapped (03 §2).</summary>
+    private static int? NInt(ref Utf8JsonReader x) => x.TokenType == JsonTokenType.Null ? null : Int(ref x);
 
     private static int Int(ref Utf8JsonReader x) =>
         x.TokenType == JsonTokenType.Number && x.TryGetInt32(out var v) ? v : throw new Malformed("expected an int32");

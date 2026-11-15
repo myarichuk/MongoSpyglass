@@ -138,7 +138,7 @@ public static class ShapeNormalizer
                         else BsonSpan.WriteValue(w, hint.Type, hint.Value);
                     }
                     Presence(w, cmd, "limit"u8);
-                    if (BsonSpan.TryGet(cmd, "projection"u8, out var proj) && proj.IsDocument) { w.WritePropertyName("projection"u8); BsonSpan.WriteDocument(w, proj.Value); }
+                    if (BsonSpan.TryGet(cmd, "projection"u8, out var proj) && proj.IsDocument) { w.WritePropertyName("projection"u8); Object(w, proj.Value, Members.Projection); } // CA-14: $elemMatch/$slice/$meta operands tagged, as in $project
                     Presence(w, cmd, "skip"u8);
                     if (BsonSpan.TryGet(cmd, "sort"u8, out var sort) && sort.IsDocument) { w.WritePropertyName("sort"u8); Ordered(w, sort.Value); }
                     break;
@@ -230,7 +230,7 @@ public static class ShapeNormalizer
 
         // ---- documents the normalizer builds from the command's keys -------------------------------------------------
 
-        private enum Members : byte { Filter, Operators, TagTree, Projection, UpdateFields, UpdateDoc }
+        private enum Members : byte { Filter, Operators, TagTree, Projection, UpdateFields, UpdateDoc, SubPipeline }
 
         /// <summary>
         /// An object of the document's members in sorted name order, each value normalized by <paramref name="kind"/>. A name
@@ -279,6 +279,10 @@ public static class ShapeNormalizer
                 case Members.Projection:
                     if (e.Type is BsonSpan.Boolean or BsonSpan.Int32 or BsonSpan.Int64 or BsonSpan.Double) BsonSpan.WriteValue(w, e.Type, e.Value);
                     else if (e.IsDocument && BsonSpan.First(e.Value, out var f) && !f.NameStartsWithDollar) Object(w, e.Value, Members.Projection);
+                    else TagTree(w, e.Type, e.Value);
+                    return;
+                case Members.SubPipeline: // $facet: each value is a pipeline
+                    if (e.IsArray) Pipeline(w, e.Value);
                     else TagTree(w, e.Type, e.Value);
                     return;
                 case Members.UpdateFields:
@@ -487,6 +491,8 @@ public static class ShapeNormalizer
                 else if (name.SequenceEqual("$lookup"u8) && stage.IsDocument) Lookup(w, stage.Value);
                 else if (name.SequenceEqual("$group"u8) && stage.IsDocument) Object(w, stage.Value, Members.TagTree);
                 else if (name.SequenceEqual("$project"u8) && stage.IsDocument) Object(w, stage.Value, Members.Projection);
+                else if (name.SequenceEqual("$facet"u8) && stage.IsDocument) Object(w, stage.Value, Members.SubPipeline);
+                else if (name.SequenceEqual("$unionWith"u8) && stage.IsDocument) UnionWith(w, stage.Value);
                 else TagTree(w, stage.Type, stage.Value);
                 w.WriteEndObject();
             }
@@ -506,6 +512,15 @@ public static class ShapeNormalizer
             w.WriteEndObject();
         }
 
+        /// <summary>$unionWith: <c>{coll, pipeline}</c> (the sub-pipeline normalized like $lookup's); a bare collection name is kept as a string.</summary>
+        private void UnionWith(Utf8JsonWriter w, ReadOnlySpan<byte> u)
+        {
+            w.WriteStartObject();
+            Raw(w, u, "coll"u8);
+            if (BsonSpan.TryGet(u, "pipeline"u8, out var p) && p.IsArray) { w.WritePropertyName("pipeline"u8); Pipeline(w, p.Value); }
+            w.WriteEndObject();
+        }
+
         /// <summary>Structure kept (keys, operator names, field-path strings), other leaves tagged; in value mode, the value itself.</summary>
         private void TagTree(Utf8JsonWriter w, byte type, ReadOnlySpan<byte> v)
         {
@@ -519,6 +534,16 @@ public static class ShapeNormalizer
                     Object(w, v, Members.TagTree);
                     return;
                 case BsonSpan.Array:
+                    // CA-14: an array of literals of one kind is one tag whatever its length (like $in), its size counted
+                    // toward inCardinality; mixed or structured arrays keep their elements
+                    if (LiteralArray(v, out var len, out var tag))
+                    {
+                        InCard = Math.Max(InCard, len);
+                        w.WriteStartArray();
+                        w.WriteStringValue(tag);
+                        w.WriteEndArray();
+                        return;
+                    }
                     w.WriteStartArray();
                     foreach (var x in Items(v)) TagTree(w, x.Type, x.Value);
                     w.WriteEndArray();
@@ -538,10 +563,36 @@ public static class ShapeNormalizer
 
         // ---- leaves (03 §4.1) --------------------------------------------------------------------------------------------
 
+        /// <summary>True for a non-empty array whose elements are all leaves with the same tag (no field paths, documents or arrays).</summary>
+        private static bool LiteralArray(ReadOnlySpan<byte> array, out int length, out ReadOnlySpan<byte> tag)
+        {
+            var n = 0;
+            tag = default;
+            foreach (var x in Items(array))
+            {
+                if (x.Type is BsonSpan.Document or BsonSpan.Array) { length = 0; return false; }
+                if (x.Type is BsonSpan.String or BsonSpan.Symbol or BsonSpan.DbPointer)
+                {
+                    var str = StringOf(x.Type, x.Value);
+                    if (str.Length > 0 && str[0] == (byte)'$') { length = 0; return false; } // a field path or $redacted: structure
+                }
+                var t = LeafTag(x.Type, x.Value);
+                if (n == 0) tag = t;
+                else if (!t.SequenceEqual(tag)) { length = 0; return false; }
+                n++;
+            }
+            length = n == 0 ? 0 : Length(array);
+            return n > 0;
+        }
+
         private void Leaf(Utf8JsonWriter w, byte type, ReadOnlySpan<byte> v)
         {
             if (!Shape) { BsonSpan.WriteValue(w, type, v); return; }
-            w.WriteStringValue(type switch
+            w.WriteStringValue(LeafTag(type, v));
+        }
+
+        private static ReadOnlySpan<byte> LeafTag(byte type, ReadOnlySpan<byte> v) =>
+            type switch
             {
                 BsonSpan.Int32 or BsonSpan.Int64 or BsonSpan.Double or BsonSpan.Decimal => "?number"u8,
                 BsonSpan.String or BsonSpan.Symbol or BsonSpan.DbPointer => StringTag(StringOf(type, v)),
@@ -556,13 +607,12 @@ public static class ShapeNormalizer
                 BsonSpan.Document => "?document"u8,
                 BsonSpan.Array => "?array"u8,
                 _ => "?other"u8,
-            });
-        }
+            };
 
         private static ReadOnlySpan<byte> StubTag(ReadOnlySpan<byte> stub)
         {
             BsonSpan.First(stub, out var inner);
-            return BsonSpan.TryGet(inner.Value, "subtype"u8, out var st) && st.IsNumeric && BsonSpan.ToInt32(st) == 4 ? "?uuid"u8 : "?binData"u8;
+            return BsonSpan.TryGet(inner.Value, "subtype"u8, out var st) && st.IsNumeric && BsonSpan.TryToInt32(st, out var subtype) && subtype == 4 ? "?uuid"u8 : "?binData"u8;
         }
 
         private static ReadOnlySpan<byte> StringOf(byte type, ReadOnlySpan<byte> v) =>
@@ -628,7 +678,7 @@ public static class ShapeNormalizer
             var e = new BsonElements(v.Value);
             if (!e.MoveNext()) return false;
             var only = e.Current;
-            return !e.MoveNext() && only.NameIs("$more"u8) && only.IsNumeric;
+            return !e.MoveNext() && only.NameIs("$more"u8) && only.IsNumeric && BsonSpan.TryToInt32(only, out var more) && more >= 0; // anything else is an ordinary element
         }
 
         /// <summary>Array length including the elements the proxy cut.</summary>
@@ -640,7 +690,7 @@ public static class ShapeNormalizer
             if (n > 0 && IsMore(last))
             {
                 BsonSpan.First(last.Value, out var more);
-                return n - 1 + BsonSpan.ToInt32(more);
+                return (int)Math.Min(int.MaxValue, (long)n - 1 + BsonSpan.ToInt32(more)); // saturates
             }
             return n;
         }

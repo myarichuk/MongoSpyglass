@@ -23,6 +23,10 @@ public sealed class Server : IAsyncDisposable
     private readonly WebApplication _app;
     private readonly object _store;
     private readonly ConcurrentDictionary<string, DateTime> _sessions = new();
+    private readonly LoginThrottle _throttle = new();
+    /// <summary>Unauthenticated login bodies are a password and nothing else (CA-20).</summary>
+    private const int MaxLoginBodyBytes = 4096;
+    private const int MaxExportOps = 100_000;
 
     public Collector Collector { get; }
     public CollectorOptions Options { get; }
@@ -205,7 +209,8 @@ public sealed class Server : IAsyncDisposable
             case AuthMode.None:
                 return "anonymous";
             case AuthMode.Header:
-                return c.Request.Headers[Options.AuthHeader].FirstOrDefault() is { Length: > 0 } u ? u : null;
+                // CA-3: the header is the proxy's word; anyone else who can reach the port could write it themselves
+                return IsTrustedProxy(c) && c.Request.Headers[Options.AuthHeader].FirstOrDefault() is { Length: > 0 } u ? u : null;
             default:
                 if (c.Request.Cookies[SessionCookie] is { } sid && _sessions.TryGetValue(sid, out var exp) && exp > DateTime.UtcNow)
                     return "admin";
@@ -216,11 +221,29 @@ public sealed class Server : IAsyncDisposable
                     try { decoded = Encoding.UTF8.GetString(Convert.FromBase64String(h[6..].Trim())); }
                     catch (FormatException) { return null; }
                     var colon = decoded.IndexOf(':');
-                    if (colon >= 0 && Same(decoded[(colon + 1)..], Options.AdminPassword!)) return "admin";
+                    var ip = c.Connection.RemoteIpAddress;
+                    if (_throttle.Locked(ip, out _)) return null;
+                    if (colon >= 0 && Same(decoded[(colon + 1)..], Options.AdminPassword!)) { _throttle.Succeeded(ip); return "admin"; }
+                    _throttle.Failed(ip);
                 }
                 return null;
         }
     }
+
+    /// <summary>True when the TCP peer is in <see cref="CollectorOptions.TrustedProxies"/> (03 §9).</summary>
+    private bool IsTrustedProxy(HttpContext c)
+    {
+        var ip = c.Connection.RemoteIpAddress;
+        if (ip == null) return false;
+        if (ip.IsIPv4MappedToIPv6) ip = ip.MapToIPv4();
+        foreach (var net in Options.TrustedProxies)
+            if (net.Contains(ip)) return true;
+        return false;
+    }
+
+    /// <summary>The request reached the proxy over TLS: this connection is, or a trusted proxy says so.</summary>
+    private bool IsHttps(HttpContext c) =>
+        c.Request.IsHttps || (IsTrustedProxy(c) && string.Equals(c.Request.Headers["X-Forwarded-Proto"].FirstOrDefault()?.Split(',')[0].Trim(), "https", StringComparison.OrdinalIgnoreCase));
 
     private static bool Same(string a, string b) =>
         CryptographicOperations.FixedTimeEquals(SHA256.HashData(Encoding.UTF8.GetBytes(a)), SHA256.HashData(Encoding.UTF8.GetBytes(b)));
@@ -228,28 +251,39 @@ public sealed class Server : IAsyncDisposable
     private async Task<IResult> Login(HttpContext c)
     {
         if (Options.Auth != AuthMode.Password) return Obj(("auth", Options.Auth.ToString().ToLowerInvariant()));
-        string? password = null;
-        if (c.Request.HasFormContentType) password = (await c.Request.ReadFormAsync().ConfigureAwait(false))["password"];
-        else
+        var ip = c.Connection.RemoteIpAddress;
+        if (_throttle.Locked(ip, out var retry))
         {
-            try
+            c.Response.Headers.RetryAfter = retry.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            return Results.StatusCode(StatusCodes.Status429TooManyRequests);
+        }
+        // CA-20: cap the body before parsing (it is read without a session)
+        if (c.Request.ContentLength > MaxLoginBodyBytes) return Results.StatusCode(StatusCodes.Status413PayloadTooLarge);
+        if (c.Features.Get<IHttpMaxRequestBodySizeFeature>() is { IsReadOnly: false } limit) limit.MaxRequestBodySize = MaxLoginBodyBytes;
+        string? password = null;
+        try
+        {
+            if (c.Request.HasFormContentType) password = (await c.Request.ReadFormAsync().ConfigureAwait(false))["password"];
+            else
             {
                 using var doc = await JsonDocument.ParseAsync(c.Request.Body).ConfigureAwait(false);
-                password = doc.RootElement.TryGetProperty("password", out var p) ? p.GetString() : null;
+                password = doc.RootElement.ValueKind == JsonValueKind.Object && doc.RootElement.TryGetProperty("password", out var p) && p.ValueKind == JsonValueKind.String ? p.GetString() : null;
             }
-            catch (JsonException) { }
         }
+        catch (Exception e) when (e is JsonException or InvalidDataException or BadHttpRequestException or IOException) { }
         if (password == null || !Same(password, Options.AdminPassword!))
         {
+            _throttle.Failed(ip);
             await Task.Delay(250).ConfigureAwait(false); // blunt the online guessing rate
             return Results.Unauthorized();
         }
+        _throttle.Succeeded(ip);
         foreach (var (k, v) in _sessions) if (v < DateTime.UtcNow) _sessions.TryRemove(k, out _);
         var sid = Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(32));
         _sessions[sid] = DateTime.UtcNow + SessionLifetime;
         c.Response.Cookies.Append(SessionCookie, sid, new CookieOptions
         {
-            HttpOnly = true, SameSite = SameSiteMode.Strict, Secure = c.Request.IsHttps, Path = "/", MaxAge = SessionLifetime,
+            HttpOnly = true, SameSite = SameSiteMode.Strict, Secure = IsHttps(c), Path = "/", MaxAge = SessionLifetime,
         });
         return Obj(("ok", true));
     }
@@ -535,7 +569,7 @@ public sealed class Server : IAsyncDisposable
         var list = Collector.Analysis.Alerts.Snapshot()
             .Where(a => state == null || (state == "open") == a.Open)
             .Where(a => rule == null || a.Rule == rule)
-            .OrderByDescending(a => a.Open).ThenByDescending(a => a.LastSeen).ToList();
+            .OrderByDescending(a => a.Open).ThenByDescending(a => a.LastSeen).Take((int)Math.Clamp(L(req, "limit") ?? 1000, 1, 5000)).ToList(); // CA-22
         return Raw(Json.Write(w =>
         {
             w.WriteStartObject();
@@ -675,6 +709,7 @@ public sealed class Server : IAsyncDisposable
         c.Response.Headers["X-Accel-Buffering"] = "no";
         using var sub = Collector.Live.Subscribe(Filter);
         var ct = c.RequestAborted;
+        var reportedDrops = 0L;
         await c.Response.WriteAsync(": connected\n\n", ct).ConfigureAwait(false);
         await c.Response.Body.FlushAsync(ct).ConfigureAwait(false);
         try
@@ -697,6 +732,12 @@ public sealed class Server : IAsyncDisposable
                     await c.Response.WriteAsync($"event: {e.Name}\ndata: ", ct).ConfigureAwait(false);
                     await c.Response.Body.WriteAsync(e.Payload, ct).ConfigureAwait(false);
                     await c.Response.WriteAsync("\n\n", ct).ConfigureAwait(false);
+                }
+                // CA-22: a slow reader's overflow is counted by the hub; tell the client rows were missed (it can refetch)
+                if (Volatile.Read(ref sub.Dropped) is var dropped && dropped > reportedDrops)
+                {
+                    await c.Response.WriteAsync($"event: dropped\ndata: {{\"dropped\":{dropped - reportedDrops},\"total\":{dropped}}}\n\n", ct).ConfigureAwait(false);
+                    reportedDrops = dropped;
                 }
                 await c.Response.Body.FlushAsync(ct).ConfigureAwait(false);
             }
@@ -725,20 +766,31 @@ public sealed class Server : IAsyncDisposable
         });
         await c.Response.Body.WriteAsync(header).ConfigureAwait(false);
         await c.Response.WriteAsync("\n").ConfigureAwait(false);
+        var ct = c.RequestAborted;
         string? cursor = null;
         var written = 0;
-        while (written < 100_000)
+        try
         {
-            var page = Collector.Ops.Query(new OpQuery { From = from, To = to, Limit = 1000, Cursor = cursor });
-            foreach (var o in page)
+            while (!ct.IsCancellationRequested)
             {
-                await c.Response.Body.WriteAsync(Json.Write(w => Json.OpDetail(w, o, null))).ConfigureAwait(false);
-                await c.Response.WriteAsync("\n").ConfigureAwait(false);
+                if (written >= MaxExportOps) // 03 §8: say so rather than stop silently
+                {
+                    await c.Response.WriteAsync($"{{\"type\":\"truncated\",\"limit\":{MaxExportOps}}}\n", ct).ConfigureAwait(false);
+                    break;
+                }
+                var page = Collector.Ops.Query(new OpQuery { From = from, To = to, Limit = 1000, Cursor = cursor });
+                foreach (var o in page)
+                {
+                    await c.Response.Body.WriteAsync(Json.Write(w => Json.OpDetail(w, o, null)), ct).ConfigureAwait(false);
+                    await c.Response.WriteAsync("\n", ct).ConfigureAwait(false);
+                }
+                written += page.Count;
+                if (page.Count < 1000) break;
+                cursor = page[^1].Id;
             }
-            written += page.Count;
-            if (page.Count < 1000) break;
-            cursor = page[^1].Id;
+            if (ct.IsCancellationRequested) return;
         }
+        catch (OperationCanceledException) { return; }
         foreach (var a in Collector.Analysis.Alerts.Snapshot().Where(a => a.LastSeen >= from && a.FirstSeen <= to))
         {
             await c.Response.Body.WriteAsync(Json.Write(w => Json.Alert(w, a))).ConfigureAwait(false);
