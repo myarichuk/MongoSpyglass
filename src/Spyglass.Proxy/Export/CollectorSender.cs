@@ -26,12 +26,24 @@ internal sealed class RecordBuffer
 {
     private readonly CollectorSender _sender;
     private readonly bool _reserved;
+    private readonly RecordBuffer? _before;
     private RecordChunk? _current;
 
-    internal RecordBuffer(CollectorSender sender, bool reserved = false)
+    /// <param name="before">
+    /// a buffer whose records must reach the collector ahead of this one's: the worker's <c>conn</c> buffer, sealed before
+    /// any op chunk of the same worker so a connection's open record (its app, driver) never arrives after its ops
+    /// </param>
+    internal RecordBuffer(CollectorSender sender, bool reserved = false, RecordBuffer? before = null)
     {
         _sender = sender;
         _reserved = reserved;
+        _before = before;
+    }
+
+    private void Seal(RecordChunk c)
+    {
+        _before?.Flush(); // lock order: an op buffer may take its conn buffer's lock, never the reverse
+        _sender.Seal(c);
     }
 
     /// <summary>Never blocks on I/O; drops (and counts) the record when the buffer bound is reached or the collector asked to pause.</summary>
@@ -48,7 +60,7 @@ internal sealed class RecordBuffer
             var c = _current;
             if (c != null && c.Length + need > c.Buffer.Length)
             {
-                _sender.Seal(c);
+                Seal(c);
                 c = _current = null;
             }
             if (c == null)
@@ -65,7 +77,7 @@ internal sealed class RecordBuffer
             c.Buffer[c.Length++] = (byte)'\n';
             if (++c.Records >= _sender.BatchMaxRecords)
             {
-                _sender.Seal(c);
+                Seal(c);
                 _current = null;
             }
         }
@@ -82,7 +94,7 @@ internal sealed class RecordBuffer
         }
         if (c != null)
         {
-            if (c.Records > 0) _sender.Seal(c);
+            if (c.Records > 0) Seal(c);
             else _sender.Release(c);
         }
     }
@@ -149,9 +161,9 @@ internal sealed class CollectorSender : IAsyncDisposable
     internal long PausedForMs => Math.Max(0, Volatile.Read(ref _pausedUntil) - Environment.TickCount64);
 
     /// <summary>A producer's buffer; one per observer worker. <paramref name="reserved"/>: <c>conn</c> records, kept through a 429 pause.</summary>
-    public RecordBuffer CreateBuffer(bool reserved = false)
+    public RecordBuffer CreateBuffer(bool reserved = false, RecordBuffer? before = null)
     {
-        var b = new RecordBuffer(this, reserved);
+        var b = new RecordBuffer(this, reserved, before);
         lock (_buffers) _buffers.Add(b);
         return b;
     }

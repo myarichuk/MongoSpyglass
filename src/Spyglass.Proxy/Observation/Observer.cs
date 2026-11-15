@@ -225,8 +225,8 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
         {
             _o = o;
             _busy = busy;
-            _out = o._sender?.CreateBuffer();
             _connOut = o._sender?.CreateBuffer(reserved: true);
+            _out = o._sender?.CreateBuffer(before: _connOut); // conn records ahead of the ops they attribute
             _parser = new RequestParser(new Redactor(o._config.Capture), o._config.Compression);
         }
 
