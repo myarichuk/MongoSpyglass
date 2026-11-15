@@ -21,6 +21,8 @@ internal sealed class CaptureTap : IFrameTap
 
     /// <summary>01 §4's per-connection ring, per direction: a connection can't hold more than this many slots at once.</summary>
     internal const int RingSlots = 512;
+    /// <summary>Slot-less reply notices outstanding per connection: a stalled observer cannot grow its queue without bound (FP-3).</summary>
+    internal const int UnobservedSlots = 64;
     private readonly int[] _inflight = new int[1];
 
     // A reply that got no slot still tells the observer which request it answers (and whether more replies follow),
@@ -156,6 +158,9 @@ internal sealed class CaptureTap : IFrameTap
             if (_lost)
             {
                 _lost = false;
+                if (Volatile.Read(ref _conn.UnobservedInflight) >= UnobservedSlots)
+                    return; // the observer is far behind: the pending request it answers is left to the age-out / close sweep
+                Interlocked.Increment(ref _conn.UnobservedInflight);
                 var flags = _lostFlagsHave == 4 ? (MsgFlags)System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(_lostFlags) : MsgFlags.None;
                 _observer.PublishUnobservedReply(_conn, _lostResponseTo, _lostRequestId, _lostOpCode, flags);
             }

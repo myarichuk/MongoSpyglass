@@ -350,6 +350,95 @@ public sealed class WireRobustnessTests
         Assert.Equal(0, proxy.Server.HelloBuffers.Used);
     }
 
+    // ---- FP-2: an unexpected exception in a pump ------------------------------------------------
+
+    /// <summary>Reads throw something the pump does not expect (SslStream and friends do this); everything else passes through.</summary>
+    private sealed class ReadFaultStream(Stream inner) : Stream
+    {
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() => inner.Flush();
+        public override int Read(byte[] buffer, int offset, int count) => throw new InvalidOperationException("injected read fault");
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default) => throw new InvalidOperationException("injected read fault");
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => inner.Write(buffer, offset, count);
+        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default) => inner.WriteAsync(buffer, ct);
+        protected override void Dispose(bool disposing) { if (disposing) inner.Dispose(); base.Dispose(disposing); }
+        public override ValueTask DisposeAsync() => inner.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task An_unexpected_pump_fault_stops_both_pumps_closes_both_sockets_and_posts_the_close_record()
+    {
+        var (proxy, mongo) = await StandaloneAsync();
+        await using var _ = proxy;
+        await using var __ = mongo;
+        proxy.Server.Upstream.StreamDecorator = s => new ReadFaultStream(s);
+        using var client = await ConnectAsync(proxy); // the upstream-side pump faults at once; the client side is idle
+
+        Assert.True(await ClosedAsync(client, TimeSpan.FromSeconds(5)));
+        var closed = await proxy.WaitRecordsAsync(r => r.GetProperty("type").GetString() == "conn" && r.GetProperty("event").GetString() == "close", 1);
+        Assert.NotEmpty(closed);
+        await WaitAsync(() => proxy.Server.OpenConnections == 0);
+    }
+
+    // ---- FP-12: member sweep ---------------------------------------------------------------------
+
+    [Fact]
+    public async Task An_absent_member_without_connections_is_swept_its_port_is_reusable_and_the_last_member_is_kept()
+    {
+        var ports = Ports.FreeRange(2);
+        var hosts = new[] { $"127.0.0.1:{ports}", $"127.0.0.1:{ports + 1}" };
+        var view = hosts;
+        var members = new[] { new FakeMongo(ports, "rs0", () => view), new FakeMongo(ports + 1, "rs0", () => view) };
+        foreach (var m in members) m.Start();
+
+        var basePort = Ports.FreeRange(4);
+        var args = new Dictionary<string, string>
+        {
+            ["upstream.uri"] = $"mongodb://{hosts[0]},{hosts[1]}/?replicaSet=rs0",
+            ["listen.basePort"] = basePort.ToString(),
+            ["listen.portRange"] = $"{basePort},{basePort + 3}",
+            ["metrics.bind"] = "127.0.0.1:0",
+            ["logLevel"] = "warn",
+        };
+        var config = ConfigLoader.Load(args.SelectMany(kv => new[] { "--" + kv.Key, kv.Value }).ToArray(), new Dictionary<string, string?>());
+        await using var server = new ProxyServer(config);
+        server.Topology.MonitorInterval = TimeSpan.FromMilliseconds(100);
+        server.Topology.AbsentListenerTtl = TimeSpan.FromMilliseconds(300);
+        await server.StartAsync();
+        try
+        {
+            Assert.Equal(2, server.Topology.Members.Count);
+
+            view = [hosts[0]]; // the second member left the set; the monitors keep succeeding
+            await WaitAsync(() => server.Topology.Members.Count == 1);
+            await Assert.ThrowsAnyAsync<SocketException>(async () =>
+            {
+                using var probe = new TcpClient();
+                await probe.ConnectAsync(IPAddress.Loopback, basePort + 1);
+            });
+
+            view = hosts; // it comes back: the freed port is bound again
+            await WaitAsync(() => server.Topology.Members.Count == 2);
+            using (var probe = new TcpClient())
+                await probe.ConnectAsync(IPAddress.Loopback, basePort + 1);
+
+            view = []; // nobody is in the view any more: all but the last member are swept, the last one stays
+            await WaitAsync(() => server.Topology.Members.Count == 1);
+            await Task.Delay(800);
+            Assert.Single(server.Topology.Members);
+        }
+        finally
+        {
+            foreach (var m in members) await m.DisposeAsync();
+        }
+    }
+
     // ---- PW-1: a total outage must not tear the proxy down --------------------------------------
 
     [Fact]
@@ -483,48 +572,123 @@ public sealed class WireRobustnessTests
     }
 }
 
-/// <summary>Alone: shortens the process-wide hello buffering deadline.</summary>
-[Collection(Isolated.Name)]
+/// <summary>FP-1: hello buffering bounds. Requests (any client) and replies (the server) have separate budgets; requests are charged by bytes received.</summary>
 public sealed class HelloBufferingTests
 {
-    [Fact]
-    public async Task A_stalled_hello_frame_is_closed_and_its_budget_released()
+    private static byte[] StalledPrefix(int declared)
     {
-        var old = Pump.HelloBufferTimeout;
-        Pump.HelloBufferTimeout = TimeSpan.FromMilliseconds(500);
+        var hello = WireFrames.Msg(3, w =>
+        {
+            w.WriteInt32("hello", 1);
+            w.WriteString("pad", new string('x', 400));
+        });
+        var prefix = hello[..300];
+        BinaryPrimitives.WriteInt32LittleEndian(prefix, declared);
+        return prefix;
+    }
+
+    private static async Task<Socket> ConnectAsync(ProxyHost proxy)
+    {
+        var s = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
+        await s.ConnectAsync(new IPEndPoint(IPAddress.Loopback, proxy.BasePort));
+        return s;
+    }
+
+    private static async Task UntilAsync(Func<bool> cond, string what)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (!cond())
+        {
+            Assert.True(DateTime.UtcNow < deadline, what);
+            await Task.Delay(20);
+        }
+    }
+
+    [Fact]
+    public async Task A_stalled_hello_frame_is_closed_as_hello_timeout_and_its_budget_released()
+    {
         var mongo = new FakeMongo(Ports.FreeRange(1));
         mongo.Start();
-        await using var _ = mongo;
+        await using var mongoLease = mongo;
+        await using var proxy = await ProxyHost.StartAsync($"mongodb://{mongo.Address}", listeners: 1, c => c["limits.helloBufferTimeoutMs"] = "500");
+        using var client = await ConnectAsync(proxy);
+
+        // the first 300 bytes of a hello that declares 60 000, then silence: slowloris
+        await client.SendAsync(StalledPrefix(60_000));
+        await UntilAsync(() => proxy.Server.HelloRequestBuffers.Used > 0, "budget never charged");
+        // charged by what arrived (one step), not by the declared length; the reply budget is untouched
+        Assert.Equal(4096, proxy.Server.HelloRequestBuffers.Used);
+        Assert.Equal(0, proxy.Server.HelloBuffers.Used);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var n = await client.ReceiveAsync(new byte[16], SocketFlags.None, cts.Token);
+        Assert.Equal(0, n);
+        await UntilAsync(() => proxy.Server.HelloRequestBuffers.Used == 0, "budget not released");
+        Assert.Empty(mongo.Frames); // nothing of the stalled frame went upstream
+
+        // its own close reason; invalidHeader stays the 16-byte header of an invalid frame (02 §4.1)
+        var closed = await proxy.WaitRecordsAsync(r => r.GetProperty("type").GetString() == "conn"
+            && r.GetProperty("event").GetString() == "close", 1);
+        Assert.Equal("hello_timeout", closed[0].GetProperty("closeReason").GetString());
+        Assert.False(closed[0].TryGetProperty("invalidHeader", out _));
+        Assert.DoesNotContain("spyglass_proxy_invalid_frames_total{listener=\"" + $"localhost:{proxy.BasePort}" + "\"} 1", await proxy.HttpGetAsync("/metrics"));
+    }
+
+    [Fact]
+    public async Task Stalled_hello_requests_cannot_starve_the_reply_budget_or_inflate_it_by_declared_length()
+    {
+        var mongo = new FakeMongo(Ports.FreeRange(1));
+        mongo.Start();
+        await using var mongoLease = mongo;
+        // request budget = max(4096, helloBufferBytes / 4) = 4096: one stalled client takes all of it
+        await using var proxy = await ProxyHost.StartAsync($"mongodb://{mongo.Address}", listeners: 1, c =>
+        {
+            c["limits.helloBufferBytes"] = "8192";
+            c["limits.helloRewriteMaxBytes"] = "65536";
+            c["limits.helloBufferTimeoutMs"] = "60000";
+        });
+        using var attacker = await ConnectAsync(proxy);
+        await attacker.SendAsync(StalledPrefix(60_000));
+        await UntilAsync(() => proxy.Server.HelloRequestBuffers.Used == 4096, "request budget not held");
+        Assert.Equal(0, proxy.Server.HelloBuffers.Used);
+
+        // a legitimate client: its request finds the request budget taken (counted, forwarded as is) ...
+        using var client = await ConnectAsync(proxy);
+        var hello = WireFrames.Msg(9, w =>
+        {
+            w.WriteInt32("hello", 1);
+            w.StartArray("compression");
+            w.WriteString("0", "zlib");
+            w.EndDocument();
+            w.WriteString("$db", "admin");
+        });
+        var helloBefore = mongo.HelloCount; // discovery already said hello
+        await client.SendAsync(hello);
+        await UntilAsync(() => mongo.HelloCount > helloBefore, "hello never reached the server");
+        // ... and its reply still gets the (untouched) reply budget: exactly one budget skip, the request's
+        var buf = new byte[4096];
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        Assert.True(await client.ReceiveAsync(buf, SocketFlags.None, cts.Token) > 16);
+        var metrics = await proxy.HttpGetAsync("/metrics");
+        Assert.Contains("rewrite_skipped_total{reason=\"budget\"} 1", metrics);
+    }
+
+    [Fact]
+    public async Task A_hello_request_declaring_more_than_the_request_cap_is_passed_through_unbuffered()
+    {
+        var mongo = new FakeMongo(Ports.FreeRange(1));
+        mongo.Start();
+        await using var mongoLease = mongo;
         await using var proxy = await ProxyHost.StartAsync($"mongodb://{mongo.Address}", listeners: 1);
-        try
+        using var client = await ConnectAsync(proxy);
+        await client.SendAsync(StalledPrefix(1024 * 1024));
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        string metrics;
+        while (!(metrics = await proxy.HttpGetAsync("/metrics")).Contains("rewrite_skipped_total{reason=\"too_large\"} 1"))
         {
-            using var client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-            await client.ConnectAsync(new IPEndPoint(IPAddress.Loopback, proxy.BasePort));
-
-            // the first 300 bytes of a 1 MiB hello, then silence: slowloris
-            var hello = WireFrames.Msg(3, w =>
-            {
-                w.WriteInt32("hello", 1);
-                w.WriteString("pad", new string('x', 400));
-            });
-            var prefix = hello[..300];
-            BinaryPrimitives.WriteInt32LittleEndian(prefix, 1024 * 1024);
-            await client.SendAsync(prefix);
-            await Task.Delay(100);
-            Assert.True(proxy.Server.HelloBuffers.Used >= 1024 * 1024);
-
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-            var n = await client.ReceiveAsync(new byte[16], SocketFlags.None, cts.Token);
-            Assert.Equal(0, n);
-            var deadline = DateTime.UtcNow.AddSeconds(5);
-            while (proxy.Server.HelloBuffers.Used != 0 && DateTime.UtcNow < deadline)
-                await Task.Delay(20);
-            Assert.Equal(0, proxy.Server.HelloBuffers.Used);
-            Assert.Empty(mongo.Frames); // nothing of the stalled frame went upstream
+            Assert.True(DateTime.UtcNow < deadline, "not counted as too_large");
+            await Task.Delay(20);
         }
-        finally
-        {
-            Pump.HelloBufferTimeout = old;
-        }
+        Assert.Equal(0, proxy.Server.HelloRequestBuffers.Used);
     }
 }

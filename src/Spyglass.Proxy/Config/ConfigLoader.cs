@@ -205,8 +205,10 @@ public static class ConfigLoader
             ["limits.maxClientConnections"] = (c, v) => c.Limits.MaxClientConnections = Int(v, 1, 1 << 20),
             ["limits.observeQueueBytes"] = (c, v) => c.Limits.ObserveQueueBytes = Long(v, 0), // 0 = observe nothing (forwarding-only A/B runs)
             ["limits.maxPendingPerConnection"] = (c, v) => c.Limits.MaxPendingPerConnection = Int(v, 1, 1 << 20),
+            ["limits.pendingMaxAgeSeconds"] = (c, v) => c.Limits.PendingMaxAgeSeconds = Int(v, 1, 7 * 24 * 3600),
             ["limits.helloRewriteMaxBytes"] = (c, v) => c.Limits.HelloRewriteMaxBytes = Int(v, 4096, 48_000_000),
             ["limits.helloBufferBytes"] = (c, v) => c.Limits.HelloBufferBytes = Long(v, 4096),
+            ["limits.helloBufferTimeoutMs"] = (c, v) => c.Limits.HelloBufferTimeoutMs = Int(v, 50, 3_600_000),
             ["limits.readBufferBytes"] = (c, v) => c.Limits.ReadBufferBytes = Int(v, 4096, 16 * 1024 * 1024),
 
             ["collector.endpoint"] = (c, v) => c.Collector.Endpoint = HttpUrl(v),
@@ -316,6 +318,8 @@ public static class ConfigLoader
             yield return $"listen.bindAddress={c.Listen.BindAddress} with listen.tls.mode=none: client traffic, including credentials exchanged during authentication, is plaintext on the network";
         foreach (var o in c.Overrides)
             yield return o;
+        if (c.Limits.HelloBufferBytes < c.Limits.HelloRewriteMaxBytes)
+            yield return $"limits.helloBufferBytes ({c.Limits.HelloBufferBytes}) is below limits.helloRewriteMaxBytes ({c.Limits.HelloRewriteMaxBytes}): large hello replies are passed through unrewritten";
         if (c.Upstream.Tls.AllowInvalidCertificates)
             yield return "upstream.tls.allowInvalidCertificates=true: upstream certificates are not validated";
         if (c.Upstream.Tls.AllowInvalidHostnames)

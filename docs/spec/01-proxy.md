@@ -53,14 +53,17 @@ capture:
   replyBytes: 0             # accepted and ignored: replies are scanned for facts, never copied (§10)
   values: truncated         # full | truncated | shape   (§9.3)
   truncateStringsAt: 64
-  redactFieldPattern: "(?i)(passw(or)?d|passphrase|pwd|^pass$|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|authorization|cookie|credential|^ssn$|[-_]ssn$|^card$|card[-_]?num|^cvv$)"
+  # not matched on purpose (too broad): auth, sessionId, pin/otp as parts of longer names; extend the pattern for your schema
+  redactFieldPattern: "(?i)(passw(or)?d|passphrase|pwd|^pass$|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|authorization|bearer|cookie|credential|ssn$|social[-_]?security|^card$|card[-_]?num|card[-_]?no(?![a-z])|credit[-_]?card|cv[vc]$|^pin$|^otp$)"
 
 limits:
   maxClientConnections: 4096
   observeQueueBytes: 67108864   # 64 MiB across all connections (I4)
   maxPendingPerConnection: 1024 # outstanding requests tracked per connection
-  helloRewriteMaxBytes: 1048576
-  helloBufferBytes: 16777216    # process-wide budget for hello frames buffered for rewriting (§13)
+  pendingMaxAgeSeconds: 21600   # a request with no reply for this long is dropped from the pending table (§7); 6 h
+  helloRewriteMaxBytes: 1048576 # hello replies above this pass through; hello requests are further capped at 64 KiB (§13)
+  helloBufferBytes: 16777216    # budget for hello replies buffered for rewriting; hello requests have their own, a quarter of it (§13)
+  helloBufferTimeoutMs: 10000   # a hello frame being buffered must complete within this, or the connection closes (§13)
 
 collector:
   endpoint: "http://spyglass-collector:4318/ingest/v0"   # null = headless
@@ -85,11 +88,13 @@ naming the key. In particular:
 
 * `bindAddress` other than loopback, combined with `listen.tls.mode=none`, logs a warning:
   traffic would be plaintext on the network.
+* `limits.helloBufferBytes` below `limits.helloRewriteMaxBytes` logs a warning: large hello replies would pass through unrewritten.
 * `upstream.tls.enabled=false`, or `tls=false` in the URI, against a `+srv` URI is an error.
 * A configuration value set in the file and replaced by a different value from the environment logs a warning
   naming both sources (the container image sets some keys through the environment).
 * Errors found while building the server (unreadable cert/key/CA PEM, a listener or metrics port that cannot be bound)
-  are startup errors naming the key, exit code 3, never a stack trace.
+  are startup errors naming the key, exit code 3, never a stack trace. So are I/O, TLS and DNS failures while
+  resolving or discovering the upstream.
 
 ## 3. Forwarding path
 
@@ -161,7 +166,7 @@ That's constant work per frame. The name is recorded in the connection's pending
 `admin.$cmd`.
 
 * **R3 (client hello, `compression=strip`).** For a hello-family request carrying a
-  `compression` array, buffer the frame (≤ `helloRewriteMaxBytes`, within the `helloBufferBytes` budget, completed within 10 s), remove the element,
+  `compression` array, buffer the frame (≤ 64 KiB and `helloRewriteMaxBytes`, within the request share of the hello budget and charged by the bytes actually received (§13), completed within `helloBufferTimeoutMs`), remove the element,
   re-frame, and forward. Hello requests are never compressed (wire spec), so this is always
   possible.
 * **R1 + R2 (hello reply).** When a reply's `responseTo` matches a pending hello-family
@@ -213,14 +218,16 @@ struct FrameCapture {
   byte bound (`observeQueueBytes`) is reached it counts `queue_full` (I4). Either way the frame is
   `unobserved` and forwarding continues. An unobserved *reply* still posts a header-only item
   (`responseTo`, `requestId`, flags), so the observer releases the request it answers and keeps a
-  `moreToCome` stream chained; that op produces no record.
+  `moreToCome` stream chained; that op produces no record. At most 64 such items are outstanding per
+  connection (beyond that nothing is posted, so a stalled observer cannot grow the queue; the request
+  stays pending until it ages out or the connection closes).
 * `tap.body` copies request bytes into the slot only while `capturedLength < limit`. Replies are
   fed to the streaming scanner, which inspects and does not copy; the one exception is an
   OP_COMPRESSED reply under `compression=observe`, whose first `capture.commandBytes` are kept so
   the observer can inflate them (§8).
-* `tap.end` publishes the slot to the **observer queue**. That's an MPSC queue bounded by
-  `limits.observeQueueBytes`, counting `capturedLength`. If enqueueing would exceed the
-  bound, the slot is released and a drop is counted.
+* `tap.end` publishes the slot to the **observer queue**. The bound is `limits.observeQueueBytes`,
+  charged when the slot is claimed (`tap.begin`): a slot costs its buffer plus a fixed overhead for as
+  long as it is in use (being filled, queued or processed), whatever `capturedLength` ends up being.
 * Observer workers (default `max(1, cores/2)`) consume the queue with **per-connection
   affinity** (`connSeq mod workers`), so per-connection ordering is preserved for
   correlation (§7).
@@ -247,7 +254,9 @@ and grown only up to the queue byte bound.
    fallback on truncation; a malformed answer moves on to the next nameserver. Apply TXT options `replicaSet`
    and `authSource` per the initial-DNS-seedlist spec (URI options win). If the URI (or TXT) names a
    `replicaSet` that differs from the set the seeds report, startup fails. `directConnection=true` pins the proxy to
-   the one seed member that answered: no member discovery and no R1 rewriting.
+   the one seed member that answered: no member discovery and no R1 rewriting. Startup logs a warning
+   for it: a client that does not *also* use `directConnection=true` learns the real `hosts` and connects to the members directly,
+   bypassing the proxy without an error.
 2. Open a **monitor connection** to each seed (TLS as configured) and send
    `hello` with `{ hello: 1, helloOk: true, client: { driver: { name: "spyglass-proxy", version } } }`.
    hello requires no authentication.
@@ -332,7 +341,8 @@ Sharded and standalone hello replies get R2 only.
 
 The observer keeps a per-connection pending table: `requestId → PendingRequest{commandName,
 tFirst, tLast, capture, flags}`, bounded by `maxPendingPerConnection` (oldest evicted and
-counted) and by age: a request or exhaust stream with no reply for 10 minutes is dropped and
+counted) and by age: a request or exhaust stream with no reply for `limits.pendingMaxAgeSeconds` (default 6 h:
+index builds, `$out`, `compact` and dump-style scans outlive any minutes-scale bound) is dropped and
 counted as `pending_evicted` (no `op` record), so a lost reply can't pin memory or later surface
 as a false `connection_closed`. A client reusing an id it has no reply for is counted the same way.
 
@@ -380,7 +390,11 @@ Replies to these are reduced to `ok`/`code`/`codeName` only.
   by `"$redacted"`. Dotted paths (`{"profile.password": …}` in a filter or `$set`) match if any
   segment matches.
 * A string `"$<field>"` in an array (an aggregation expression such as `{$eq: ["$password", "hunter2"]}`)
-  whose field name matches the pattern makes the other literals of that array `"$redacted"`.
+  whose field name matches the pattern (also when wrapped in an operator, `{$toLower: "$password"}`) makes every other
+  literal of that expression `"$redacted"`, nested arrays and operators included. A `$where` string that mentions a matching
+  name is `"$redacted"`. Not covered: `$function` bodies and JavaScript that builds field names.
+* Inside `sort`, `projection`, `hint` and `$sort` specs, a numeric or boolean value is not redacted whatever the field is
+  called: it is a direction or an inclusion flag, not data (`{sort: {tokenCount: -1}}`).
 * `lsid.id` is replaced by a 16-hex-char SHA-256 prefix of its bytes. That keeps grouping by
   session without exporting the UUID.
 
@@ -410,7 +424,7 @@ machine fed by `tap.body` chunks:
 
 | Fact | Source |
 |---|---|
-| `ok`, `code`, `codeName`, `errmsg` (first 256 bytes) | top-level. `ok` other than a number ≥ 1 (0, NaN) is an error. An `errmsg` is exported under the value mode (§9.3): omitted for `shape`; otherwise every `name: value` whose name matches `redactFieldPattern` (the `dup key: { apiKey: "…" }` of an E11000) has its value replaced by `"$redacted"`, and with `truncated` quoted values are cut at `truncateStringsAt`. |
+| `ok`, `code`, `codeName`, `errmsg` (first 256 bytes) | top-level. `ok` other than a number ≥ 1 (0, NaN) is an error. An `errmsg` is exported under the value mode (§9.3): omitted for `shape`; otherwise every `name: value` whose name matches `redactFieldPattern` (the `dup key: { apiKey: "…" }` of an E11000) has its value replaced by `"$redacted"` (the name may be quoted, `{"password": …}`; a value runs to the next top-level `,` or closing bracket, quotes inside brackets honoured; the key-less `dup key: { : … }` of MongoDB < 4.2 is redacted when the `index:` name matches), and with `truncated` quoted values are cut at `truncateStringsAt`. |
 | `cursor.id`, `cursor.ns` | `cursor` subdocument |
 | `nReturned` | element count of `cursor.firstBatch` / `cursor.nextBatch`, counted by skipping each element by its length prefix |
 | `n`, `nModified`, `writeErrorsCount`, `upsertedCount`, `writeConcernError` (present?) | write replies |
@@ -440,7 +454,9 @@ Wire records (02 §4.2) are built by the observer and handed to one sender threa
   it;
 * on 429: honour `Retry-After` (delta-seconds or HTTP-date; capped at 10 s), dropping new op records meanwhile. `conn`
   records have a reserved slice of the buffer (1/16 of `bufferBytes`, on top of it) and are held through a pause, then
-  sent: losing one costs attribution for a connection's whole life;
+  sent ahead of anything sealed later: losing one costs attribution for a connection's whole life. A flush seals every
+  `conn` buffer before any op buffer, and a batch may mix the two (conn chunks first); on a pause the op chunks of a batch
+  are dropped per chunk and its conn chunks kept. Conn chunks still held when the proxy shuts down are counted as dropped;
 * the sender drains everything queued on each flush (one batch per interval would cap export at
   `batchMaxBytes` per `flushIntervalMs`) and wakes early when either batch limit is reached; an
   exception in a flush is logged and the loop continues.
@@ -496,7 +512,7 @@ servers, so they can't stay open). Histogram `le` labels print as the shortest r
 | Member down | New client connections to its listener fail fast at upstream connect. Existing connections close when the upstream does. |
 | Invalid frame | Fail closed (§3.2). |
 | Rewrite failure | Forward unmodified (§3.3). |
-| Proxy OOM risk | Can't happen by construction: all buffers are bounded by config. Total = `observeQueueBytes + bufferBytes + helloBufferBytes + connections × 2 × readBufferBytes`. Hello frames are buffered only inside the process-wide `helloBufferBytes` budget (over it the frame passes through unmodified, `rewrite_skipped{reason="budget"}`) and a frame that is not complete within 10 s closes the connection (`invalid_frame`). Log the computed worst case at startup. |
+| Proxy OOM risk | Can't happen by construction: all buffers are bounded by config. Total = `observeQueueBytes + bufferBytes + bufferBytes/16` (the reserved `conn` slice, §11) `+ helloBufferBytes + max(4096, helloBufferBytes/4)` (hello replies and requests) `+ workers × 16 MiB` (only `compression=observe`: the per-worker inflate target) `+ connections × (2 × readBufferBytes + 64 slot-less reply notices)`. Hello replies are buffered only inside the `helloBufferBytes` budget. Hello requests come from unauthenticated clients, so they have a separate budget (they can never starve reply rewriting), are never buffered above 64 KiB, and are charged by the bytes actually received, not by the length the header declares. Over a budget the frame passes through unmodified (`rewrite_skipped{reason="budget"}` or `"too_large"`); a hello frame not complete within `helloBufferTimeoutMs` (10 s) closes the connection with `closeReason=hello_timeout` (no `invalidHeader`). Log the computed worst case at startup. |
 
 ## 14. Performance budget (enforced by 06 §4)
 

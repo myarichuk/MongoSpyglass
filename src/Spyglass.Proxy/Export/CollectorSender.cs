@@ -27,6 +27,7 @@ internal sealed class RecordBuffer
     private readonly CollectorSender _sender;
     private readonly bool _reserved;
     private readonly RecordBuffer? _before;
+    internal bool IsReserved => _reserved;
     private RecordChunk? _current;
 
     /// <param name="before">
@@ -125,7 +126,10 @@ internal sealed class CollectorSender : IAsyncDisposable
     private readonly int _chunkBytes;
     private long _chargedBytes, _reservedBytes;
     private readonly long _reservedBound;
-    private int _readyRecords, _readyBytes;
+    private int _readyRecords;
+    private long _readyBytes;
+    /// <summary>Conn chunks that outlived a 429 pause, oldest first; only the sender loop touches it. Sent ahead of anything sealed later.</summary>
+    private List<RecordChunk> _held = [];
     private long _pausedUntil; // Environment.TickCount64
     private Task? _loop;
 
@@ -256,66 +260,94 @@ internal sealed class CollectorSender : IAsyncDisposable
         using var final = new CancellationTokenSource(TimeSpan.FromSeconds(1));
         try { await FlushAsync(final.Token).ConfigureAwait(false); }
         catch (OperationCanceledException) { }
+        catch (Exception e) { Log.Warn($"collector sender: final flush: {e.GetType().Name}: {e.Message}"); }
+        // whatever is left (still paused, flush cut short) is lost: count it, so delivered + dropped stays whole
+        foreach (var c in _held) { Drop(c.Records); Release(c); }
+        _held.Clear();
+        while (_ready.TryDequeue(out var c))
+        {
+            Interlocked.Add(ref _readyRecords, -c.Records);
+            Interlocked.Add(ref _readyBytes, -c.Length);
+            Drop(c.Records);
+            Release(c);
+        }
     }
 
     private async Task FlushAsync(CancellationToken ct)
     {
         RecordBuffer[] buffers;
         lock (_buffers) buffers = _buffers.ToArray();
+        // conn buffers first, then the op buffers: every connection's open record is sealed ahead of the ops that
+        // came with it, and the batches stay full instead of alternating conn | op | conn | op (FP-7)
         foreach (var b in buffers)
-            b.Flush();
+            if (b.IsReserved) b.Flush();
+        foreach (var b in buffers)
+            if (!b.IsReserved) b.Flush();
 
         // Drain everything sealed so far: batches are size-capped already, and sending one per interval capped
         // export at batchMaxBytes per flushIntervalMs (records over ~bufferBytes/batchMaxRecords never reach the record limit).
-        List<RecordChunk>? held = null; // conn chunks that outlive a 429 pause
+        // Chunks held through an earlier pause go first (a connection's open record before the ops sealed since); the ones
+        // that are held again, or newly held, become the next flush's carry.
+        var carry = _held;
+        var nextHeld = new List<RecordChunk>();
+        var carryAt = 0;
         try
         {
-            while (!_ready.IsEmpty)
+            while (carryAt < carry.Count || !_ready.IsEmpty)
             {
-                var batch = TakeBatch();
+                var batch = TakeBatch(carry, ref carryAt);
                 if (batch.Chunks.Count == 0) return;
                 try
                 {
                     if (Paused)
-                    {
-                        if (batch.Reserved) batch.Retain = true;
-                        else Drop(batch.Records);
-                        continue;
-                    }
-                    await SendAsync(batch, splitAllowed: !batch.Reserved, ct).ConfigureAwait(false);
+                        DropForPause(batch);
+                    else
+                        await SendAsync(batch, splitAllowed: batch.ReservedRecords == 0, ct).ConfigureAwait(false);
                 }
                 finally
                 {
-                    if (batch.Retain) (held ??= []).AddRange(batch.Chunks);
-                    else foreach (var c in batch.Chunks) Release(c);
+                    foreach (var c in batch.Chunks)
+                    {
+                        if (batch.Retain && c.Reserved) nextHeld.Add(c);
+                        else Release(c);
+                    }
                 }
             }
         }
         finally
         {
-            if (held != null)
-                foreach (var c in held)
-                {
-                    _ready.Enqueue(c);
-                    Interlocked.Add(ref _readyRecords, c.Records);
-                    Interlocked.Add(ref _readyBytes, c.Length);
-                }
+            // an exception leaves the rest of the carry where it was
+            for (; carryAt < carry.Count; carryAt++) nextHeld.Add(carry[carryAt]);
+            _held = nextHeld;
         }
     }
 
-    private Batch TakeBatch()
+    /// <summary>A 429 pause: op records are dropped, conn records ride it out (PLAN 1.2: tiny and few, resent after the pause).</summary>
+    private void DropForPause(Batch batch)
+    {
+        if (batch.ReservedRecords > 0) batch.Retain = true;
+        Drop(batch.Records - batch.ReservedRecords);
+    }
+
+    private Batch TakeBatch(List<RecordChunk> carry, ref int carryAt)
     {
         var batch = new Batch();
-        while (_ready.TryPeek(out var c))
+        while (true)
         {
+            RecordChunk? c;
+            var fromCarry = carryAt < carry.Count;
+            if (fromCarry) c = carry[carryAt];
+            else if (!_ready.TryPeek(out c)) break;
             if (batch.Chunks.Count > 0 &&
-                (batch.Records + c.Records > _config.BatchMaxRecords || batch.Bytes + c.Length > _config.BatchMaxBytes ||
-                 c.Reserved != batch.Reserved))
+                (batch.Records + c.Records > _config.BatchMaxRecords || batch.Bytes + c.Length > _config.BatchMaxBytes))
                 break;
-            _ready.TryDequeue(out _);
-            Interlocked.Add(ref _readyRecords, -c.Records);
-            Interlocked.Add(ref _readyBytes, -c.Length);
-            batch.Reserved = c.Reserved;
+            if (fromCarry) carryAt++;
+            else
+            {
+                _ready.TryDequeue(out _);
+                Interlocked.Add(ref _readyRecords, -c.Records);
+                Interlocked.Add(ref _readyBytes, -c.Length);
+            }
             batch.Add(c);
         }
         return batch;
@@ -374,8 +406,7 @@ internal sealed class CollectorSender : IAsyncDisposable
                 case 429:
                     var pause = retryAfter is { } wait ? TimeSpan.FromSeconds(Math.Clamp(wait.TotalSeconds, 0, 10)) : TimeSpan.FromSeconds(1);
                     Volatile.Write(ref _pausedUntil, Environment.TickCount64 + (long)pause.TotalMilliseconds);
-                    if (batch.Reserved) batch.Retain = true; // conn records are tiny and few: resent after the pause
-                    else Drop(batch.Records);
+                    DropForPause(batch);
                     return;
             }
 
@@ -411,13 +442,14 @@ internal sealed class CollectorSender : IAsyncDisposable
         public readonly List<RecordChunk> Chunks = [];
         public readonly List<Segment> Segments = [];
         public int Records, Bytes;
-        /// <summary>Only conn chunks (<see cref="RecordChunk.Reserved"/>): a batch never mixes them with ops.</summary>
-        public bool Reserved;
-        /// <summary>Chunks go back to the ready queue instead of the pool (conn batch held through a 429 pause).</summary>
+        /// <summary>Records in conn chunks (<see cref="RecordChunk.Reserved"/>): they come first in a batch and survive a 429 pause.</summary>
+        public int ReservedRecords;
+        /// <summary>The conn chunks are held for the next flush instead of released (429 pause).</summary>
         public bool Retain;
 
         public void Add(RecordChunk c)
         {
+            if (c.Reserved) ReservedRecords += c.Records;
             Chunks.Add(c);
             Add(new Segment(c.Buffer, 0, c.Length, c.Records));
         }

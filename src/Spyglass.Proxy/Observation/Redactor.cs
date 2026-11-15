@@ -84,12 +84,15 @@ internal sealed class Redactor
     }
 
     /// <returns>true if the source document was truncated or malformed.</returns>
-    private bool WriteElements(BsonWriter w, ReadOnlySpan<byte> doc, int depth, bool topLevel, bool isHello, bool isArray = false)
+    /// <param name="structural">Inside a <c>sort</c> / <c>projection</c> / <c>hint</c> spec: numeric and boolean values are directions and flags, not data, whatever the field is called.</param>
+    /// <param name="inheritRedact">Inside an expression that compares a secret field path (see <see cref="HasSecretPath"/>): every literal below is redacted.</param>
+    private bool WriteElements(BsonWriter w, ReadOnlySpan<byte> doc, int depth, bool topLevel, bool isHello, bool isArray = false,
+        bool structural = false, bool inheritRedact = false)
     {
         var elements = Bson.Elements(doc);
         var index = 0;
         Span<byte> scratch = stackalloc byte[12];
-        var redactLiterals = isArray && HasSecretPath(doc);
+        var redactLiterals = inheritRedact || (isArray && HasSecretPath(doc, 0));
         while (elements.MoveNext())
         {
             var e = elements.Current;
@@ -106,7 +109,9 @@ internal sealed class Redactor
             }
             index++;
 
-            if ((topLevel && isHello && e.NameIs("speculativeAuthenticate"u8)) || NameMatches(e.Name))
+            if ((topLevel && isHello && e.NameIs("speculativeAuthenticate"u8)) ||
+                (NameMatches(e.Name) && !(structural && e.Type is BsonType.Int32 or BsonType.Int64 or BsonType.Double or BsonType.Decimal128 or BsonType.Boolean)) ||
+                (e.Type is BsonType.String or BsonType.JavaScript && e.NameIs("$where"u8) && TextMentionsSecret(e.StringBytes)))
             {
                 w.WriteStringUtf8(e.Name, "$redacted"u8);
                 continue;
@@ -137,12 +142,15 @@ internal sealed class Redactor
                 continue;
             }
 
-            WriteValue(w, e, depth);
+            WriteValue(w, e, depth, structural || IsStructuralName(e.Name), redactLiterals);
         }
         return elements.Truncated || elements.Malformed;
     }
 
-    private void WriteValue(BsonWriter w, in BsonElement e, int depth)
+    private static bool IsStructuralName(ReadOnlySpan<byte> name) =>
+        name.SequenceEqual("sort"u8) || name.SequenceEqual("projection"u8) || name.SequenceEqual("hint"u8) || name.SequenceEqual("$sort"u8);
+
+    private void WriteValue(BsonWriter w, in BsonElement e, int depth, bool structural, bool redactLiterals)
     {
         switch (e.Type)
         {
@@ -155,7 +163,8 @@ internal sealed class Redactor
                 }
                 if (e.Type == BsonType.Document) w.StartDocument(e.Name);
                 else w.StartArray(e.Name);
-                WriteElements(w, e.Value, depth + 1, topLevel: false, isHello: false, isArray: e.Type == BsonType.Array);
+                WriteElements(w, e.Value, depth + 1, topLevel: false, isHello: false, isArray: e.Type == BsonType.Array,
+                    structural: structural, inheritRedact: redactLiterals);
                 w.EndDocument();
                 return;
         }
@@ -245,17 +254,32 @@ internal sealed class Redactor
         w.PatchInt32(start, w.Length - start);
     }
 
-    /// <summary>True when an array holds a field path (<c>"$password"</c>) whose name the pattern redacts.</summary>
-    private bool HasSecretPath(ReadOnlySpan<byte> arrayDoc)
+    /// <summary>
+    /// True when an expression array holds a field path (<c>"$password"</c>) whose name the pattern redacts, directly or inside
+    /// an operator document of it (<c>{$toLower: "$password"}</c>). The literals of the whole expression are then redacted
+    /// (<c>$eq</c>, <c>$in</c>, <c>$cond</c>, ...). Not covered: <c>$function</c> bodies and JavaScript that builds names.
+    /// </summary>
+    private bool HasSecretPath(ReadOnlySpan<byte> doc, int level)
     {
-        foreach (var e in Bson.Elements(arrayDoc))
+        foreach (var e in Bson.Elements(doc))
         {
+            if (e.Type == BsonType.Document && level < 4 && HasSecretPath(e.Value, level + 1))
+                return true;
             if (e.Type != BsonType.String) continue;
             var s = e.StringBytes;
             if (s.Length > 1 && s[0] == (byte)'$' && s[1] != (byte)'$' && NameMatches(s[1..]))
                 return true;
         }
         return false;
+    }
+
+    /// <summary>Server-side JavaScript (<c>$where</c>) that names a secret field: <c>this.password == 'x'</c> carries the secret in the code.</summary>
+    private bool TextMentionsSecret(ReadOnlySpan<byte> text)
+    {
+        if (text.Length > 2048) return true; // too long to scan cheaply: redact
+        Span<char> chars = stackalloc char[text.Length];
+        var n = Encoding.UTF8.GetChars(text, chars);
+        return _fieldPattern.IsMatch(chars[..n]);
     }
 
     /// <summary>
@@ -270,6 +294,7 @@ internal sealed class Redactor
         var copied = 0;
         var i = 0;
         var buf = _errmsg;
+        bool? indexSecret = null;
         while (i < msg.Length)
         {
             var rel = msg[i..].IndexOf((byte)':');
@@ -277,14 +302,33 @@ internal sealed class Redactor
             var p = i + rel;
             i = p + 1;
             var ts = p;
+            var te = p;
             while (ts > copied && IsNameByte(msg[ts - 1])) ts--;
+            if (ts == p && p > copied && msg[p - 1] is (byte)'"' or (byte)'\'')
+            {
+                // a quoted key: {"password": "x"}
+                var q = msg[p - 1];
+                var k = p - 2;
+                while (k >= copied && msg[k] != q) k--;
+                if (k >= copied) { ts = k + 1; te = p - 1; }
+            }
             var vs = p + 1;
             while (vs < msg.Length && msg[vs] == (byte)' ') vs++;
             if (vs >= msg.Length) break;
 
-            if (ts < p && NameMatches(msg[ts..p]))
+            bool secret;
+            if (ts < te) secret = NameMatches(msg[ts..te]);
+            else
             {
-                var end = ValueEnd(msg, vs);
+                // `dup key: { : "v" }` (MongoDB < 4.2 leaves the key names out): the index name says which fields they are
+                var b = p;
+                while (b > copied && msg[b - 1] == (byte)' ') b--;
+                secret = b > 0 && msg[b - 1] is (byte)'{' or (byte)',' && (indexSecret ??= IndexNameIsSecret(msg));
+            }
+
+            if (secret)
+            {
+                var end = ValueEnd(msg, vs, toClauseEnd: true);
                 Put(buf, ref o, msg[copied..vs]);
                 Put(buf, ref o, "\"$redacted\""u8);
                 copied = i = end;
@@ -305,6 +349,17 @@ internal sealed class Redactor
         return buf.AsSpan(0, o);
     }
 
+    /// <summary>The token after <c>index: </c> (<c>app.users.$apiKey_1</c>, <c>apiKey_1_user_1</c>) matches the redaction pattern.</summary>
+    private bool IndexNameIsSecret(ReadOnlySpan<byte> msg)
+    {
+        var at = msg.IndexOf("index: "u8);
+        if (at < 0) return false;
+        var token = msg[(at + 7)..];
+        var end = token.IndexOfAny((byte)' ', (byte)',');
+        if (end >= 0) token = token[..end];
+        return token.Length > 0 && NameMatches(token);
+    }
+
     private static void Put(byte[] buf, ref int o, ReadOnlySpan<byte> b)
     {
         var n = Math.Min(b.Length, buf.Length - o);
@@ -315,8 +370,12 @@ internal sealed class Redactor
     private static bool IsNameByte(byte b) => b is >= (byte)'a' and <= (byte)'z' or >= (byte)'A' and <= (byte)'Z' or >= (byte)'0' and <= (byte)'9'
         or (byte)'_' or (byte)'.' or (byte)'$' or (byte)'-' or >= 0x80;
 
-    /// <summary>End (exclusive) of the value starting at <paramref name="vs"/> in a server message: a quoted string, or up to the next top-level separator.</summary>
-    private static int ValueEnd(ReadOnlySpan<byte> m, int vs)
+    /// <summary>
+    /// End (exclusive) of the value starting at <paramref name="vs"/> in a server message: a quoted string, or up to the next
+    /// top-level separator. Quotes inside braces and brackets are skipped as strings. With <paramref name="toClauseEnd"/> (a value
+    /// that is being redacted) a space does not end an unquoted value: <c>password: my pass phrase</c> goes whole.
+    /// </summary>
+    private static int ValueEnd(ReadOnlySpan<byte> m, int vs, bool toClauseEnd = false)
     {
         var j = vs;
         if (m[j] is (byte)'"' or (byte)'\'')
@@ -330,6 +389,7 @@ internal sealed class Redactor
             return m.Length;
         }
         var depth = 0;
+        var closed = false; // a bracketed value ended: a space after it ends the value even when redacting
         for (; j < m.Length; j++)
         {
             var c = m[j];
@@ -337,9 +397,15 @@ internal sealed class Redactor
             else if (c is (byte)')' or (byte)'}' or (byte)']')
             {
                 if (depth == 0) break;
-                depth--;
+                if (--depth == 0) closed = true;
             }
-            else if (depth == 0 && c is (byte)',' or (byte)' ') break;
+            else if (depth > 0 && c is (byte)'"' or (byte)'\'')
+            {
+                for (j++; j < m.Length && m[j] != c; j++)
+                    if (m[j] == (byte)'\\') j++;
+                if (j >= m.Length) return m.Length;
+            }
+            else if (depth == 0 && (c == (byte)',' || (c == (byte)' ' && (!toClauseEnd || closed)))) break;
         }
         return j;
     }

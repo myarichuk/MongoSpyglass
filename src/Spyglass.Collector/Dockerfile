@@ -31,6 +31,8 @@ COPY src/Spyglass.Collector/ src/Spyglass.Collector/
 COPY src/Spyglass.Collector.Ui/ src/Spyglass.Collector.Ui/
 # The UI is WebAssembly: built once, the same for every architecture. Its CSS is the committed
 # wwwroot/css/app.css (tools/collector/publish.sh rebuilds it with Tailwind when node is around).
+# The image has no node, so say so in the build log: a Razor class added since app.css was last rebuilt is unstyled.
+RUN echo "NOTE: shipping the committed src/Spyglass.Collector.Ui/wwwroot/css/app.css ($(wc -c < src/Spyglass.Collector.Ui/wwwroot/css/app.css) bytes); run tools/collector/publish.sh and commit it after changing UI classes" >&2
 RUN --mount=type=cache,id=spyglass-nuget,target=/root/.nuget/packages \
     dotnet publish src/Spyglass.Collector.Ui/Spyglass.Collector.Ui.csproj -c Release --no-restore -o /out/ui && \
     dotnet publish src/Spyglass.Collector/Spyglass.Collector.csproj -c Release --no-restore -a $TARGETARCH \

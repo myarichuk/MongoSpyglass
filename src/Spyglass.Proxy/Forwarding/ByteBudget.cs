@@ -5,6 +5,8 @@ internal sealed class ByteBudget(long limit)
 {
     private long _used;
 
+    public long Limit => limit;
+
     public long Used => Volatile.Read(ref _used);
 
     public bool TryAcquire(long bytes)

@@ -8,6 +8,10 @@ internal enum CloseReason
     UpstreamConnectFailed,
     TlsFailed,
     ProxyShutdown,
+    /// <summary>A hello frame being buffered for rewriting stalled past <c>limits.helloBufferTimeoutMs</c> (01 §13).</summary>
+    HelloTimeout,
+    /// <summary>Frame processing threw; the connection failed closed (01 §3.2).</summary>
+    ProcessingFault,
 }
 
 /// <summary>Connection lifecycle and per-direction taps for the observation side (01 §4).</summary>
@@ -35,6 +39,8 @@ internal static class CloseReasonNames
         CloseReason.InvalidFrame => "invalid_frame",
         CloseReason.UpstreamConnectFailed => "upstream_connect_failed",
         CloseReason.TlsFailed => "tls_failed",
+        CloseReason.HelloTimeout => "hello_timeout",
+        CloseReason.ProcessingFault => "processing_fault",
         _ => "proxy_shutdown",
     };
 }

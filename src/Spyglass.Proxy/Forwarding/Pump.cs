@@ -18,6 +18,10 @@ internal enum PumpEnd
     /// <summary>Writing to the destination failed.</summary>
     DestinationFailed,
     InvalidFrame,
+    /// <summary>A hello frame being buffered for rewriting did not complete in time (01 §13); not an invalid frame.</summary>
+    HelloTimeout,
+    /// <summary>The frame processing code threw; the connection fails closed (01 §3.2).</summary>
+    ProcessingFault,
     Cancelled,
 }
 
@@ -35,8 +39,10 @@ internal sealed class Pump
 {
     private enum State { Header, Pass, Buffer }
 
-    /// <summary>A hello frame being buffered for rewriting must complete within this (01 §13): a stalled peer is not waited on forever.</summary>
-    internal static TimeSpan HelloBufferTimeout = TimeSpan.FromSeconds(10);
+    /// <summary>A client hello is a few hundred bytes (&lt; 4 KB in practice); a request frame declaring more than this is passed through, not buffered (01 §13).</summary>
+    internal const int RequestHelloMaxBytes = 64 * 1024;
+    /// <summary>First budget charge for a request being buffered; further charges follow the bytes actually received.</summary>
+    private const int RequestReserveStep = 4096;
 
     private readonly Stream _src;
     private readonly Stream _dst;
@@ -61,7 +67,7 @@ internal sealed class Pump
     private int _remaining;     // body bytes of the current Pass frame still to come
     private FrameHeader _header;
     private byte[]? _frame;     // Buffer state: whole frame
-    private int _frameReserved; // bytes of the process-wide hello budget held for _frame
+    private int _frameReserved; // bytes of the hello budget held for _frame (replies: the whole frame; requests: grows with the bytes received, FP-1)
     private CancellationTokenSource? _bufferCts; // deadline of an incomplete buffered frame
     private int _frameFilled;
     private RequestKind _kind;
@@ -125,9 +131,8 @@ internal sealed class Pump
                 }
                 catch (OperationCanceledException) when (_bufferCts != null)
                 {
-                    Failure = new TimeoutException($"hello frame not completed within {HelloBufferTimeout.TotalSeconds:0} s");
-                    InvalidFrameHeaderHex = "hello_buffer_timeout";
-                    return PumpEnd.InvalidFrame;
+                    Failure = new TimeoutException($"hello frame not completed within {_config.Limits.HelloBufferTimeoutMs / 1000.0:0.###} s");
+                    return PumpEnd.HelloTimeout;
                 }
                 catch (Exception e) when (e is IOException or SocketException or ObjectDisposedException)
                 {
@@ -158,15 +163,14 @@ internal sealed class Pump
                     // A parser fault must never escape the pump: fail the connection closed like an invalid frame (01 §3.2).
                     Log.Warn($"conn {_conn.ConnSeq}: frame processing fault: {e.GetType().Name}: {e.Message}");
                     Failure = e;
-                    InvalidFrameHeaderHex = "processing_fault";
-                    return PumpEnd.InvalidFrame;
+                    return PumpEnd.ProcessingFault;
                 }
                 if (r != null)
                     return r.Value;
                 if (_state == State.Buffer && _bufferCts == null)
                 {
                     _bufferCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                    _bufferCts.CancelAfter(HelloBufferTimeout);
+                    _bufferCts.CancelAfter(_config.Limits.HelloBufferTimeoutMs);
                 }
                 if (now - _lastFlush > FlushTicks)
                     FlushStats(now);
@@ -186,11 +190,13 @@ internal sealed class Pump
         }
     }
 
+    private ByteBudget FrameBudget => _isRequest ? _conn.Server.HelloRequestBuffers : _conn.Server.HelloBuffers;
+
     private void ReleaseFrameBudget()
     {
         if (_frameReserved != 0)
         {
-            _conn.Server.HelloBuffers.Release(_frameReserved);
+            FrameBudget.Release(_frameReserved);
             _frameReserved = 0;
         }
         if (_bufferCts != null)
@@ -268,7 +274,7 @@ internal sealed class Pump
                         // Flush pass-through bytes that precede this frame, then accumulate it whole.
                         if (p > fwdStart && !await WriteAsync(fwdStart, p - fwdStart, ct).ConfigureAwait(false))
                             return PumpEnd.DestinationFailed;
-                        _frame = ArrayPool<byte>.Shared.Rent(h.MessageLength);
+                        _frame = ArrayPool<byte>.Shared.Rent(_frameReserved);
                         _frameFilled = 0;
                         _state = State.Buffer;
                         fwdStart = p; // consumed by Buffer below; reset after copying
@@ -303,7 +309,18 @@ internal sealed class Pump
 
                 case State.Buffer:
                 {
-                    var n = Math.Min(_header.MessageLength - _frameFilled, total - p);
+                    var room = Math.Min(_header.MessageLength, _frameReserved) - _frameFilled;
+                    if (room == 0)
+                    {
+                        // more bytes have arrived than the request budget was charged for: charge them now, or stop buffering
+                        if (GrowFrame())
+                            break;
+                        if (!await AbandonBufferingAsync(ct).ConfigureAwait(false))
+                            return PumpEnd.DestinationFailed;
+                        fwdStart = p;
+                        break;
+                    }
+                    var n = Math.Min(room, total - p);
                     Buffer.BlockCopy(_buf, p, _frame!, _frameFilled, n);
                     _frameFilled += n;
                     p += n;
@@ -339,20 +356,67 @@ internal sealed class Pump
         return null;
     }
 
-    /// <summary>Reserves the hello-buffer budget for a frame about to be buffered; counts the skip when it can't be.</summary>
+    /// <summary>
+    /// Reserves the hello-buffer budget for a frame about to be buffered; counts the skip when it can't be. Replies (from
+    /// the trusted server) reserve the whole frame from their own budget; requests (any client, unauthenticated) draw on a
+    /// separate budget, are capped at <see cref="RequestHelloMaxBytes"/> and are charged by the bytes actually received,
+    /// so declared lengths cannot be used to starve reply rewriting (FP-1, 01 §13).
+    /// </summary>
     private bool ReserveFrame(int length)
     {
-        if (length > _config.Limits.HelloRewriteMaxBytes)
+        if (length > _config.Limits.HelloRewriteMaxBytes || (_isRequest && length > RequestHelloMaxBytes))
         {
             _conn.Server.Metrics.RewritesSkipped.WithLabels("too_large").Inc();
             return false;
         }
-        if (!_conn.Server.HelloBuffers.TryAcquire(length))
+        var charge = _isRequest ? Math.Min(length, RequestReserveStep) : length;
+        if (!FrameBudget.TryAcquire(charge))
         {
             _conn.Server.Metrics.RewritesSkipped.WithLabels("budget").Inc();
             return false;
         }
-        _frameReserved = length;
+        _frameReserved = charge;
+        return true;
+    }
+
+    /// <summary>Request side: doubles the charge (capped at the declared length) and the buffer. False when the budget refuses.</summary>
+    private bool GrowFrame()
+    {
+        var want = Math.Min(_header.MessageLength, _frameReserved * 2);
+        if (!FrameBudget.TryAcquire(want - _frameReserved))
+            return false;
+        var bigger = ArrayPool<byte>.Shared.Rent(want);
+        Buffer.BlockCopy(_frame!, 0, bigger, 0, _frameFilled);
+        ArrayPool<byte>.Shared.Return(_frame!);
+        _frame = bigger;
+        _frameReserved = want;
+        return true;
+    }
+
+    /// <summary>The budget ran out mid-frame: forward what was buffered and carry on as a pass-through frame (header and inspect window are always inside the first charge).</summary>
+    private async ValueTask<bool> AbandonBufferingAsync(CancellationToken ct)
+    {
+        _conn.Server.Metrics.RewritesSkipped.WithLabels("budget").Inc();
+        var frame = _frame!;
+        var filled = _frameFilled;
+        _frame = null;
+        try
+        {
+            _tap.Body(frame.AsSpan(FrameHeader.Size, filled - FrameHeader.Size));
+            await _dst.WriteAsync(frame.AsMemory(0, filled), ct).ConfigureAwait(false);
+        }
+        catch (Exception e) when (e is IOException or SocketException or ObjectDisposedException or OperationCanceledException)
+        {
+            Failure = e;
+            return false;
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(frame);
+            ReleaseFrameBudget();
+        }
+        _remaining = _header.MessageLength - filled;
+        _state = State.Pass;
         return true;
     }
 

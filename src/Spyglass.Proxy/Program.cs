@@ -50,6 +50,16 @@ void Stop()
     catch (ObjectDisposedException) { }
 }
 
+Console.CancelKeyPress += (_, e) =>
+{
+    e.Cancel = true;
+    Stop();
+};
+// `docker stop` sends SIGTERM: take the graceful path (close connections with proxy_shutdown, flush the sender) instead of dying with 143.
+// Declared before the server so they are disposed after it: a second TERM during the graceful shutdown (up to ~13 s) must not kill the flush.
+using var sigterm = System.Runtime.InteropServices.PosixSignalRegistration.Create(System.Runtime.InteropServices.PosixSignal.SIGTERM, c => { c.Cancel = true; Stop(); });
+using var sigquit = System.Runtime.InteropServices.PosixSignalRegistration.Create(System.Runtime.InteropServices.PosixSignal.SIGQUIT, c => { c.Cancel = true; Stop(); });
+
 ProxyServer server;
 try
 {
@@ -62,27 +72,21 @@ catch (Exception e) when (e is ConfigException or System.Security.Cryptography.C
 }
 await using var disposeServer = server;
 
-Console.CancelKeyPress += (_, e) =>
-{
-    e.Cancel = true;
-    Stop();
-};
-// `docker stop` sends SIGTERM: take the graceful path (close connections with proxy_shutdown, flush the sender) instead of dying with 143.
-using var sigterm = System.Runtime.InteropServices.PosixSignalRegistration.Create(System.Runtime.InteropServices.PosixSignal.SIGTERM, c => { c.Cancel = true; Stop(); });
-using var sigquit = System.Runtime.InteropServices.PosixSignalRegistration.Create(System.Runtime.InteropServices.PosixSignal.SIGQUIT, c => { c.Cancel = true; Stop(); });
-
 try
 {
     await server.StartAsync(stop.Token);
 }
-catch (ConfigException e)
-{
-    Log.Error($"startup failed: {e.Message}");
-    return 3;
-}
 catch (OperationCanceledException)
 {
     return 0;
+}
+catch (Exception e) when (e is ConfigException or System.IO.IOException or System.Net.Sockets.SocketException or TimeoutException
+                              or System.Security.Authentication.AuthenticationException or System.Security.Cryptography.CryptographicException
+                              or System.Net.Http.HttpRequestException or FormatException)
+{
+    // 01 §2: startup errors name the cause and exit 3, never a stack trace (SRV resolution, upstream TLS during discovery, ...)
+    Log.Error($"startup failed: {e.Message}");
+    return 3;
 }
 
 try

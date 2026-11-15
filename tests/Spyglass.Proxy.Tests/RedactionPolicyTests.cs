@@ -157,4 +157,137 @@ public sealed class RedactionPolicyTests
         Assert.Equal("no pairs here", Scrub("no pairs here"));
         Assert.Equal("a: 1: b", Scrub("a: 1: b"));
     }
+
+    [Theory]
+    [InlineData(ValueMode.Full)]
+    [InlineData(ValueMode.Truncated)]
+    public void Errmsg_scrub_closes_the_spelling_gaps_of_server_messages(ValueMode mode)
+    {
+        var r = new Redactor(new CaptureConfig { Values = mode });
+        string Scrub(string m) => System.Text.Encoding.UTF8.GetString(r.ScrubErrmsg(System.Text.Encoding.UTF8.GetBytes(m)));
+
+        // MongoDB < 4.2 leaves the key names out of dup key: the index name says which fields they are (FP-4)
+        var legacy = Scrub("E11000 duplicate key error index: app.users.$apiKey_1 dup key: { : \"sk_live_123\" }");
+        Assert.DoesNotContain("sk_live_123", legacy);
+        Assert.Contains("index: app.users.$apiKey_1", legacy);
+        Assert.Equal("E11000 duplicate key error index: app.users.$name_1 dup key: { : \"bob\" }",
+            Scrub("E11000 duplicate key error index: app.users.$name_1 dup key: { : \"bob\" }")); // not a secret index: untouched
+
+        // extended-JSON style: the key is a quoted token
+        var json = Scrub("Document failed: {\"password\": \"hunter2\", \"n\": 1}");
+        Assert.DoesNotContain("hunter2", json);
+        Assert.Contains("\"n\": 1", json);
+        Assert.DoesNotContain("hunter2", Scrub("Document failed: {'password': 'hunter2'}"));
+
+        // quotes inside a braced value do not end it early: the rest of the document is still the value
+        var braces = Scrub("Plan executor error :: token: { $gt: \"a}b\", leak: \"zzz\" } trailing");
+        Assert.DoesNotContain("zzz", braces);
+        Assert.DoesNotContain("a}b", braces);
+        Assert.EndsWith("trailing", braces);
+
+        // a value with spaces goes whole
+        var spaced = Scrub("bad password: my pass phrase, n: 1");
+        Assert.DoesNotContain("pass phrase", spaced);
+        Assert.Contains("n: 1", spaced);
+    }
+
+    [Fact]
+    public void Literals_next_to_a_secret_path_are_redacted_through_nested_arrays_and_operators()
+    {
+        // FP-5: the literal list is a nested array; the path is wrapped in an operator
+        var nested = Redact(new BsonDocument
+        {
+            ["find"] = "users",
+            ["filter"] = new BsonDocument("$expr", new BsonDocument("$in", new BsonArray { "$password", new BsonArray { "hunter2", "letmein" } })),
+        });
+        Assert.DoesNotContain("hunter2", nested.ToJson());
+        Assert.DoesNotContain("letmein", nested.ToJson());
+        Assert.Equal("$password", nested["filter"]["$expr"]["$in"][0].AsString);
+
+        var wrapped = Redact(new BsonDocument
+        {
+            ["find"] = "users",
+            ["filter"] = new BsonDocument("$expr", new BsonDocument("$eq", new BsonArray { new BsonDocument("$toLower", "$password"), "hunter2" })),
+        });
+        Assert.DoesNotContain("hunter2", wrapped.ToJson());
+
+        // an unrelated clause of the same $and keeps its literals
+        var and = Redact(new BsonDocument
+        {
+            ["find"] = "users",
+            ["filter"] = new BsonDocument("$expr", new BsonDocument("$and", new BsonArray
+            {
+                new BsonDocument("$eq", new BsonArray { "$password", "hunter2" }),
+                new BsonDocument("$eq", new BsonArray { "$name", "bob" }),
+            })),
+        });
+        Assert.DoesNotContain("hunter2", and.ToJson());
+        Assert.Equal("bob", and["filter"]["$expr"]["$and"][1]["$eq"][1].AsString);
+    }
+
+    [Fact]
+    public void Where_javascript_that_names_a_secret_field_is_redacted()
+    {
+        var doc = Redact(new BsonDocument { ["find"] = "users", ["filter"] = new BsonDocument("$where", "this.password == 'hunter2'") });
+        Assert.DoesNotContain("hunter2", doc.ToJson());
+        var ok = Redact(new BsonDocument { ["find"] = "users", ["filter"] = new BsonDocument("$where", "this.age > 18") });
+        Assert.Equal("this.age > 18", ok["filter"]["$where"].AsString);
+    }
+
+    [Fact]
+    public void Sort_projection_and_hint_values_are_directions_not_data()
+    {
+        // FP-16: tokenCount / password are field names there; -1 and 0 are the sort direction and the exclusion flag
+        var doc = Redact(new BsonDocument
+        {
+            ["find"] = "users",
+            ["filter"] = new BsonDocument("password", "hunter2"),
+            ["sort"] = new BsonDocument("tokenCount", -1),
+            ["projection"] = new BsonDocument { ["password"] = 0, ["secretLevel"] = true },
+            ["hint"] = new BsonDocument("apiKey", 1),
+        });
+        Assert.Equal("$redacted", doc["filter"]["password"].AsString); // data is still redacted
+        Assert.Equal(-1, doc["sort"]["tokenCount"].AsInt32);
+        Assert.Equal(0, doc["projection"]["password"].AsInt32);
+        Assert.True(doc["projection"]["secretLevel"].AsBoolean);
+        Assert.Equal(1, doc["hint"]["apiKey"].AsInt32);
+
+        var pipeline = Redact(new BsonDocument
+        {
+            ["aggregate"] = "users",
+            ["pipeline"] = new BsonArray { new BsonDocument("$sort", new BsonDocument("tokenCount", -1)), new BsonDocument("$match", new BsonDocument("token", "t-1")) },
+        });
+        Assert.Equal(-1, pipeline["pipeline"][0]["$sort"]["tokenCount"].AsInt32);
+        Assert.Equal("$redacted", pipeline["pipeline"][1]["$match"]["token"].AsString);
+    }
+
+    [Theory]
+    [InlineData("userSSN")]
+    [InlineData("customerSsn")]
+    [InlineData("social_security_number")]
+    [InlineData("creditCard")]
+    [InlineData("credit_card_number")]
+    [InlineData("cardNo")]
+    [InlineData("cvc")]
+    [InlineData("cardCVC")]
+    [InlineData("bearer")]
+    [InlineData("pin")]
+    [InlineData("otp")]
+    public void Default_pattern_matches_more_secret_spellings(string field)
+    {
+        var doc = Redact(new BsonDocument { ["find"] = "users", ["filter"] = new BsonDocument(field, "s3cr3t") });
+        Assert.Equal("$redacted", doc["filter"][field].AsString);
+    }
+
+    [Theory]
+    [InlineData("spinning")]
+    [InlineData("author")]
+    [InlineData("cardinality")]
+    [InlineData("cardNotes")]
+    [InlineData("jessnr")]
+    public void Default_pattern_leaves_lookalikes_alone(string field)
+    {
+        var doc = Redact(new BsonDocument { ["find"] = "users", ["filter"] = new BsonDocument(field, "v") });
+        Assert.Equal("v", doc["filter"][field].AsString);
+    }
 }

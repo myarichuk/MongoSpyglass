@@ -42,6 +42,9 @@ public sealed class UpstreamConnector
 
     public bool UsesTls => _tls;
 
+    /// <summary>Test seam: wraps every stream this connector returns (fault injection).</summary>
+    internal Func<Stream, Stream>? StreamDecorator { get; set; }
+
     public async Task<(Socket Socket, Stream Stream)> ConnectAsync(HostPort member, CancellationToken ct)
     {
         var socket = new Socket(SocketType.Stream, ProtocolType.Tcp);
@@ -59,7 +62,7 @@ public sealed class UpstreamConnector
 
             Stream stream = new NetworkStream(socket, ownsSocket: true);
             if (!_tls)
-                return (socket, stream);
+                return (socket, StreamDecorator?.Invoke(stream) ?? stream);
 
             var ssl = new SslStream(stream, leaveInnerStreamOpen: false);
             using (var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct))
@@ -72,7 +75,7 @@ public sealed class UpstreamConnector
                     RemoteCertificateValidationCallback = (_, cert, chain, errors) => Validate(member, cert, chain, errors),
                 }, timeout.Token).ConfigureAwait(false);
             }
-            return (socket, ssl);
+            return (socket, StreamDecorator?.Invoke(ssl) ?? ssl);
         }
         catch
         {

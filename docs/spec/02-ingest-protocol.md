@@ -218,8 +218,9 @@ Encoding:
  "app":"orders-api","driver":"nodejs|spyglass-node","driverVersion":"7.7.0|0.1.0",   // absent if the client sent none
  "exporter":"spyglass-node",                     // absent if no marker
  "os":"linux","platform":"Node.js v22.4.0, LE",
- "closeReason":"client_closed|upstream_closed|invalid_frame|upstream_connect_failed|proxy_shutdown",   // close only
- "invalidHeader":"0c0000000100000000000000",     // close only, closeReason invalid_frame: the offending 16-byte header, hex
+ "closeReason":"client_closed|upstream_closed|invalid_frame|upstream_connect_failed|tls_failed|proxy_shutdown|hello_timeout|processing_fault",   // close only
+ "invalidHeader":"0c0000000100000000000000",     // close only, closeReason invalid_frame only: the offending 16-byte header, hex
+                                                 // (hello_timeout: a hello frame stalled while buffered for rewriting; processing_fault: the proxy failed on a frame and closed)
  "bytesIn":…, "bytesOut":…}                      // close only
 ```
 

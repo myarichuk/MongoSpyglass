@@ -32,13 +32,16 @@ public sealed class ObserverBehaviorTests
         private readonly Member _member;
         private int _seq;
 
-        public Harness(params string[] args)
+        public Harness(params string[] args) : this(true, args) { }
+
+        /// <param name="start">false: the workers never run, as in a stalled observer thread.</param>
+        public Harness(bool start, params string[] args)
         {
             var config = ConfigLoader.Load(["--upstream.uri", "mongodb://127.0.0.1:1/", .. args], new Dictionary<string, string?>());
             Server = new ProxyServer(config);
             Observer = new Observer(Server);
             Observer.RecordTap = line => Records.Enqueue(JsonDocument.Parse(line.ToArray()).RootElement.Clone());
-            Observer.Start();
+            if (start) Observer.Start();
             _member = new Member(new HostPort("127.0.0.1", 1), 1, "127.0.0.1:1",
                 new HelloRewriteContext { RewriteTopology = false, Map = new NoMap(), Self = "127.0.0.1:1", SpyglassDocument = [5, 0, 0, 0, 0] },
                 Server.Metrics);
@@ -219,6 +222,26 @@ public sealed class ObserverBehaviorTests
     }
 
     [Fact]
+    public void Pending_age_out_is_configurable_and_defaults_to_hours()
+    {
+        var h = new Harness(false);
+        Assert.Equal(TimeSpan.FromHours(6), h.Observer.PendingMaxAge); // index builds, $out, compact and dumps outlive any minutes-scale bound
+        var short_ = new Harness(false, "--limits.pendingMaxAgeSeconds", "90");
+        Assert.Equal(TimeSpan.FromSeconds(90), short_.Observer.PendingMaxAge);
+    }
+
+    [Fact]
+    public void A_stalled_observer_holds_a_bounded_number_of_slotless_reply_notices_per_connection()
+    {
+        // FP-3: the pool has no room for any slot, so every reply is slotless; nobody drains the worker queue
+        var h = new Harness(false, "--limits.observeQueueBytes", "512");
+        var c = h.Open();
+        for (var i = 0; i < 1000; i++)
+            Harness.Feed(c.Rep, Harness.Msg(100 + i, 1 + i, new BsonDocument { ["ok"] = 1.0 }));
+        Assert.Equal(CaptureTap.UnobservedSlots, Volatile.Read(ref c.Ctx.UnobservedInflight));
+    }
+
+    [Fact]
     public async Task Pending_request_at_close_is_still_connection_closed()
     {
         await using var h = new Harness();
@@ -362,6 +385,14 @@ public sealed class ObserverBehaviorTests
         Assert.True(cm.CursorsOpen.SeriesCount <= 11, cm.CursorsOpen.SeriesCount.ToString());
         Assert.True(cm.Series(cm.Errors, "x", "x", "x", "x", "x").Value > 900); // the overflow series took the rest
         Assert.Contains(CommandMetrics.Other, reg.Render());
+
+        // first fold level: the collection folds, command / database / app / code_name stay intact
+        var reg2 = new MetricsRegistry();
+        var cm2 = new CommandMetrics(reg2, maxSeries: 2);
+        for (var i = 0; i < 4; i++)
+            cm2.Series(cm2.Errors, "find", "db", "coll" + i, "app", "Boom").Inc();
+        var text = reg2.Render();
+        Assert.Contains("command=\"find\",database=\"db\",collection=\"__other__\",app=\"app\",code_name=\"Boom\"", text);
     }
 
     // ---- PO-16: le labels ----

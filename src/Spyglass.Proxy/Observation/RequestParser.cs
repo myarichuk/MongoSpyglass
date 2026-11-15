@@ -85,7 +85,7 @@ internal sealed class ClientMetadata
 internal sealed class RequestParser
 {
     /// <summary>compression=observe never inflates more than this per frame (I4).</summary>
-    private const int MaxObservedInflate = 16 * 1024 * 1024;
+    internal const int MaxObservedInflate = 16 * 1024 * 1024;
     private const int MaxPooled = 1024;
 
     private readonly Redactor _redactor;

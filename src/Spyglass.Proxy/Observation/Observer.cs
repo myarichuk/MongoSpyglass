@@ -30,8 +30,9 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
     private readonly Counter _noSlot, _queueFull, _pendingEvicted, _exportDropped, _tapFault, _observerFault, _uncorrelated;
 
     /// <summary>A request (or exhaust stream) with no reply for this long is dropped from the pending table and counted
-    /// <c>pending_evicted</c>: 01 §13's bound on observer memory holds only if nothing waits forever. Longer than any server time.</summary>
-    internal TimeSpan PendingMaxAge { get; set; } = TimeSpan.FromMinutes(10);
+    /// <c>pending_evicted</c>: 01 §13's bound on observer memory holds only if nothing waits forever. Set by
+    /// <c>limits.pendingMaxAgeSeconds</c> (default 6 h: index builds, <c>$out</c>, <c>compact</c> and dump-style scans can run for hours).</summary>
+    internal TimeSpan PendingMaxAge { get; set; }
 
     /// <summary>Test hook: every record line, after serialization (headless mode included).</summary>
     internal RecordSink? RecordTap { get; set; }
@@ -40,6 +41,7 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
     {
         _server = server;
         _config = server.Config;
+        PendingMaxAge = TimeSpan.FromSeconds(_config.Limits.PendingMaxAgeSeconds);
         _src = server.ProxyId.ToString();
         var m = server.Metrics;
         _noSlot = m.ObservationDropped.WithLabels("no_slot");
@@ -80,6 +82,7 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
     internal CapturePool Pool => _pool;
     internal CollectorSender? Sender => _sender;
     internal CursorRegistry Cursors => _cursors;
+    internal int WorkerCount => _workers.Length;
 
     public void Start()
     {
@@ -425,6 +428,7 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
                     OnClosed(item.Conn, item.Reason, item.Detail, item.Tick);
                     return;
                 case ObserverEvent.UnobservedReply:
+                    Interlocked.Decrement(ref item.Conn.UnobservedInflight);
                     if (_conns.TryGetValue(item.Conn.ConnSeq, out var lost))
                         OnUnobservedReply(lost, item.ResponseTo, item.RequestId, item.Flags, item.OpCode);
                     return;

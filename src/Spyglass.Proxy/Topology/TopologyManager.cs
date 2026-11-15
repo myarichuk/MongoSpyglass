@@ -77,7 +77,8 @@ public sealed class TopologyManager : IAddressMap
         if (detected == TopologyKind.ReplicaSet && _server.Uri.DirectConnection)
         {
             detected = TopologyKind.Standalone;
-            Log.Info("directConnection=true: proxying the one seed member only; replica-set members are not discovered");
+            Log.Warn("directConnection=true: proxying the one seed member only; replica-set members are not discovered and hello replies are not rewritten. " +
+                     "Clients MUST also connect with directConnection=true: a client that does not will learn the real member addresses from `hosts` and connect to them directly, bypassing the proxy");
         }
 
         Kind = detected;
@@ -148,14 +149,15 @@ public sealed class TopologyManager : IAddressMap
         lock (_gate)
         {
             if (_byUpstream.TryGetValue(upstream, out var existing))
-                return existing.Advertised;
+                // another thread is still binding it: don't hand out an address nothing listens on yet
+                return _snapshot.ContainsKey(upstream) ? existing.Advertised : null;
             var port = NextFreePortLocked();
             if (port < 0)
             {
                 Log.Error($"no free port in 'listen.portRange' for new member {upstream}; clients will see its real address");
                 return null;
             }
-            member = CreateMemberLocked(upstream, port);
+            member = CreateMemberLocked(upstream, port, publish: false); // in _byUpstream (de-duplication), not yet in _snapshot
         }
 
         // Bind outside the lock: socket syscalls must not stall other forwarding threads on _gate (PW-12).
@@ -170,14 +172,17 @@ public sealed class TopologyManager : IAddressMap
             {
                 _members.Remove(member);
                 _byUpstream.Remove(upstream);
-                _snapshot = new Dictionary<HostPort, Member>(_byUpstream);
             }
             return null;
         }
         Log.Info($"listener {member.Advertised} → {upstream}");
         lock (_gate)
+        {
+            // the address becomes visible to hello rewriting only now that something listens on it
+            _snapshot = new Dictionary<HostPort, Member>(_byUpstream);
             if (_byUpstream.TryGetValue(upstream, out var still) && still == member)
                 StartMonitorLocked(member);
+        }
         return member.Advertised;
     }
 
@@ -216,7 +221,7 @@ public sealed class TopologyManager : IAddressMap
     }
 
     /// <summary>Registers a member and reserves its port; the caller binds its listener.</summary>
-    private Member CreateMemberLocked(HostPort upstream, int port)
+    private Member CreateMemberLocked(HostPort upstream, int port, bool publish = true)
     {
         var advertised = new HostPort(HostPort.NormalizeHost(_config.Listen.AdvertiseHost), port).ToString();
         var member = new Member(upstream, port, advertised, new HelloRewriteContext
@@ -232,7 +237,8 @@ public sealed class TopologyManager : IAddressMap
         _usedPorts.Add(port);
         _byUpstream[upstream] = member;
         _members.Add(member);
-        _snapshot = new Dictionary<HostPort, Member>(_byUpstream);
+        if (publish)
+            _snapshot = new Dictionary<HostPort, Member>(_byUpstream);
         return member;
     }
 
@@ -311,8 +317,7 @@ public sealed class TopologyManager : IAddressMap
                 _monitors.Remove(m, out var cts);
                 _members.Remove(m);
                 _byUpstream.Remove(m.Upstream);
-                _usedPorts.Remove(m.ListenPort);
-                (removed ??= []).Add((m, cts));
+                (removed ??= []).Add((m, cts)); // its port stays reserved until the listener is closed (below)
             }
             if (removed != null)
                 _snapshot = new Dictionary<HostPort, Member>(_byUpstream);
@@ -325,6 +330,9 @@ public sealed class TopologyManager : IAddressMap
             _server.StopListener(m);
             cts?.Cancel();
         }
+        lock (_gate)
+            foreach (var (m, _) in removed)
+                _usedPorts.Remove(m.ListenPort); // only now can another member bind it
     }
 
     public bool AnyMonitorSucceededWithin(TimeSpan window)

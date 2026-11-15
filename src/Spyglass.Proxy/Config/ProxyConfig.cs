@@ -62,7 +62,7 @@ public sealed class CaptureConfig
     public ValueMode Values { get; set; } = ValueMode.Truncated;
     public int TruncateStringsAt { get; set; } = 64;
     public string RedactFieldPattern { get; set; } =
-        "(?i)(passw(or)?d|passphrase|pwd|^pass$|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|authorization|cookie|credential|^ssn$|[-_]ssn$|^card$|card[-_]?num|^cvv$)";
+        "(?i)(passw(or)?d|passphrase|pwd|^pass$|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|authorization|bearer|cookie|credential|ssn$|social[-_]?security|^card$|card[-_]?num|card[-_]?no(?![a-z])|credit[-_]?card|cv[vc]$|^pin$|^otp$)";
 }
 
 public sealed class LimitsConfig
@@ -70,9 +70,13 @@ public sealed class LimitsConfig
     public int MaxClientConnections { get; set; } = 4096;
     public long ObserveQueueBytes { get; set; } = 64L * 1024 * 1024;
     public int MaxPendingPerConnection { get; set; } = 1024;
+    /// <summary>A request with no reply for this long is dropped from the observer's pending table (<c>pending_evicted</c>); long enough for any operation.</summary>
+    public int PendingMaxAgeSeconds { get; set; } = 6 * 3600;
     public int HelloRewriteMaxBytes { get; set; } = 1024 * 1024;
-    /// <summary>Process-wide budget for hello frames buffered for rewriting (01 §13); over it, frames pass through unmodified.</summary>
+    /// <summary>Process-wide budget for hello replies buffered for rewriting (01 §13); over it, frames pass through unmodified. Hello requests draw on a separate budget of a quarter of this.</summary>
     public long HelloBufferBytes { get; set; } = 16L * 1024 * 1024;
+    /// <summary>A hello frame being buffered for rewriting must complete within this (01 §13): a stalled peer is not waited on forever.</summary>
+    public int HelloBufferTimeoutMs { get; set; } = 10_000;
     public int ReadBufferBytes { get; set; } = 64 * 1024;
 }
 

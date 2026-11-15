@@ -20,7 +20,10 @@ public sealed class ProxyServer : IAsyncDisposable
     private readonly ConcurrentDictionary<long, ProxyConnection> _live = new();
     private readonly List<Task> _acceptLoops = [];
     private long _connSeq;
+    /// <summary>Hello replies being buffered for rewriting (server-controlled).</summary>
     internal ByteBudget HelloBuffers { get; }
+    /// <summary>Hello requests being buffered (client-controlled): separate so clients can never starve reply rewriting (FP-1).</summary>
+    internal ByteBudget HelloRequestBuffers { get; }
     private int _openConnections;
     private MetricsServer? _metricsServer;
     private bool _started;
@@ -29,6 +32,7 @@ public sealed class ProxyServer : IAsyncDisposable
     {
         Config = config;
         HelloBuffers = new ByteBudget(config.Limits.HelloBufferBytes);
+        HelloRequestBuffers = new ByteBudget(Math.Max(4096, config.Limits.HelloBufferBytes / 4));
         Uri = MongoUri.Parse(config.Upstream.Uri!);
         Upstream = new UpstreamConnector(config, Uri);
         if (config.Listen.Tls.Mode == DownstreamTlsMode.Tls)
@@ -88,10 +92,17 @@ public sealed class ProxyServer : IAsyncDisposable
         Topology.StartMonitors();
         Ready = true;
 
-        var worstCase = Config.Limits.ObserveQueueBytes + Config.Collector.BufferBytes + Config.Limits.HelloBufferBytes
-                        + (long)Config.Limits.MaxClientConnections * 2 * Config.Limits.ReadBufferBytes;
+        // 01 §13: every term is a configured bound
+        var inflate = Config.Compression == CompressionMode.Observe ? (long)Observation!.WorkerCount * (long)RequestParser.MaxObservedInflate : 0;
+        var perConnection = 2L * Config.Limits.ReadBufferBytes + CaptureTap.UnobservedSlots * 128L; // two read buffers + slot-less reply notices
+        var worstCase = Config.Limits.ObserveQueueBytes
+                        + (Config.Collector.Endpoint != null ? Config.Collector.BufferBytes + Config.Collector.BufferBytes / 16 : 0)
+                        + Config.Limits.HelloBufferBytes + HelloRequestBuffers.Limit
+                        + inflate + (long)Config.Limits.MaxClientConnections * perConnection;
         Log.Info($"proxy {ProxyId} ready; worst-case buffer memory {worstCase / (1024 * 1024)} MiB " +
-                 $"(observe queue + export buffer + hello buffers + {Config.Limits.MaxClientConnections} connections × 2 × {Config.Limits.ReadBufferBytes / 1024} KiB)");
+                 $"(observe queue + export buffer incl. its conn slice + hello buffers (replies + requests)" +
+                 $"{(inflate > 0 ? " + observe-mode inflate" : "")} + {Config.Limits.MaxClientConnections} connections × " +
+                 $"({Config.Limits.ReadBufferBytes / 1024} KiB × 2 + notices))");
     }
 
     /// <summary>Binds and starts accepting for <paramref name="member"/>. Throws if the port can't be bound.</summary>

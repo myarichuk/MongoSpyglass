@@ -105,8 +105,9 @@ Used as the response opcode for `OP_QUERY`.
   - Hello reply: a top-level `$spyglass` discovery document is appended (R2, `02` §2.2). On a replica set,
     `hosts`, `passives`, `arbiters`, `primary` and `me` are rewritten to the proxy's listener addresses (R1, `01` §5.3).
     If the OP_MSG `checksumPresent` flag was set, it is cleared and the 4 checksum bytes are dropped.
-  - A hello frame that cannot be rewritten (malformed, or over `helloRewriteMaxBytes`) is forwarded unmodified and
-    counted in `spyglass_proxy_rewrite_skipped_total`.
+  - A hello frame that cannot be rewritten (malformed, over `helloRewriteMaxBytes` (requests: 64 KiB), or over the hello
+    buffer budget) is forwarded unmodified and counted in `spyglass_proxy_rewrite_skipped_total{reason}`. A hello frame that
+    stalls while being buffered (`limits.helloBufferTimeoutMs`, 10 s) closes the connection (`closeReason=hello_timeout`).
 - Transparently forwards unknown opcodes.
 
 This approach keeps backwards compatibility while still allowing structured introspection.
