@@ -3,6 +3,8 @@
 #
 #   SPYGLASS_TOKEN=... SPYGLASS_ADMIN_PASSWORD=... docker compose up --build
 #
+# Both variables are required (compose stops with an error if one is unset). Published ports bind to 127.0.0.1.
+#
 #   UI            http://localhost:8080          (password: SPYGLASS_ADMIN_PASSWORD)
 #   demo service  http://localhost:5000          (its traffic shows up in the UI as app "demoapp")
 #   proxy         mongodb://localhost:27018/?appName=me   for your own mongosh / driver
@@ -32,10 +34,10 @@ services:
       context: .
       dockerfile: src/Spyglass.Collector/Dockerfile
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"   # loopback only (put a TLS reverse proxy in front to reach it from elsewhere)
     environment:
-      SPYGLASS_TOKEN: ${SPYGLASS_TOKEN:-dev-ingest-token}
-      SPYGLASS_ADMIN_PASSWORD: ${SPYGLASS_ADMIN_PASSWORD:-spyglass}
+      SPYGLASS_TOKEN: ${SPYGLASS_TOKEN:?set SPYGLASS_TOKEN (ingest token shared with the proxy)}
+      SPYGLASS_ADMIN_PASSWORD: ${SPYGLASS_ADMIN_PASSWORD:?set SPYGLASS_ADMIN_PASSWORD (UI login)}
       # SPYGLASS_OP_RETENTION_HOURS: "24"
       # SPYGLASS_SLOW_SHAPE_MS: "100"
     volumes:
@@ -46,14 +48,14 @@ services:
       context: .
       dockerfile: src/Spyglass.Proxy/Dockerfile
     ports:
-      - "27018:27017"   # the proxy's listener, for clients on the host (mongodb itself is not published)
-      - "9187:9187"     # /metrics, /healthz, /readyz
+      - "127.0.0.1:27018:27017"   # the proxy's listener, for clients on the host (mongodb itself is not published)
+      - "127.0.0.1:9187:9187"     # /metrics, /healthz, /readyz
     environment:
       SPYGLASS_UPSTREAM__URI: mongodb://mongodb:27017/?directConnection=true
       SPYGLASS_LISTEN__ADVERTISEHOST: spyglass-proxy
       SPYGLASS_LISTEN__BASEPORT: "27017"
       SPYGLASS_COLLECTOR__ENDPOINT: http://spyglass-collector:8080/ingest/v0
-      SPYGLASS_COLLECTOR__TOKEN: ${SPYGLASS_TOKEN:-dev-ingest-token}
+      SPYGLASS_COLLECTOR__TOKEN: ${SPYGLASS_TOKEN:?set SPYGLASS_TOKEN (ingest token shared with the collector)}
       # capture.values: full | truncated (default: values cut at 64 chars) | shape (no values leave the proxy)
       # SPYGLASS_CAPTURE__VALUES: shape
     depends_on:
@@ -67,7 +69,7 @@ services:
       context: DemoApp
       dockerfile: Dockerfile
     ports:
-      - "5000:8080"
+      - "127.0.0.1:5000:8080"
     environment:
       ASPNETCORE_ENVIRONMENT: Development
       Mongo__ConnectionString: mongodb://spyglass-proxy:27017/?appName=demoapp
