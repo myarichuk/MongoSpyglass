@@ -165,7 +165,12 @@ internal sealed class JoinEngine
 
         if (_cmds.ContainsKey(key)) { Interlocked.Increment(ref _counters.AlreadyJoined); return; }
         while (_cmds.Count >= _maxCmds && _cmdOrder.TryDequeue(out var old))
-            if (_cmds.Remove(old.Item1, out var ow) && ReferenceEquals(ow.Item, old.Item2)) ExpiredCmd(old.Item2);
+            // a stale entry (its cmd already joined, the key reused by a newer cmd) must not take the newer one with it
+            if (_cmds.TryGetValue(old.Item1, out var ow) && ReferenceEquals(ow.Item, old.Item2))
+            {
+                _cmds.Remove(old.Item1);
+                ExpiredCmd(old.Item2);
+            }
         _cmds[key] = new Waiting<CmdRecord>(c, nowUs, nowUs + CmdWaitUs);
         _cmdOrder.Enqueue((key, c));
         Interlocked.Increment(ref _counters.PendingCmds);
@@ -192,6 +197,9 @@ internal sealed class JoinEngine
         foreach (var (key, w) in _ops.ToList()) FinalizeWaiting(key, w, output);
         _opsShort.Clear();
         _opsLong.Clear();
+        Interlocked.Add(ref _counters.PendingCmds, -_cmds.Count); // abandoned with the process: the gauge must not keep them
+        _cmds.Clear();
+        _cmdOrder.Clear();
     }
 
     private void ExpireOps(Queue<(JoinKey, Operation)> q, long nowUs, PartitionOutput output)

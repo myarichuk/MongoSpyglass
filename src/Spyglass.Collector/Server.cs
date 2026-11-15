@@ -389,7 +389,7 @@ public sealed class Server : IAsyncDisposable
         var o = Collector.Ops.Get(id) ?? Collector.Analysis.Waiting(id); // live but still waiting for context (02 §6.2)
         if (o == null) return Results.NotFound();
         var callsite = o.Ctx?.Callsite is { } cs ? Collector.Callsites.Callsite(cs) : null;
-        o.ShapeJson = Collector.Aggregates.Shape(o.ShapeHash)?.ShapeJson;
+        var shapeJson = Collector.Aggregates.Shape(o.ShapeHash)?.ShapeJson; // not written onto the op: it is shared (the store's, or the waiting one)
         var a = Collector.Analysis;
         var cursorId = o.Op.Command == "getMore" ? CursorIdOf(o) : o.Op.Reply?.CursorId;
         var cursor = cursorId is { } cid and not 0
@@ -400,7 +400,7 @@ public sealed class Server : IAsyncDisposable
         {
             w.WriteStartObject();
             w.WritePropertyName("op");
-            Json.OpDetail(w, o, cursor, callsite);
+            Json.OpDetail(w, o, cursor, callsite, shapeJson);
             w.WriteStartArray("alerts");
             foreach (var x in alerts) Json.Alert(w, x);
             w.WriteEndArray();

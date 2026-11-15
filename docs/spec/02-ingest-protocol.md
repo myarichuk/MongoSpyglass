@@ -394,7 +394,8 @@ Responses:
   counted. The index of stored ops that a late `cmd` can still find is bounded by memory like
   dedup (§6.4): 2^17 keys per partition by default, about 10 minutes below ~200 ops/s per partition.
 * Waiting is per arrival, not per event time: the windows run on the collector's clock, from
-  when each record arrived.
+  when each record arrived. They are durations, so the collector measures them on a monotonic
+  clock (a wall-clock step must not stall or fire expiry).
 * The waiting sets are bounded too (200,000 ops and 200,000 cmds by default, 03 §11). Past the
   bound the op closest to its deadline is stored early, wire-only, and counted; a `cmd` that
   arrives for it later still merges.
@@ -408,7 +409,7 @@ tripwire for the negligible collision case in §3.1.
 ### 6.4 Duplicates
 
 Producers may resend after a timeout. The collector deduplicates by
-`(src, type, joinKey, ts)` within the 10-minute window, bounded by memory: 2^18 key hashes per
+`(src, type, joinKey, ts)` (for `stream` records also `seq`: the frames of one read share a `ts`) within the 10-minute window, bounded by memory: 2^18 key hashes per
 partition (~8 MiB). That covers the whole window below ~440 records/s per partition, and about
 10 s at the 03 §11 rate. Producers resend within seconds (§5: one retry after 1 s).
 

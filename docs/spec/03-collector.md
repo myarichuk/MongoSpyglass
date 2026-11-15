@@ -30,8 +30,12 @@ POST /ingest/v0 ─▶ validate ─▶ dedup ─▶ join (02 §6) ─▶ enrich 
 * Any record from an exporter (`cmd`, `hello`, `callsite`, `stats`, `uow`, `pool`) shows it is alive
   for the 10-minute exporter-idle rule of 02 §6.2. `uow` and `pool` are only counted (M3); their fields are
   not kept.
-* `ts` more than 5 minutes in the future (relative to collector time) is clamped and counted
-  as clock skew per `src`. It's shown on the Proxies/Exporters page.
+* `ts` more than 5 minutes in the future (relative to collector time), or older than the op
+  retention (a negative or ancient `ts` would give the op an id that sorts last and is pruned
+  at once), is clamped to collector time and counted as clock skew per `src`. It's shown on the
+  Proxies/Exporters page. A producer clock that merely lags is not corrected: everything that
+  runs on a lifetime (an alert's quiet period, a cursor's idle timeout, closing a minute
+  bucket) uses the collector's own clock, never `ts`.
 
 ## 3. Join engine
 
@@ -185,8 +189,9 @@ Alert { id, rule, scope{shapeHash?, coll?, app?, member?, uowName?, callsite?}, 
 * One alert per `(rule, scope)`. New occurrences bump `occurrences` and `lastSeen`, and keep
   up to 10 sample op ids.
 * An alert is **resolved** automatically after `quietPeriod` (rule-specific) with no
-  occurrences. A later occurrence reopens it.
-* Users can mute a `(rule, scope)`.
+  occurrences, measured on the collector's clock. A later occurrence reopens it.
+* Users can mute a `(rule, scope)`. A muted alert keeps tracking occurrences silently, resolves
+  as usual, and is never deleted by retention while muted (so the mute survives expiry and restarts).
 
 ### 5.2 Rules
 
@@ -257,7 +262,7 @@ Per `(shapeHash, minute)` bucket:
 
 * `count`, `errors`;
 * `serverLatency` as a DDSketch (relative accuracy 1%) or an HDR histogram
-  (1 µs – 60 s, 2 significant digits);
+  (1 µs – 1 h, 2 significant digits; a quantile is never reported above the maximum seen);
 * `sum(respBytes)`, `sum(reqBytes)`, `sum(nReturned)`, `max(nReturned)`;
 * `sum(poolWait_us)` and `sum(client_us)` when present.
 
@@ -277,7 +282,8 @@ Buckets roll up to hourly after 48 h.
 | Operations (joined, including redacted command) | 24 h | 5 GiB, oldest deleted first |
 | Aggregates, minute | 48 h | — |
 | Aggregates, hour | 30 d | — |
-| Alerts | 30 d after resolve | — |
+| Alerts | 30 d after resolve (muted ones kept) | — |
+| Shapes | until unused for 30 d (the in-memory catalog is also capped at 100,000, least recently seen first; the slowest-10 examples cover the op retention) | — |
 | UoW summaries | 7 d | — |
 | Callsites | until unused for 30 d (used = a joined op referenced it; refreshed hourly) | — |
 

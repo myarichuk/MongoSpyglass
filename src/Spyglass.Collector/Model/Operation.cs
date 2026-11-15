@@ -93,7 +93,8 @@ public static class Ulid
         }
         var random = t_random = (t_random + 1) & ((UInt128.One << 80) - 1);
         // 128 bits → 26 chars, 5 bits each, most significant first (the first char carries 3 bits)
-        var v = ((UInt128)(ulong)(unixMs & 0xFFFF_FFFF_FFFF) << 80) | random;
+        // a negative time (a producer clock before 1970) would wrap to the end of the id range
+        var v = ((UInt128)(ulong)(Math.Max(0, unixMs) & 0xFFFF_FFFF_FFFF) << 80) | random;
         return string.Create(26, v, static (c, x) =>
         {
             for (var i = 25; i >= 0; i--) { c[i] = Alphabet[(int)(x & 31)]; x >>= 5; }

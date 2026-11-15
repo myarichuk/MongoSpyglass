@@ -1,16 +1,17 @@
 namespace Spyglass.Collector.Analysis;
 
 /// <summary>
-/// 03 §6 latency distribution: a DDSketch with 1% relative accuracy over 1 µs – 60 s. Bucket i holds
+/// 03 §6 latency distribution: a DDSketch with 1% relative accuracy over 1 µs – 1 h (about 1,100 bins at most). Bucket i holds
 /// values in (γ^(i-1), γ^i], γ = (1+α)/(1−α); a quantile is reported as the bucket's midpoint in
-/// relative terms, so the error is ≤ α. Sparse: one shape's latencies occupy a few dozen buckets.
+/// relative terms, so the error is ≤ α; never above the largest value seen. Values over 1 h count in the top bin. Sparse: one
+/// shape's latencies occupy a few dozen buckets.
 /// </summary>
 public sealed class Sketch
 {
     public const double Alpha = 0.01;
     private static readonly double Gamma = (1 + Alpha) / (1 - Alpha);
     private static readonly double LogGamma = Math.Log(Gamma);
-    private const double Min = 1, Max = 60_000_000;
+    private const double Min = 1, Max = 3_600_000_000;
     private static readonly int MaxIndex = Index(Max);
 
     private readonly SortedDictionary<int, long> _bins = [];
@@ -52,7 +53,7 @@ public sealed class Sketch
         {
             seen += n;
             if (seen >= rank)
-                return 2 * Math.Pow(Gamma, i) / (Gamma + 1);
+                return Math.Min(2 * Math.Pow(Gamma, i) / (Gamma + 1), MaxValue);
         }
         return MaxValue;
     }

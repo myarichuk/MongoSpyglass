@@ -56,6 +56,8 @@ public interface IAggregateStore
     List<MinuteBucket> Buckets(long fromMinute, long toMinute, string? shape = null);
     ShapeInfo? Shape(string hash);
     List<ShapeInfo> Shapes();
+    /// <summary>Deletes shapes whose <c>LastSeen</c> is before <paramref name="lastSeenBeforeUs"/> (03 §7: unused for as long as hourly aggregates are kept).</summary>
+    int PruneShapes(long lastSeenBeforeUs);
     /// <summary>03 §7: minute buckets roll up to hourly after 48 h; hourly kept 30 d.</summary>
     void Rollup(long nowUs);
 }
@@ -64,6 +66,8 @@ public interface IAlertStore
 {
     void Upsert(IReadOnlyList<Alert> alerts);
     List<Alert> All();
+    /// <summary>Deletes alerts (03 §7: 30 d after resolve).</summary>
+    void Delete(IReadOnlyCollection<string> ids);
 }
 
 /// <summary>
@@ -189,6 +193,14 @@ public sealed class MemoryStore : IOperationStore, IAggregateStore, IAlertStore,
 
     public List<ShapeInfo> Shapes() => [.. _shapes.Values];
 
+    public int PruneShapes(long lastSeenBeforeUs)
+    {
+        var n = 0;
+        foreach (var (k, v) in _shapes)
+            if (v.LastSeen < lastSeenBeforeUs && _shapes.TryRemove(k, out _)) n++;
+        return n;
+    }
+
     /// <summary>03 §7 as SqliteStore: minutes older than 48 h roll up to hours, hours are kept 30 d.</summary>
     public void Rollup(long nowUs)
     {
@@ -218,4 +230,9 @@ public sealed class MemoryStore : IOperationStore, IAggregateStore, IAlertStore,
     }
 
     public List<Alert> All() => [.. _alerts.Values];
+
+    public void Delete(IReadOnlyCollection<string> ids)
+    {
+        foreach (var id in ids) _alerts.TryRemove(id, out _);
+    }
 }

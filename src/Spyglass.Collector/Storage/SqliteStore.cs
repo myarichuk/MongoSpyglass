@@ -509,7 +509,32 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
         return list;
     }
 
+    public int PruneShapes(long lastSeenBeforeUs)
+    {
+        lock (_writeLock)
+        {
+            using var cmd = _write.CreateCommand();
+            cmd.CommandText = "DELETE FROM shapes WHERE coalesce(json_extract(data, '$.LastSeen'), 0) < $t";
+            cmd.Parameters.AddWithValue("$t", lastSeenBeforeUs);
+            return cmd.ExecuteNonQuery();
+        }
+    }
+
     // ---- alerts ----------------------------------------------------------------------------
+
+    public void Delete(IReadOnlyCollection<string> ids)
+    {
+        if (ids.Count == 0) return;
+        lock (_writeLock)
+        {
+            using var tx = _write.BeginTransaction();
+            using var cmd = _write.CreateCommand();
+            cmd.CommandText = "DELETE FROM alerts WHERE id = $id";
+            var p = cmd.Parameters.Add("$id", SqliteType.Text);
+            foreach (var id in ids) { p.Value = id; cmd.ExecuteNonQuery(); }
+            tx.Commit();
+        }
+    }
 
     public void Upsert(IReadOnlyList<Alert> alerts)
     {

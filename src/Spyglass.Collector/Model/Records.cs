@@ -89,6 +89,11 @@ public sealed class OpRecord : Record
 
     // 02 §4.2 derivations
     public string ProxyId => Src;
+    /// <summary>
+    /// The connection-id slot of routing and dedup (02 §6.4): the server connection id, else a placeholder. One rule for ops and
+    /// their stream records: a stream op without an id uses -1 (its stream records carry no connSeq), any other op -connSeq.
+    /// </summary>
+    public long RouteSid => ServerConnectionId ?? (Stream ? -1 : -ConnSeq);
     public bool Ack => Status != "unacknowledged";
     public long? ServerLatencyUs => RespFirstUs is { } rf ? Math.Max(0, rf - ReqLastUs) : null;
     public bool HasReply => Status is not ("unacknowledged" or "connection_closed");
@@ -118,6 +123,8 @@ public sealed class StreamRecord : Record
     public long? ServerConnectionId;
     public int RequestId;
     public int Seq;
+    /// <summary>See <see cref="OpRecord.RouteSid"/>.</summary>
+    public long RouteSid => ServerConnectionId ?? -1;
     public int RespBytes;
     public long? CursorId;
     public int? NReturned;
