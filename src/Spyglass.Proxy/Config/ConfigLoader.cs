@@ -42,9 +42,16 @@ public static class ConfigLoader
                 Set(k, v, configPath);
         }
 
+        // A SPYGLASS_* variable the file or a flag references as ${NAME} is a value, not a key (e.g. a keyPassword)
+        var referenced = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var (_, (v, _)) in values)
+            if (v != null) foreach (Match m in Variable.Matches(v)) referenced.Add(m.Groups[1].Value);
+        foreach (var (_, v) in cli)
+            if (v != null) foreach (Match m in Variable.Matches(v)) referenced.Add(m.Groups[1].Value);
+
         foreach (var (k, v) in environment)
         {
-            if (!k.StartsWith("SPYGLASS_", StringComparison.Ordinal) || ExporterOrVariableEnv.Contains(k))
+            if (!k.StartsWith("SPYGLASS_", StringComparison.Ordinal) || ExporterOrVariableEnv.Contains(k) || referenced.Contains(k))
                 continue;
             Set(k["SPYGLASS_".Length..].Replace("__", "."), v, "environment " + k);
         }

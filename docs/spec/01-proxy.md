@@ -104,6 +104,8 @@ naming the key. In particular:
   `tlsDisableOCSPEndpointCheck` / `tlsDisableCertificateRevocationCheck` are accepted (revocation defaults to none).
 * An expired or not-yet-valid `listen.tls.certFile` / `upstream.tls.certFile` certificate, or one with fewer than 14 days left, logs a warning.
 * `keyPassword` values are never logged, exported in records or shown by `/readyz` and `/metrics`; prefer `${ENV}` over a flag.
+* A `SPYGLASS_*` variable that the file or a flag references as `${NAME}` is a value, not a configuration key: it is not
+  bound (and so not an unknown-key error). Any other unknown `SPYGLASS_*` key is still a startup error.
 * `upstream.tls.enabled=false`, or `tls=false` in the URI, against a `+srv` URI is an error.
 * A configuration value set in the file and replaced by a different value from the environment logs a warning
   naming both sources (the container image sets some keys through the environment).

@@ -136,8 +136,12 @@ internal static class TlsTrust
         custom.ChainPolicy.CustomTrustStore.AddRange(trust);
         custom.ChainPolicy.RevocationMode = revocation;
         if (chain != null)
+        {
+            // intermediates the peer sent (the platform puts them in ExtraStore even when its own build was partial)
+            custom.ChainPolicy.ExtraStore.AddRange(chain.ChainPolicy.ExtraStore);
             foreach (var el in chain.ChainElements.Skip(1))
                 custom.ChainPolicy.ExtraStore.Add(el.Certificate);
+        }
         using var leaf = new X509Certificate2(cert);
         var ok = custom.Build(leaf);
         if (!ok)

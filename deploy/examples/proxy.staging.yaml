@@ -1,0 +1,44 @@
+# Corporate staging: a TLS replica set whose certificates come from the company's internal CA; apps on other
+# machines reach the proxy over the network, so the app → proxy hop is TLS too, with a certificate from the same CA.
+#
+#   SPYGLASS_TOKEN=... SPYGLASS_PROXY_KEY_PASSWORD=... spyglass-proxy --config /etc/spyglass/proxy.yaml
+#
+# Apps change only host and port in their connection string, keep tls=true, and trust the corporate CA the way
+# they already do (OS store, or tlsCAFile=/path/corp-ca.pem):
+#
+#   mongodb://spyglass-proxy.staging.corp.example:27017/?replicaSet=rs0&tls=true&appName=orders-api
+#
+# Everything this file sets is visible (minus passwords) on the collector's Topology & producers page.
+
+upstream:
+  # Driver TLS options in the URI work too (tlsCAFile=, tlsCertificateKeyFile=, tlsInsecure=); keys below win.
+  uri: "mongodb://mongo-a.staging.corp.example:27017,mongo-b.staging.corp.example:27017,mongo-c.staging.corp.example:27017/?replicaSet=rs0&tls=true"
+  tls:
+    enabled: true
+    caFile: /etc/spyglass/certs/corp-ca.pem       # root (+ intermediates). Only this bundle is trusted for MongoDB
+    # mongod with net.tls.mode requireTLS and client certificates required (no allowConnectionsWithoutCertificates):
+    # certFile: /etc/spyglass/certs/spyglass-proxy-client.pem   # cert + key in one PEM, or a .pfx
+    # keyPassword: "${SPYGLASS_PROXY_CLIENT_KEY_PASSWORD}"
+    # revocation: online    # only if the CA's CRL/OCSP endpoints are reachable from this host
+
+listen:
+  bindAddress: 0.0.0.0
+  advertiseHost: spyglass-proxy.staging.corp.example   # the name apps use; must be in the certificate's SANs
+  basePort: 27017           # rs0 members get 27017, 27018, 27019 — open them in the firewall
+  portRange: [27017, 27040]
+  tls:
+    mode: tls
+    certFile: /etc/spyglass/certs/spyglass-proxy.pem   # leaf + intermediates; key in keyFile (or in this file, or a .pfx)
+    keyFile: /etc/spyglass/certs/spyglass-proxy.key
+    keyPassword: "${SPYGLASS_PROXY_KEY_PASSWORD}"     # remove if the key is not encrypted
+
+capture:
+  values: truncated         # strings cut at 64 chars; `shape` sends no values at all
+
+collector:
+  endpoint: "https://spyglass.staging.corp.example/ingest/v0"
+  token: "${SPYGLASS_TOKEN}"
+  caFile: /etc/spyglass/certs/corp-ca.pem
+
+metrics:
+  bind: 0.0.0.0:9187        # for Prometheus; alert on spyglass_proxy_tls_cert_expiry_seconds - time() < 14*86400

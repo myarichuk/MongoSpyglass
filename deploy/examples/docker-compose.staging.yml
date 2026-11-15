@@ -1,0 +1,50 @@
+# Corporate staging host running the proxy and the collector, both speaking TLS with certificates from the
+# internal CA. MongoDB is elsewhere (see proxy.staging.yaml). Run from the repository root:
+#
+#   SPYGLASS_TOKEN=... SPYGLASS_ADMIN_PASSWORD=... SPYGLASS_PROXY_KEY_PASSWORD=... \
+#     docker compose -f deploy/examples/docker-compose.staging.yml up -d --build
+#
+# ./certs (next to this file) holds:
+#   corp-ca.pem                         the internal root (+ intermediates)
+#   spyglass-proxy.pem / .key           cert for spyglass-proxy.staging.corp.example (leaf + intermediates; key)
+#   spyglass-collector.pem              cert + key for spyglass.staging.corp.example, in one PEM (or a .pfx)
+# The containers run as a non-root user: the files must be readable by it (chmod 0644 certs, 0640 + group for keys).
+
+services:
+  spyglass-collector:
+    build:
+      context: ../..
+      dockerfile: src/Spyglass.Collector/Dockerfile
+    ports:
+      - "8443:8443"
+    environment:
+      SPYGLASS_BIND: 0.0.0.0:8443
+      SPYGLASS_TLS_CERT: /certs/spyglass-collector.pem          # HTTPS straight from the collector, no reverse proxy
+      SPYGLASS_TOKEN: ${SPYGLASS_TOKEN:-}
+      SPYGLASS_ADMIN_PASSWORD: ${SPYGLASS_ADMIN_PASSWORD:-}
+    volumes:
+      - ./certs:/certs:ro
+      - spyglass-data:/data
+
+  spyglass-proxy:
+    build:
+      context: ../..
+      dockerfile: src/Spyglass.Proxy/Dockerfile
+    command: ["--config", "/config/proxy.yaml"]
+    ports:
+      - "27017-27019:27017-27019"   # one per replica-set member (listen.basePort + i)
+      - "9187:9187"
+    environment:
+      SPYGLASS_TOKEN: ${SPYGLASS_TOKEN:-}
+      SPYGLASS_PROXY_KEY_PASSWORD: ${SPYGLASS_PROXY_KEY_PASSWORD:-}
+      # inside this network the collector is reached by its service name, so its certificate must carry that SAN too,
+      # or point the proxy at the public name instead. Overrides the file's collector.endpoint:
+      SPYGLASS_COLLECTOR__ENDPOINT: https://spyglass-collector:8443/ingest/v0
+    volumes:
+      - ./proxy.staging.yaml:/config/proxy.yaml:ro
+      - ./certs:/etc/spyglass/certs:ro
+    depends_on:
+      - spyglass-collector
+
+volumes:
+  spyglass-data:
