@@ -175,14 +175,42 @@ public sealed class LoginThrottleTests
     }
 
     [Fact]
-    public void A_flood_from_many_addresses_locks_everyone_for_the_minute()
+    public void A_flood_from_many_addresses_slows_failures_but_never_locks_another_address()
+    {
+        // FC-2: a global hard lock was a lever for anyone to keep every user out; it is now a delay on failed answers only
+        long now = 1000;
+        var t = new LoginThrottle(() => now);
+        Assert.Equal(0, t.ExtraDelayMs());
+        for (var i = 0; i < 60; i++) t.Failed(IPAddress.Parse($"10.0.{i / 200}.{i % 200 + 1}"));
+        Assert.False(t.Locked(IPAddress.Parse("10.9.9.9"), out _));
+        Assert.True(t.ExtraDelayMs() > 0);
+        now += 61_000;
+        Assert.Equal(0, t.ExtraDelayMs());
+    }
+
+    [Fact]
+    public void Ipv6_addresses_share_their_64_and_failures_decay()
     {
         long now = 1000;
         var t = new LoginThrottle(() => now);
-        for (var i = 0; i < 60; i++) t.Failed(IPAddress.Parse($"10.0.{i / 200}.{i % 200 + 1}"));
-        Assert.True(t.Locked(IPAddress.Parse("10.9.9.9"), out _));
-        now += 61_000;
-        Assert.False(t.Locked(IPAddress.Parse("10.9.9.9"), out _));
+        for (var i = 0; i < 6; i++) t.Failed(IPAddress.Parse($"2001:db8:1:2::{i + 1}")); // six addresses of one /64
+        Assert.True(t.Locked(IPAddress.Parse("2001:db8:1:2:ffff::9"), out _)); // same /64
+        Assert.True(t.Locked(IPAddress.Parse("2001:db8:1:2::99"), out _));
+        Assert.False(t.Locked(IPAddress.Parse("2001:db8:1:3::1"), out _));
+        // decay: a quiet spell forgets the old burst, so one more failure is not another max lock
+        now += 20 * 60_000;
+        Assert.False(t.Locked(IPAddress.Parse("2001:db8:1:2::99"), out _));
+        t.Failed(IPAddress.Parse("2001:db8:1:2::99"));
+        Assert.False(t.Locked(IPAddress.Parse("2001:db8:1:2::99"), out _));
+    }
+
+    [Fact]
+    public void An_ipv4_mapped_address_is_the_ipv4_address()
+    {
+        long now = 1000;
+        var t = new LoginThrottle(() => now);
+        for (var i = 0; i < 6; i++) t.Failed(IPAddress.Parse("1.2.3.4").MapToIPv6());
+        Assert.True(t.Locked(IPAddress.Parse("1.2.3.4"), out _));
     }
 }
 

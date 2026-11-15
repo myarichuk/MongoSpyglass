@@ -185,6 +185,7 @@ internal sealed class StorageWriter
             return;
         }
         if (!final && Environment.TickCount64 < _retryAt) return; // backing off
+        var committed = false;
         while (true)
         {
             try
@@ -200,12 +201,9 @@ internal sealed class StorageWriter
                 });
                 Interlocked.Add(ref Written, _batch.Count);
                 Interlocked.Add(ref Updated, _updates.Count);
-                if (_updates.Count > 0 && _live.Subscribers > 0)
-                    foreach (var u in _updates)
-                        if (u.Ctx != null && _store.Get(u.Id) is { } op) // late context: the op left memory when it was stored
-                            _live.Publish("op.updated", op);
                 Volatile.Write(ref FailingSince, 0);
                 _attempts = 0;
+                committed = true;
                 break;
             }
             catch (Exception e)
@@ -230,6 +228,15 @@ internal sealed class StorageWriter
                 break;
             }
         }
+        // after the commit and outside its try: a throwing read or subscriber must not make a stored batch look failed (FC-10)
+        if (committed && _updates.Count > 0 && _live.Subscribers > 0)
+            foreach (var u in _updates)
+                try
+                {
+                    if (u.Ctx != null && _store.Get(u.Id) is { } op) // late context: the op left memory when it was stored
+                        _live.Publish("op.updated", op);
+                }
+                catch (Exception e) { Console.Error.WriteLine($"storage: publishing op.updated failed: {e.GetType().Name}: {e.Message}"); break; }
         Interlocked.Add(ref _ops, -_batch.Count);
         Interlocked.Add(ref _pendingUpdates, -_updates.Count);
         Interlocked.Add(ref _pendingCallsites, -_newCallsites.Count);

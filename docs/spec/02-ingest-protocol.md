@@ -411,7 +411,8 @@ tripwire for the negligible collision case in §3.1.
 ### 6.4 Duplicates
 
 Producers may resend after a timeout. The collector deduplicates by
-`(src, type, joinKey, ts)` (for `stream` records also `seq`: the frames of one read share a `ts`) within the 10-minute window, bounded by memory: 2^18 key hashes per
+`(src, type, joinKey, ts)` (for `stream` records also `seq`: the frames of one read share a `ts`) within the 10-minute window,
+where `ts` is the producer's own value, before the collector clamps an out-of-range one (03 §2): a resend of a skewed record is still a duplicate, bounded by memory: 2^18 key hashes per
 partition (~8 MiB). That covers the whole window below ~440 records/s per partition, and about
 10 s at the 03 §11 rate. Producers resend within seconds (§5: one retry after 1 s).
 

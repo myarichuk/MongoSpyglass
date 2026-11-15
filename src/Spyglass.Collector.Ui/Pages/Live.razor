@@ -24,6 +24,7 @@
         </form>
         <div class="ml-auto flex items-center gap-2 text-ui-label-sm text-muted">
             @if (_error != null) { <span class="text-bad" role="alert" title="@_error">@_error</span> }
+            @if (_notice != null) { <span class="text-warn" role="status" title="@_notice">@_notice</span> }
             <span class="@(_connected ? "text-ok" : "text-warn")">● @(_connected ? "streaming" : _everConnected ? "reconnecting" : "connecting")</span>
             @if (_paused)
             {
@@ -89,8 +90,12 @@
     private bool _connected, _everConnected, _paused, _loaded, _loading, _flushQueued, _disposed, _loadingOlder;
     private int _dropped;
     private long _lastTs;
-    private string? _next, _error;
+    private string? _next, _error, _notice;
     private string _query = "";
+    /// <summary>One per connection attempt or resync: a snapshot of an older one is ignored (FC-15), so it cannot clear the events a newer one holds or overwrite newer rows.</summary>
+    private int _gen;
+    /// <summary>A gap fill starts this far before the newest op start seen: an op that began earlier can complete (and arrive) later, during an outage.</summary>
+    private const long GapMarginUs = 5 * 60_000_000L;
 
     protected override async Task OnParametersSetAsync()
     {
@@ -106,7 +111,7 @@
         if (_cts != null) await _cts.CancelAsync();
         _cts = new CancellationTokenSource();
         _rows.Clear(); _buffer.Clear(); _older.Clear(); _early.Clear();
-        (_dropped, _lastTs, _next, _error, _loaded, _paused, _connected, _everConnected) = (0, 0, null, null, false, false, false, false);
+        (_dropped, _lastTs, _next, _error, _notice, _loaded, _paused, _connected, _everConnected) = (0, 0, null, null, null, false, false, false, false);
         _ = Stream(query, _cts.Token);
     }
 
@@ -134,6 +139,7 @@
         var attempt = 0;
         while (!ct.IsCancellationRequested)
         {
+            _gen++;
             _loading = true;
             _early.Clear();
             try
@@ -143,7 +149,13 @@
                     if (ev == "open")
                     {
                         (_connected, _everConnected, _error, attempt) = (true, true, null, 0);
-                        _ = Snapshot(query, ct);
+                        StartSnapshot(query, ct);
+                    }
+                    else if (ev == "dropped")
+                    {
+                        // this viewer was too slow and the server shed events (03 §8): say so, and fetch what was missed
+                        _notice = "Some operations were missed because the stream fell behind; refreshed.";
+                        StartSnapshot(query, ct);
                     }
                     else if (ev.StartsWith("op.", StringComparison.Ordinal))
                     {
@@ -162,13 +174,22 @@
         }
     }
 
-    private async Task Snapshot(string query, CancellationToken ct)
+    private void StartSnapshot(string query, CancellationToken ct)
+    {
+        _gen++;
+        _loading = true;
+        _early.Clear();
+        _ = Snapshot(query, ct, _gen);
+    }
+
+    private async Task Snapshot(string query, CancellationToken ct, int gen)
     {
         try
         {
             var gap = _lastTs > 0;
-            var page = await Api.Ops(query + (query.Length > 0 ? "&" : "") + (gap ? $"from={_lastTs}&limit=1000" : $"limit={PageSize}"), ct);
+            var page = await Api.Ops(query + (query.Length > 0 ? "&" : "") + (gap ? $"from={Math.Max(0, _lastTs - GapMarginUs)}&limit=1000" : $"limit={PageSize}"), ct);
             ct.ThrowIfCancellationRequested();
+            if (gen != _gen) return; // a newer connection or resync owns the early events and the rows now
             if (page != null)
             {
                 foreach (var o in page.Items.OrderBy(o => o.Ts).ThenBy(o => o.Id, StringComparer.Ordinal)) Merge(o, false);
@@ -176,7 +197,7 @@
             }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
-        catch (Exception ex) { _error = "could not load operations: " + ex.Message; }
+        catch (Exception ex) { if (gen != _gen) return; _error = "could not load operations: " + ex.Message; }
         // the events that raced the snapshot, in arrival order: creations dedupe by id, updates patch whichever list holds the row
         foreach (var (op, updated) in _early) Merge(op, updated);
         _early.Clear();

@@ -4,6 +4,10 @@ namespace Spyglass.Collector.Model;
 public abstract class Record
 {
     public long Ts;
+    /// <summary>The producer's own <c>ts</c> when the collector clamped <see cref="Ts"/> (clock skew): duplicate suppression keys on it (02 §6.4, FC-8).</summary>
+    public long OriginalTs = long.MinValue;
+    /// <summary>The <c>ts</c> a resend of this record carries: what duplicate suppression keys on.</summary>
+    public long DedupTs => OriginalTs == long.MinValue ? Ts : OriginalTs;
     public string Src = "";
     /// <summary>Unknown fields, verbatim, as a JSON object; null if there were none (03 §2).</summary>
     public string? Extra;

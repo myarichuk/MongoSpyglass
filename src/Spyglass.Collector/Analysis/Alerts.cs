@@ -62,7 +62,6 @@ public sealed class AlertBook
     };
 
     private readonly Dictionary<(string Rule, string Scope), Alert> _alerts = [];
-    private readonly HashSet<(string Rule, string Scope)> _muted = [];
     private volatile Alert[] _snapshot = [];
     private bool _dirty;
 
@@ -85,7 +84,8 @@ public sealed class AlertBook
             if (a.Muted) // silent, but the problem is still there: it must not resolve or expire under the mute (CA-21)
             {
                 a.Occurrences++;
-                if (!a.Open) { a.Open = true; a.ResolvedAt = null; _dirty = true; }
+                if (!a.Open) { a.Open = true; a.ResolvedAt = null; }
+                _dirty = true; // the occurrence count and times reach readers (and, through the caller, the store) while muted (FC-5)
                 return null;
             }
             var reopened = !a.Open;
@@ -112,12 +112,11 @@ public sealed class AlertBook
             Occurrences = 1,
             Summary = summary,
             Details = details,
-            Muted = _muted.Contains((rule, scopeKey)),
         };
         if (opId != null) a.SampleOpIds.Add(opId);
         _alerts[(rule, scopeKey)] = a;
         _dirty = true;
-        return a.Muted ? null : new AlertChange(a, true);
+        return new AlertChange(a, true);
     }
 
     /// <summary>Resolves alerts quiet for their rule's period; returns those resolved.</summary>
@@ -135,13 +134,13 @@ public sealed class AlertBook
         return resolved;
     }
 
-    public bool SetMuted(string id, bool muted)
+    public bool SetMuted(string id, bool muted) => SetMuted(id, muted, out _);
+
+    public bool SetMuted(string id, bool muted, out Alert? alert)
     {
-        var a = _alerts.Values.FirstOrDefault(x => x.Id == id);
+        var a = alert = _alerts.Values.FirstOrDefault(x => x.Id == id);
         if (a == null) return false;
         a.Muted = muted;
-        if (muted) _muted.Add((a.Rule, a.ScopeKey));
-        else _muted.Remove((a.Rule, a.ScopeKey));
         _dirty = true;
         return true;
     }
@@ -172,7 +171,6 @@ public sealed class AlertBook
     public void Restore(Alert a)
     {
         _alerts[(a.Rule, a.ScopeKey)] = a;
-        if (a.Muted) _muted.Add((a.Rule, a.ScopeKey));
         _dirty = true;
     }
 

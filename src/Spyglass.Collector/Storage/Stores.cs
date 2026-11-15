@@ -12,6 +12,9 @@ public sealed record OpQuery
     public long? MinLatencyUs;
     public int Limit = 100;
     public string? Cursor;
+    /// <summary>Set by the store: rows read for this page, and the id of the last of them. A stored row that no longer parses is skipped, so a short page is not the end (FC-21).</summary>
+    public int? Scanned;
+    public string? LastId;
 }
 
 /// <summary>03 §7. Written by one writer thread; read concurrently by the API.</summary>

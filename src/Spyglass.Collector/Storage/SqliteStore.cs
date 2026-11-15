@@ -41,7 +41,7 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
         _readCs = new SqliteConnectionStringBuilder(cs) { Mode = SqliteOpenMode.ReadOnly }.ToString();
         _write = new SqliteConnection(cs);
         _write.Open();
-        // the ops table carries five secondary indexes: a 64 MiB page cache keeps their hot pages resident
+        // the ops table carries six secondary indexes: a 64 MiB page cache keeps their hot pages resident
         Exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=OFF; " +
              "PRAGMA cache_size=-65536; PRAGMA mmap_size=268435456; PRAGMA temp_store=MEMORY; PRAGMA journal_size_limit=67108864;");
         Exec("""
@@ -222,9 +222,29 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
         return rd.Read() ? Materialize(rd) : null;
     }
 
+    /// <summary>
+    /// Rows a min-latency query reads through the primary key, newest first, before it falls back to the latency index. A threshold
+    /// that most rows pass fills the page long before this; a rare one is cheap through the index (FC-9).
+    /// </summary>
+    private const int LatencyScanBudget = 50_000;
+
     public List<Operation> Query(OpQuery q)
     {
         using var c = Read();
+        var limit = Math.Clamp(q.Limit, 1, 1000);
+        if (q.MinLatencyUs != null)
+        {
+            // WHERE latency >= ? ORDER BY id DESC LIMIT n plans as a search of ops_latency plus a sort of every match: it reads
+            // millions of rows when the threshold is low. Walk the key backwards instead (the table is ordered by id) for a bounded
+            // number of rows; only when that does not fill the page is the threshold selective enough for the index.
+            var fast = Run(c, q, limit, latencyViaScan: true);
+            if (q.Scanned >= limit) return fast;
+        }
+        return Run(c, q, limit, latencyViaScan: false);
+    }
+
+    private List<Operation> Run(SqliteConnection c, OpQuery q, int limit, bool latencyViaScan)
+    {
         using var cmd = c.CreateCommand();
         var where = new List<string>();
         void Add(string clause, string name, object value) { where.Add(clause); cmd.Parameters.AddWithValue(name, value); }
@@ -243,26 +263,54 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
             if (q.Status != "ok") where.Add("status <> 'ok'");
         }
         if (q.Uow != null) Add("uow = $uow", "$uow", q.Uow);
-        if (q.MinLatencyUs != null) Add("latency >= $lat", "$lat", q.MinLatencyUs);
-        cmd.CommandText = $"SELECT {Columns} FROM ops" +
-                          (where.Count > 0 ? " WHERE " + string.Join(" AND ", where) : "") + " ORDER BY id DESC LIMIT $limit";
-        cmd.Parameters.AddWithValue("$limit", Math.Clamp(q.Limit, 1, 1000));
+        if (q.MinLatencyUs != null && !latencyViaScan) Add("latency >= $lat", "$lat", q.MinLatencyUs);
+        var filter = where.Count > 0 ? " WHERE " + string.Join(" AND ", where) : "";
+        if (q.MinLatencyUs != null && latencyViaScan)
+        {
+            cmd.Parameters.AddWithValue("$lat", q.MinLatencyUs);
+            cmd.CommandText = $"SELECT {Columns} FROM ops WHERE id IN (SELECT id FROM (SELECT id, latency FROM ops{filter} ORDER BY id DESC LIMIT {LatencyScanBudget}) " +
+                              "WHERE latency >= $lat ORDER BY id DESC LIMIT $limit) ORDER BY id DESC";
+        }
+        else cmd.CommandText = $"SELECT {Columns} FROM ops{filter} ORDER BY id DESC LIMIT $limit";
+        cmd.Parameters.AddWithValue("$limit", limit);
         var list = new List<Operation>();
+        var scanned = 0;
+        string? lastId = null;
         using var rd = cmd.ExecuteReader();
         while (rd.Read())
+        {
+            scanned++;
+            lastId = rd.GetString(0);
             if (Materialize(rd) is { } op) list.Add(op);
+        }
+        // a latency scan that came up short says so with Scanned < limit, even when the table was read to its end
+        q.Scanned = scanned;
+        q.LastId = lastId;
         return list;
     }
 
     private const string Columns = "id, ts, app, driver, shape, value_hash, reply_count, alerts, raw, ctx";
 
+    /// <summary>
+    /// A stored line through the ingest parser. A line an older build stored that the stricter parser now refuses for invalid UTF-8 is read
+    /// again with the bad bytes replaced (U+FFFD) rather than made to vanish from queries (FC-21).
+    /// </summary>
+    private static bool ParseStored(byte[] raw, out Record? rec)
+    {
+        if (RecordParser.Parse(raw, out rec, out _) == ParseResult.Ok) return true;
+        if (System.Text.Unicode.Utf8.IsValid(raw)) return false;
+        var fixedUp = Encoding.UTF8.GetBytes(Encoding.UTF8.GetString(raw));
+        if (RecordParser.Parse(fixedUp, out rec, out _) != ParseResult.Ok) return false;
+        return true;
+    }
+
     private static Operation? Materialize(SqliteDataReader rd)
     {
         var raw = (byte[])rd["raw"];
-        if (RecordParser.Parse(raw, out var rec, out _) != ParseResult.Ok || rec is not OpRecord op) return null;
+        if (!ParseStored(raw, out var rec) || rec is not OpRecord op) return null;
         op.Ts = rd.GetInt64(1); // the stored ts (clamped at ingest if it was in the future)
         CmdRecord? ctx = null;
-        if (!rd.IsDBNull(9) && RecordParser.Parse((byte[])rd[9], out var c, out _) == ParseResult.Ok) ctx = c as CmdRecord;
+        if (!rd.IsDBNull(9) && ParseStored((byte[])rd[9], out var c)) ctx = c as CmdRecord;
         return new Operation
         {
             Id = rd.GetString(0),
@@ -390,7 +438,17 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
         get.CommandText = $"SELECT data FROM {table} WHERE shape = $s AND {col} = $k";
         get.Parameters.AddWithValue("$s", shape);
         get.Parameters.AddWithValue("$k", key);
-        var b = get.ExecuteScalar() is byte[] existing ? Decode(existing, shape, key) : new MinuteBucket { ShapeHash = shape, Minute = key };
+        MinuteBucket? b = null;
+        if (get.ExecuteScalar() is byte[] existing)
+        {
+            // FC-7: one row that no longer decodes must not stop every later write: it is replaced by the delta and counted
+            try { b = Decode(existing, shape, key); }
+            catch (Exception)
+            {
+                Interlocked.Increment(ref _undecodable);
+            }
+        }
+        b ??= new MinuteBucket { ShapeHash = shape, Minute = key };
         b.Merge(delta);
         using var put = _write.CreateCommand();
         put.CommandText = $"INSERT OR REPLACE INTO {table} (shape, {col}, data) VALUES ($s, $k, $d)";
@@ -399,6 +457,10 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
         put.Parameters.AddWithValue("$d", Encode(b));
         put.ExecuteNonQuery();
     }
+
+    private long _undecodable;
+    /// <summary>Stored aggregate rows that could not be decoded and were replaced or skipped.</summary>
+    public long UndecodableRows => Interlocked.Read(ref _undecodable);
 
     private static byte[] Encode(MinuteBucket b)
     {
@@ -435,7 +497,10 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
             if (shape != null) cmd.Parameters.AddWithValue("$s", shape);
             using var rd = cmd.ExecuteReader();
             while (rd.Read())
-                list.Add(Decode((byte[])rd[2], rd.GetString(0), rd.GetInt64(1) * scale));
+            {
+                try { list.Add(Decode((byte[])rd[2], rd.GetString(0), rd.GetInt64(1) * scale)); }
+                catch (Exception) { Interlocked.Increment(ref _undecodable); }
+            }
         }
         return list;
     }
@@ -452,7 +517,11 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
                 cmd.CommandText = "SELECT shape, minute, data FROM agg_minute WHERE minute < $c";
                 cmd.Parameters.AddWithValue("$c", cutoff);
                 using var rd = cmd.ExecuteReader();
-                while (rd.Read()) old.Add(Decode((byte[])rd[2], rd.GetString(0), rd.GetInt64(1)));
+                while (rd.Read())
+                {
+                    try { old.Add(Decode((byte[])rd[2], rd.GetString(0), rd.GetInt64(1))); }
+                    catch (Exception) { Interlocked.Increment(ref _undecodable); } // dropped with the rows below
+                }
             }
             using var tx = _write.BeginTransaction();
             foreach (var g in old.GroupBy(b => (b.ShapeHash, Hour: b.Minute / 60)))

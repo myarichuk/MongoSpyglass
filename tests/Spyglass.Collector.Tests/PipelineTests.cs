@@ -321,7 +321,7 @@ public class PipelineTests : IAsyncLifetime
 
         Assert.True(await _c.Analysis.Invoke(() => _c.Analysis.Alerts.SetMuted(reopened.Id, true))); // the book is single-threaded
         await Send(Op(3, "find", latencyUs: 200_000, ts: _now));
-        Assert.Equal(2, Assert.Single(Alerts("slow-shape")).Occurrences);
+        Assert.Equal(3, Assert.Single(Alerts("slow-shape")).Occurrences); // silent, but still counted (and republished: FC-5)
     }
 
     [Fact]

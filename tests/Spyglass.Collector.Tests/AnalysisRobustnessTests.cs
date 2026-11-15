@@ -13,7 +13,7 @@ namespace Spyglass.Collector.Tests;
 internal sealed class FaultyStore : IOperationStore, IAggregateStore, IAlertStore, ICallsiteStore
 {
     public readonly MemoryStore Inner = new();
-    public volatile bool Fail;
+    public volatile bool Fail, FailPrune;
     public int Failures;
 
     private void Check()
@@ -34,7 +34,11 @@ internal sealed class FaultyStore : IOperationStore, IAggregateStore, IAlertStor
     public List<MinuteBucket> Buckets(long fromMinute, long toMinute, string? shape = null) => Inner.Buckets(fromMinute, toMinute, shape);
     public ShapeInfo? Shape(string hash) => Inner.Shape(hash);
     public List<ShapeInfo> Shapes() => Inner.Shapes();
-    public int PruneShapes(long lastSeenBeforeUs) => Inner.PruneShapes(lastSeenBeforeUs);
+    public int PruneShapes(long lastSeenBeforeUs)
+    {
+        if (FailPrune) throw new IOException("prune failed");
+        return Inner.PruneShapes(lastSeenBeforeUs);
+    }
     public void Rollup(long nowUs) => Inner.Rollup(nowUs);
     public void Upsert(IReadOnlyList<Alert> alerts) { Check(); Inner.Upsert(alerts); }
     public List<Alert> All() => Inner.All();

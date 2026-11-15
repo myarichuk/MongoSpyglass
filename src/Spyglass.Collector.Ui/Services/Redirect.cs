@@ -9,8 +9,10 @@ public static class Redirect
     public static string Safe(string? ret)
     {
         if (string.IsNullOrEmpty(ret) || ret.StartsWith("login", StringComparison.OrdinalIgnoreCase)) return "";
-        if (ret[0] is '/' or '\\') return "";
-        foreach (var ch in ret) if (ch < 0x20 || ch == 0x7f || ch == '\\') return "";
+        // URL parsing strips C0/space at both ends, so " //evil" would be "//evil": no whitespace at either end
+        if (ret[0] is '/' or '\\' || char.IsWhiteSpace(ret[0]) || char.IsWhiteSpace(ret[^1])) return "";
+        foreach (var ch in ret) if (ch < 0x20 || (ch >= 0x7f && ch <= 0x9f) || ch == '\\') return "";
+        if (Uri.TryCreate(ret, UriKind.Absolute, out _)) return "";
         var end = ret.IndexOfAny(['/', '?', '#']);
         return (end < 0 ? ret : ret[..end]).Contains(':') ? "" : ret; // "https:…" or "javascript:…" in the first segment
     }

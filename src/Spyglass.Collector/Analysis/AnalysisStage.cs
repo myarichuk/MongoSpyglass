@@ -217,8 +217,11 @@ internal sealed class AnalysisStage
     /// <summary>The op into the aggregates. A shape the catalog dropped (its cap) and the partition will not send again comes back from the store.</summary>
     private void Count(Operation op, long nowUs)
     {
-        if (op.ShapeJson == null && !Aggregates.Shapes.ContainsKey(op.ShapeHash) && _aggregates.Shape(op.ShapeHash) is { } known)
-            Aggregates.Restore(known);
+        // FC-13: a shape missing from the catalog (evicted by the cap, or after a restart past the load cap) is restored from the store
+        // whether or not the op carries JSON, so its first-seen, count and examples are continued, not replaced by the next upsert
+        if (!Aggregates.Shapes.ContainsKey(op.ShapeHash))
+            try { if (_aggregates.Shape(op.ShapeHash) is { } known) Aggregates.Restore(known); }
+            catch (Exception e) { StoreResult(e); }
         Aggregates.Add(op, nowUs);
     }
 
@@ -234,7 +237,8 @@ internal sealed class AnalysisStage
             if (c != null)
             {
                 op.ShapeHash = c.ShapeHash;   // 03 §4.3: getMores group with the query that opened the cursor
-                op.ShapeJson = Aggregates.Shapes.TryGetValue(c.ShapeHash, out var si) ? si.ShapeJson : op.ShapeJson;
+                // a catalog miss: the getMore's own JSON is not the find's shape (FC-12), so Count restores the shape from the store
+                op.ShapeJson = Aggregates.Shapes.TryGetValue(c.ShapeHash, out var si) ? si.ShapeJson : null;
                 op.App ??= c.App;
                 op.AwaitsByDesign |= c.AwaitsByDesign;
             }
@@ -476,8 +480,13 @@ internal sealed class AnalysisStage
         var nowUs = _nowUs();
         var ts = tsOverride ?? op?.Ts ?? nowUs;
         var existing = Alerts.Find(rule, scopeKey);
-        var text = existing is { Open: true } && nowUs - existing.SummaryAtUs < 1_000_000 ? existing.Summary : summary(state);
-        if (Alerts.Hit(rule, scopeKey, existing?.Scope ?? scope(state), text, op?.Id, ts, nowUs) is not { } change) return;
+        // a muted alert's summary is never shown, so it is not rebuilt per hit (FC-14)
+        var text = existing is { Muted: true } || existing is { Open: true } && nowUs - existing.SummaryAtUs < 1_000_000 ? existing.Summary : summary(state);
+        if (Alerts.Hit(rule, scopeKey, existing?.Scope ?? scope(state), text, op?.Id, ts, nowUs) is not { } change)
+        {
+            if (existing is { Muted: true }) _dirtyAlerts.Add(existing); // a muted alert keeps counting: the store follows (FC-5)
+            return;
+        }
         if (op != null && op.Alerts?.Contains(rule) != true)
             op.Alerts = op.Alerts == null ? [rule] : [.. op.Alerts, rule]; // copy on write: /ops/{id} reads a waiting op from an HTTP thread
         _live.Publish(change.Opened ? "alert.opened" : "alert.updated", null, change.Alert, static a => Json.Write(w => Json.Alert(w, a)));
@@ -485,6 +494,14 @@ internal sealed class AnalysisStage
     }
 
     private readonly HashSet<Alert> _dirtyAlerts = [];
+
+    /// <summary>Mutes or unmutes an alert (on the analysis thread, via <c>Invoke</c>) and queues it for the store at once, so the mute survives a restart (FC-5).</summary>
+    public bool Mute(string id, bool muted)
+    {
+        if (!Alerts.SetMuted(id, muted, out var a)) return false;
+        _dirtyAlerts.Add(a!);
+        return true;
+    }
 
     private void TrackStream((string, string, long, int) key, Operation op)
     {
@@ -524,6 +541,14 @@ internal sealed class AnalysisStage
     /// </summary>
     private void Flush()
     {
+        // FC-7: after a failed write the store is left alone for a growing while (0.5 s … 30 s), not hit on every flush; what piles up
+        // meanwhile is bounded (Aggregates.BoundPending) and counted
+        if (Environment.TickCount64 < _storeRetryAt)
+        {
+            Aggregates.BoundPending();
+            Alerts.Publish();
+            return;
+        }
         var (deltas, shapes) = Aggregates.TakeDirty();
         Exception? failed = null;
         if (deltas.Count > 0)
@@ -539,9 +564,21 @@ internal sealed class AnalysisStage
                 _dirtyAlerts.Clear();
             }
             catch (Exception e) { failed = e; }
+        if (failed != null)
+        {
+            _storeFailures++;
+            _storeRetryAt = Environment.TickCount64 + Math.Min(30_000L, 500L << Math.Min(_storeFailures - 1, 6));
+            Aggregates.BoundPending();
+        }
+        else _storeFailures = 0;
         Alerts.Publish();
-        StoreResult(failed);
+        StoreResult(failed ?? _retentionError);
     }
+
+    private long _storeRetryAt;
+    private int _storeFailures;
+    /// <summary>The last retention step (alert delete, shape prune) that failed, until a later run of it succeeds: the flushes in between must not report the store healthy (FC-11).</summary>
+    private Exception? _retentionError;
 
     private void StoreResult(Exception? failed)
     {
@@ -605,13 +642,14 @@ internal sealed class AnalysisStage
     private void Retention(long nowUs)
     {
         if (Alerts.Expire(nowUs, AlertRetention) is { } expired) _pendingAlertDeletes.AddRange(expired);
+        Exception? retentionError = null;
         if (_pendingAlertDeletes.Count > 0)
             try
             {
                 _alertStore.Delete(_pendingAlertDeletes);
                 _pendingAlertDeletes.Clear();
             }
-            catch (Exception e) { StoreResult(e); }
+            catch (Exception e) { retentionError = e; }
         Aggregates.Expire(nowUs, ShapeRetention);
         Cursors.RetainShapes(Aggregates.Shapes);
         if (nowUs >= _nextShapePruneUs) // a scan of the shapes table: hourly
@@ -621,8 +659,10 @@ internal sealed class AnalysisStage
                 _aggregates.PruneShapes(nowUs - (long)ShapeRetention.TotalMicroseconds);
                 _nextShapePruneUs = nowUs + 3_600_000_000;
             }
-            catch (Exception e) { StoreResult(e); }
+            catch (Exception e) { retentionError = e; _nextShapePruneUs = nowUs + 600_000_000; } // a failing scan is not retried every minute
         }
+        _retentionError = retentionError;
+        if (retentionError != null) StoreResult(retentionError);
         if (_collMaxReturned.Count > 100_000) _collMaxReturned.Clear();
     }
 }

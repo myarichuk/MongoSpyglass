@@ -35,11 +35,15 @@ public sealed class ConnectionRegistry
     private readonly int _cap;
     private long _evicted;
 
-    /// <param name="idle">A connection with no record for this long is dropped: its <c>close</c> was lost, or its proxy died (PLAN 1.2).</param>
+    /// <param name="idle">
+    /// A connection with no record for this long is dropped. Off by default (FC-6): <c>conn</c> is sent once at open and once at
+    /// close (02 §4.2), so an idle pool's connection could never get its app and driver back; a dead proxy's connections go with
+    /// <see cref="DropProxy"/> and a lost <c>close</c> is bounded by the cap (least recently seen first).
+    /// </param>
     /// <param name="cap">Hard bound: past it the least recently seen go first.</param>
     public ConnectionRegistry(TimeSpan? idle = null, int cap = 200_000)
     {
-        _idleMs = (long)(idle ?? TimeSpan.FromHours(2)).TotalMilliseconds;
+        _idleMs = idle is { } i ? (long)i.TotalMilliseconds : long.MaxValue;
         _cap = cap;
     }
 

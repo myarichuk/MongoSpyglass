@@ -75,7 +75,7 @@ internal sealed class Partition
     private long _nextStateSweepUs, _clockUs, _knownShapesClearUs;
     private Thread? _thread;
 
-    public long Duplicates, DecodeFailures, Processed;
+    public long Duplicates, DecodeFailures, Processed, Faults;
     /// <summary>Stopwatch ticks spent on work (dequeue to hand-off), not waiting.</summary>
     public long BusyTicks;
     /// <summary>Environment.TickCount64 at the loop's last turn (at least every 100 ms when healthy).</summary>
@@ -151,7 +151,7 @@ internal sealed class Partition
                                 break;
                             case StreamRecord s:
                                 // every stream record of one exhaust cursor has the same requestId and, off one socket read, the same ts: seq tells them apart
-                                if (!_dedup.Seen(Dedup.Key(s.Src, "stream", s.Member, s.RouteSid, s.RequestId, s.Ts, s.Seq)))
+                                if (!_dedup.Seen(Dedup.Key(s.Src, "stream", s.Member, s.RouteSid, s.RequestId, s.DedupTs, s.Seq)))
                                 {
                                     (output.Streams ??= []).Add(s);
                                     forwarded = true;
@@ -162,7 +162,9 @@ internal sealed class Partition
                     }
                     catch (Exception e)
                     {
-                        Console.Error.WriteLine($"partition: {e.GetType().Name}: {e.Message}");
+                        // FC-21: the first few, then every thousandth: a hostile input must not flood stderr
+                        var n = Interlocked.Increment(ref Faults);
+                        if (n <= 10 || n % 1000 == 0) Console.Error.WriteLine($"partition: {e.GetType().Name}: {e.Message} ({n} so far)");
                     }
                     finally
                     {
@@ -185,7 +187,7 @@ internal sealed class Partition
     private void OnCmd(CmdRecord c, long now, PartitionOutput output)
     {
         var key = c.Key!.Value; // keyless cmds are orphans at ingest and never routed here
-        if (_dedup.Seen(Dedup.Key(c.Src, "cmd", key.Member, key.ServerConnectionId, key.RequestId, c.Ts)))
+        if (_dedup.Seen(Dedup.Key(c.Src, "cmd", key.Member, key.ServerConnectionId, key.RequestId, c.DedupTs)))
         {
             Interlocked.Increment(ref _joinCounters.Duplicates);
             return;
@@ -217,7 +219,7 @@ internal sealed class Partition
 
     private (Operation, List<RuleHit>?)? Enrich(OpRecord r)
     {
-        if (_dedup.Seen(Dedup.Key(r.Src, "op", r.Member, r.RouteSid, r.RequestId, r.Ts)))
+        if (_dedup.Seen(Dedup.Key(r.Src, "op", r.Member, r.RouteSid, r.RequestId, r.DedupTs)))
         {
             Interlocked.Increment(ref Duplicates);
             return null;

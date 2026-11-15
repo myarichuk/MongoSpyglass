@@ -77,6 +77,20 @@ public sealed class Api(HttpClient http, NavigationManager nav)
         return true;
     }
 
+    /// <summary>The auth mode ("none", "password", "header"), asked without an attempt to sign in (FC-1); null when unreadable.</summary>
+    public async Task<string?> AuthMode(CancellationToken ct = default)
+    {
+        using var r = await http.GetAsync("api/v1/auth/mode", ct);
+        Observe(r);
+        if (!r.IsSuccessStatusCode) return null;
+        try
+        {
+            var body = await r.Content.ReadFromJsonAsync<JsonElement>(Json, ct);
+            return body.ValueKind == JsonValueKind.Object && body.TryGetProperty("auth", out var a) ? a.GetString() : null;
+        }
+        catch (JsonException) { return null; }
+    }
+
     /// <summary>Wrong password (401) is a result, not an exception; a network failure throws.</summary>
     public async Task<LoginResult> Login(string password, CancellationToken ct = default)
     {

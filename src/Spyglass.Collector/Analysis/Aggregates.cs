@@ -56,7 +56,7 @@ public sealed class ShapeInfo
 /// (two tumbling hourly sketches per shape) rather than a sliding 60-minute window, which would cost 60
 /// sketches per shape.
 /// </summary>
-public sealed class AggregateBook(TimeSpan? exampleRetention = null)
+public sealed class AggregateBook(TimeSpan? exampleRetention = null, int maxPendingDeltas = AggregateBook.MaxPendingDeltas)
 {
     public const int Examples = 10;
     /// <summary>The catalog's cap (03 §5: analyzers bound their state in total): past it the least recently seen shapes go.</summary>
@@ -195,6 +195,20 @@ public sealed class AggregateBook(TimeSpan? exampleRetention = null)
         }
         Evicted += dropped.Count;
         return dropped;
+    }
+
+    /// <summary>Most pending bucket deltas kept while the store is failing (FC-7): about a shape-minute each, so a few minutes of a busy catalog.</summary>
+    public const int MaxPendingDeltas = 100_000;
+    /// <summary>Bucket deltas dropped (oldest minutes first) because the store kept failing: /metrics.</summary>
+    public long DeltasDropped;
+
+    /// <summary>Keeps the pending deltas within <see cref="MaxPendingDeltas"/>: the oldest minutes go, and are counted.</summary>
+    public void BoundPending()
+    {
+        var over = _delta.Count - maxPendingDeltas;
+        if (over <= 0) return;
+        foreach (var k in _delta.OrderBy(kv => kv.Key.Item2).Take(over).Select(kv => kv.Key).ToList()) _delta.Remove(k);
+        DeltasDropped += over;
     }
 
     /// <summary>Puts back what a failed store write took (the next flush retries it).</summary>

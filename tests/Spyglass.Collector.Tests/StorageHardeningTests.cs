@@ -147,6 +147,7 @@ public sealed class StorageHardeningTests : IDisposable
         using var store = new SqliteStore(_dir);
         // the exact WHERE terms Query emits
         Assert.Contains(Plan(store, "SELECT id FROM ops WHERE status = 'error' AND status <> 'ok' ORDER BY id DESC LIMIT 10"), p => p.Contains("ops_status"));
+        // the index is still there for a selective threshold: Query falls back to it when the key walk does not fill the page (FC-9)
         Assert.Contains(Plan(store, "SELECT id FROM ops WHERE latency >= 100000 ORDER BY id DESC LIMIT 10"), p => p.Contains("ops_latency"));
         // and Query itself still answers both
         Assert.Empty(store.Query(new OpQuery { Status = "error" }));

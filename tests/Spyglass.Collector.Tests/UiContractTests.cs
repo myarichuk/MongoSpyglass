@@ -148,7 +148,6 @@ public sealed class UiLogicTests
     [InlineData("")]
     [InlineData("{\"find\":\"orders\",\"filter\":{\"a\":")] // a truncated capture
     [InlineData("[1,2]")]
-    [InlineData("{\"find\":\"a\",\"x\":{\"$binary\":{\"base64\":\"!!\",\"subType\":\"zz\"}}}")]
     public void Unconvertible_input_yields_null_instead_of_throwing(string input) => Assert.Null(MongoShell.RunCommand("shop", input));
 
     [Fact]
@@ -167,6 +166,17 @@ public sealed class UiLogicTests
     [InlineData("data:text/html,x", "")]
     [InlineData("login?return=x", "")]
     [InlineData("\t//evil.example", "")]
+    [InlineData(" //evil.example/x", "")]
+    [InlineData("+//evil", "+//evil")] // not a space, and not a path an URL parser reads as scheme-relative (it is base-relative)
+    [InlineData("//evil.example ", "")]
+    [InlineData("x ", "")]
+    [InlineData(" x", "")]
+    [InlineData("\n//evil", "")]
+    [InlineData("/\\evil", "")]
+    [InlineData("/%2F/evil", "")]
+    [InlineData("\u0085//evil", "")]
+    [InlineData("a\\b", "")]
+    [InlineData("c:/x", "")]
     [InlineData("x?u=http://ok.example", "x?u=http://ok.example")] // a colon after the first path segment is just a query
     public void Login_return_is_only_ever_local(string? input, string expected) => Assert.Equal(expected, Redirect.Safe(input));
 

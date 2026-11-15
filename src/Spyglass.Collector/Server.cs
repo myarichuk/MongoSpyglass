@@ -71,12 +71,14 @@ public sealed class Server : IAsyncDisposable
     {
         var app = _app;
         // no auth (03 §8): states and counts only
-        app.MapGet("/healthz", () => Health(live: true));
-        app.MapGet("/readyz", () => Health(live: false));
+        app.MapGet("/healthz", (HttpContext c) => Health(c, live: true));
+        app.MapGet("/readyz", (HttpContext c) => Health(c, live: false));
         app.MapPost("/ingest/v0", Ingest);
 
         var api = app.MapGroup("/api/v1");
         api.AddEndpointFilter(async (ctx, next) => Authorized(ctx.HttpContext) ? await next(ctx) : Results.Unauthorized());
+        // FC-1: the login page learns the mode here; it is not a login attempt and never touches the throttle
+        app.MapGet("/api/v1/auth/mode", () => Obj(("auth", Options.Auth.ToString().ToLowerInvariant())));
         app.MapPost("/api/v1/login", (Delegate)Login); // outside the filter: it is how one gets authorized
         app.MapPost("/api/v1/logout", Logout);
         api.MapGet("/whoami", (HttpContext c) => Obj(("auth", Options.Auth.ToString().ToLowerInvariant()), ("user", User(c))));
@@ -174,9 +176,9 @@ public sealed class Server : IAsyncDisposable
         });
     }
 
-    private IResult Health(bool live)
+    private IResult Health(HttpContext c0, bool live)
     {
-        var h = Collector.Health();
+        var h = Collector.Health(detail: Authorized(c0)); // error text only for a signed-in caller (FC-18)
         var ok = live ? h.Live : h.Ready;
         var body = Json.Write(w =>
         {
@@ -221,8 +223,8 @@ public sealed class Server : IAsyncDisposable
                     try { decoded = Encoding.UTF8.GetString(Convert.FromBase64String(h[6..].Trim())); }
                     catch (FormatException) { return null; }
                     var colon = decoded.IndexOf(':');
-                    var ip = c.Connection.RemoteIpAddress;
-                    if (_throttle.Locked(ip, out _)) return null;
+                    var ip = ClientIp(c);
+                    if (_throttle.Locked(ip, out var wait)) { c.Response.Headers.RetryAfter = wait.ToString(System.Globalization.CultureInfo.InvariantCulture); return null; }
                     if (colon >= 0 && Same(decoded[(colon + 1)..], Options.AdminPassword!)) { _throttle.Succeeded(ip); return "admin"; }
                     _throttle.Failed(ip);
                 }
@@ -241,6 +243,30 @@ public sealed class Server : IAsyncDisposable
         return false;
     }
 
+    /// <summary>
+    /// The address the login throttle keys on (FC-2): the TCP peer, or, when the peer is a trusted proxy, the right-most
+    /// <c>X-Forwarded-For</c> hop that is not itself a trusted proxy (a client can only add hops to the left of it).
+    /// </summary>
+    internal System.Net.IPAddress? ClientIp(HttpContext c)
+    {
+        var peer = c.Connection.RemoteIpAddress;
+        if (peer == null || !IsTrustedProxy(c)) return peer;
+        var hops = c.Request.Headers["X-Forwarded-For"].ToString().Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        for (var i = hops.Length - 1; i >= 0; i--)
+        {
+            var h = hops[i];
+            if (!System.Net.IPAddress.TryParse(h, out var ip))
+            {
+                // "1.2.3.4:5678" / "[::1]:5678"
+                var colon = h.LastIndexOf(':');
+                if (colon <= 0 || h.IndexOf(':') != colon && h[0] != '[' || !System.Net.IPAddress.TryParse(h[..colon].Trim('[', ']'), out ip)) return peer; // unreadable hop: do not guess
+            }
+            if (ip.IsIPv4MappedToIPv6) ip = ip.MapToIPv4();
+            if (!Options.TrustedProxies.Any(net => net.Contains(ip))) return ip;
+        }
+        return peer;
+    }
+
     /// <summary>The request reached the proxy over TLS: this connection is, or a trusted proxy says so.</summary>
     private bool IsHttps(HttpContext c) =>
         c.Request.IsHttps || (IsTrustedProxy(c) && string.Equals(c.Request.Headers["X-Forwarded-Proto"].FirstOrDefault()?.Split(',')[0].Trim(), "https", StringComparison.OrdinalIgnoreCase));
@@ -251,7 +277,7 @@ public sealed class Server : IAsyncDisposable
     private async Task<IResult> Login(HttpContext c)
     {
         if (Options.Auth != AuthMode.Password) return Obj(("auth", Options.Auth.ToString().ToLowerInvariant()));
-        var ip = c.Connection.RemoteIpAddress;
+        var ip = ClientIp(c);
         if (_throttle.Locked(ip, out var retry))
         {
             c.Response.Headers.RetryAfter = retry.ToString(System.Globalization.CultureInfo.InvariantCulture);
@@ -270,11 +296,12 @@ public sealed class Server : IAsyncDisposable
                 password = doc.RootElement.ValueKind == JsonValueKind.Object && doc.RootElement.TryGetProperty("password", out var p) && p.ValueKind == JsonValueKind.String ? p.GetString() : null;
             }
         }
-        catch (Exception e) when (e is JsonException or InvalidDataException or BadHttpRequestException or IOException) { }
+        catch (BadHttpRequestException) { _throttle.Failed(ip); return Results.StatusCode(StatusCodes.Status413PayloadTooLarge); } // a chunked body over the cap
+        catch (Exception e) when (e is JsonException or InvalidDataException or IOException) { }
         if (password == null || !Same(password, Options.AdminPassword!))
         {
             _throttle.Failed(ip);
-            await Task.Delay(250).ConfigureAwait(false); // blunt the online guessing rate
+            await Task.Delay(250 + _throttle.ExtraDelayMs()).ConfigureAwait(false); // blunt the online guessing rate
             return Results.Unauthorized();
         }
         _throttle.Succeeded(ip);
@@ -379,7 +406,7 @@ public sealed class Server : IAsyncDisposable
             w.WriteStartArray("items");
             foreach (var o in ops) Json.OpSummary(w, o);
             w.WriteEndArray();
-            if (ops.Count == q.Limit) w.WriteString("next", ops[^1].Id); else w.WriteNull("next");
+            if ((q.Scanned ?? ops.Count) >= q.Limit && (q.LastId ?? ops.LastOrDefault()?.Id) is { } next) w.WriteString("next", next); else w.WriteNull("next");
             w.WriteEndObject();
         }));
     }
@@ -581,7 +608,7 @@ public sealed class Server : IAsyncDisposable
     }
 
     private async Task<IResult> Mute(string id, bool muted) =>
-        await Collector.Analysis.Invoke(() => Collector.Analysis.Alerts.SetMuted(id, muted)).ConfigureAwait(false)
+        await Collector.Analysis.Invoke(() => Collector.Analysis.Mute(id, muted)).ConfigureAwait(false)
             ? Obj(("id", id), ("muted", muted))
             : Results.NotFound();
 
@@ -778,15 +805,16 @@ public sealed class Server : IAsyncDisposable
                     await c.Response.WriteAsync($"{{\"type\":\"truncated\",\"limit\":{MaxExportOps}}}\n", ct).ConfigureAwait(false);
                     break;
                 }
-                var page = Collector.Ops.Query(new OpQuery { From = from, To = to, Limit = 1000, Cursor = cursor });
+                var pq = new OpQuery { From = from, To = to, Limit = 1000, Cursor = cursor };
+                var page = Collector.Ops.Query(pq);
                 foreach (var o in page)
                 {
                     await c.Response.Body.WriteAsync(Json.Write(w => Json.OpDetail(w, o, null)), ct).ConfigureAwait(false);
                     await c.Response.WriteAsync("\n", ct).ConfigureAwait(false);
                 }
                 written += page.Count;
-                if (page.Count < 1000) break;
-                cursor = page[^1].Id;
+                if ((pq.Scanned ?? page.Count) < 1000) break; // rows that no longer parse are skipped, so count what was read, not what was kept
+                cursor = pq.LastId ?? page[^1].Id;
             }
             if (ct.IsCancellationRequested) return;
         }

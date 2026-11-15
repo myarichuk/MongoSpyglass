@@ -190,8 +190,9 @@ Alert { id, rule, scope{shapeHash?, coll?, app?, member?, uowName?, callsite?}, 
   up to 10 sample op ids.
 * An alert is **resolved** automatically after `quietPeriod` (rule-specific) with no
   occurrences, measured on the collector's clock. A later occurrence reopens it.
-* Users can mute a `(rule, scope)`. A muted alert keeps tracking occurrences silently, resolves
-  as usual, and is never deleted by retention while muted (so the mute survives expiry and restarts).
+* Users can mute a `(rule, scope)`. A muted alert keeps tracking occurrences silently (its count and times are
+  published and stored like any other's, but it raises no `alert.*` event and builds no new summary), and is never
+  deleted by retention while muted. The mute itself is written to the store when it is set, so it survives restarts.
 
 ### 5.2 Rules
 
@@ -293,16 +294,22 @@ before aggregates are ever dropped. A batch (appends, updates, callsites) is one
 write is retried with backoff (6 attempts, 250 ms to 4 s), then dropped and counted
 (`spyglass_collector_storage_dropped_total`); failed ops (`ok:0`, write errors, write-concern errors) are
 never sampled, but even they are not queued past 2× the backlog bound (200k ops), and updates and callsite
-records are bounded too (200k, 50k): over a bound they are dropped and counted. The WAL is capped
+records are bounded too (200k, 50k): over a bound they are dropped and counted. Aggregate and alert writes (the analysis stage's)
+back off the same way when the store fails (0.5 s doubling to 30 s) and keep at most 100k pending minute deltas, oldest minute first
+(`spyglass_collector_aggregate_deltas_dropped_total`); a stored aggregate row that no longer decodes is replaced by the
+delta and counted, never allowed to block later writes. The WAL is capped
 (`journal_size_limit` 64 MiB, truncated after retention) and any excess counts toward the 5 GiB bound.
-The collector logs its configured memory worst case at startup (§11). Connections idle for 2 h (or past
-200k) and producers idle for 24 h (or past 10k) are evicted (`/metrics`). `--data :memory:` keeps ops by
+The collector logs its configured memory worst case at startup (§11). Connections are evicted only past
+200k (least recently seen first) or when their proxy expires: `conn` is sent once at open (02 §4.2), so an idle pool's
+connection must keep its app and driver however long it sleeps. Producers idle for 24 h (or past 10k) are evicted (`/metrics`). `--data :memory:` keeps ops by
 count and size, rolls minute buckets up to hours, and caps callsites.
 
 ## 8. API (REST + SSE, JSON)
 
-Base path `/api/v1`. All endpoints require auth (§9) except `/healthz` and `/readyz`, which report
-states and counts only.
+Base path `/api/v1`. All endpoints require auth (§9) except `/healthz`, `/readyz` (states and counts only: an
+unauthenticated caller gets no exception text; a signed-in one gets the last error in `detail`), `POST /login`
+and `GET /auth/mode` (`{auth: "none"|"password"|"header"}`: how the login page learns the mode without an attempt
+that the throttle would count).
 
 | Path | 200 when | 503 when |
 |---|---|---|
@@ -358,9 +365,13 @@ liveness one: restarting a collector that sheds load loses its in-memory state a
   a trusted proxy says the client used TLS.
 * **Login hardening.** `POST /api/v1/login` reads at most 4 KiB (413 beyond), answers 401 to a body that
   is not `{"password": "<string>"}`, and backs off guessing: after 5 failures from one address that address
-  gets 429 with `Retry-After` for 2^(n-6) s (at most 15 min); more than 60 failures a minute from
-  anywhere make every address wait out the minute (so an attack can lock the legitimate user out for a
-  minute; HTTP Basic failures count too). A success clears the address.
+  gets 429 with `Retry-After` for 2^(n-6) s (at most 15 min), and 10 quiet minutes forget its failures. "Address"
+  is the TCP peer, or, when the peer is in `SPYGLASS_TRUSTED_PROXIES`, the right-most `X-Forwarded-For` hop
+  that is not itself a trusted proxy (so one user behind the proxy cannot lock out another, and a client cannot
+  pick its own key); IPv6 clients count per /64. More than 60 failures a minute from anywhere only add a 2 s delay to
+  failed answers: no address is ever locked by another's failures. HTTP Basic failures count too (and a locked
+  Basic client sees `Retry-After`). A success clears the address. A body past 4 KiB is 413 whether its length
+  was declared or chunked.
 * **Binding:** API and UI bind to loopback by default.
 * **Data:** stored data is already redacted by the proxy (I7). The collector MUST NOT accept
   `op` records whose `cmd` decodes to a redacted-command name with a non-redacted body

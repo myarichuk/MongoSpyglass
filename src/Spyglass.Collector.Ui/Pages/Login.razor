@@ -25,15 +25,15 @@
     private string? _error;
     private bool _busy, _headerMode;
 
-    // The login endpoint answers 200 {auth} without a password in the modes that have none: "none" needs no login at all and
+    // GET auth/mode names the mode without a password: "none" needs no login at all and
     // "header" means this page is a dead end (a 401 elsewhere is the proxy's missing header), so say so instead of showing a form.
     protected override async Task OnInitializedAsync()
     {
         try
         {
-            var probe = await Api.Login("");
-            _headerMode = probe is { Ok: true, Auth: "header" };
-            if (probe is { Ok: true, Auth: not "header" }) Leave();
+            var mode = await Api.AuthMode(); // a plain GET: never an attempt, never counted by the throttle
+            _headerMode = mode == "header";
+            if (mode is "none") Leave();
         }
         catch (HttpRequestException) { }
     }

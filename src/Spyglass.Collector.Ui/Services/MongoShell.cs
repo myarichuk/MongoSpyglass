@@ -24,10 +24,7 @@ public static class MongoShell
             Object(sb, doc.RootElement, 0, top: true);
             return sb.Append(')').ToString();
         }
-        catch (JsonException) { return null; }
-        catch (FormatException) { return null; }
-        catch (InvalidOperationException) { return null; }
-        catch (KeyNotFoundException) { return null; }
+        catch (Exception) { return null; } // never throws: a copy button must not take the page down
     }
 
     private static string Str(string s) => JsonSerializer.Serialize(s);
@@ -75,7 +72,11 @@ public static class MongoShell
         sb.Append('}');
     }
 
-    /// <summary>The shell constructor for a one-key extended-JSON wrapper, or null when <paramref name="o"/> is an ordinary document.</summary>
+    /// <summary>
+    /// The shell constructor for a one-key extended-JSON wrapper, or null when <paramref name="o"/> is an ordinary document.
+    /// Relaxed EJSON is ambiguous with real documents, so every payload is validated before it is emitted as code (FC-4):
+    /// a value without the wrapper's exact shape makes the object an ordinary (quoted) document.
+    /// </summary>
     private static string? Extended(JsonElement o)
     {
         var n = 0;
@@ -84,34 +85,45 @@ public static class MongoShell
         foreach (var p in o.EnumerateObject()) { if (n++ == 0) (key, v) = (p.Name, p.Value); }
         if (n != 1 || key == null || key[0] != '$') return null;
         var s = v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+        var inv = CultureInfo.InvariantCulture;
         switch (key)
         {
-            case "$oid" when s != null: return $"ObjectId({Str(s)})";
-            case "$date" when s != null: return $"ISODate({Str(s)})";
-            case "$date" when v.ValueKind == JsonValueKind.Object && v.TryGetProperty("$numberLong", out var ms) && ms.GetString() is { } msv:
-                return $"new Date({msv})";
-            case "$date" when v.ValueKind == JsonValueKind.Number: return $"new Date({v.GetRawText()})";
-            case "$numberLong" when s != null: return $"NumberLong({Str(s)})";
-            case "$numberInt" when s != null: return s;
-            case "$numberDouble" when s != null: return s; // also NaN / Infinity / -Infinity, which are shell globals
-            case "$numberDecimal" when s != null: return $"NumberDecimal({Str(s)})";
-            case "$uuid" when s != null: return $"UUID({Str(s)})";
+            case "$oid" when s is { Length: 24 } && s.All(Uri.IsHexDigit): return $"ObjectId({Str(s)})";
+            case "$date" when s != null && DateTimeOffset.TryParse(s, inv, DateTimeStyles.AssumeUniversal, out _): return $"ISODate({Str(s)})";
+            case "$date" when v.ValueKind == JsonValueKind.Object && v.TryGetProperty("$numberLong", out var ms) && ms.ValueKind == JsonValueKind.String
+                              && long.TryParse(ms.GetString(), NumberStyles.AllowLeadingSign, inv, out var msv):
+                return $"new Date({msv.ToString(inv)})";
+            case "$date" when v.ValueKind == JsonValueKind.Number && v.TryGetInt64(out var dn): return $"new Date({dn.ToString(inv)})";
+            case "$numberLong" when s != null && long.TryParse(s, NumberStyles.AllowLeadingSign, inv, out _): return $"NumberLong({Str(s)})";
+            case "$numberInt" when s != null && int.TryParse(s, NumberStyles.AllowLeadingSign, inv, out var ni): return ni.ToString(inv);
+            case "$numberDouble" when s is "NaN" or "Infinity" or "-Infinity": return s; // shell globals
+            case "$numberDouble" when s != null && double.TryParse(s, NumberStyles.Float, inv, out var nd) && double.IsFinite(nd): return nd.ToString("R", inv);
+            case "$numberDecimal" when s != null && (s is "NaN" or "Infinity" or "-Infinity" || decimal.TryParse(s, NumberStyles.Float, inv, out _)): return $"NumberDecimal({Str(s)})";
+            case "$uuid" when s != null && Guid.TryParse(s, out _): return $"UUID({Str(s)})";
             case "$symbol" when s != null: return Str(s);
             case "$minKey": return "MinKey()";
             case "$maxKey": return "MaxKey()";
             case "$undefined": return "undefined";
-            case "$regularExpression" when v.ValueKind == JsonValueKind.Object:
-                return $"new RegExp({Str(v.GetProperty("pattern").GetString() ?? "")}, {Str(v.GetProperty("options").GetString() ?? "")})";
-            case "$timestamp" when v.ValueKind == JsonValueKind.Object:
-                return $"Timestamp({v.GetProperty("t").GetRawText()}, {v.GetProperty("i").GetRawText()})";
-            case "$binary" when v.ValueKind == JsonValueKind.Object:
+            case "$regularExpression" when v.ValueKind == JsonValueKind.Object
+                                           && v.TryGetProperty("pattern", out var pat) && pat.ValueKind == JsonValueKind.String
+                                           && v.TryGetProperty("options", out var opt) && opt.ValueKind == JsonValueKind.String:
+                return $"new RegExp({Str(pat.GetString()!)}, {Str(opt.GetString()!)})";
+            case "$timestamp" when v.ValueKind == JsonValueKind.Object
+                                   && v.TryGetProperty("t", out var t) && t.ValueKind == JsonValueKind.Number && t.TryGetUInt32(out var tv)
+                                   && v.TryGetProperty("i", out var i) && i.ValueKind == JsonValueKind.Number && i.TryGetUInt32(out var iv):
+                return $"Timestamp({tv.ToString(inv)}, {iv.ToString(inv)})";
+            case "$binary" when v.ValueKind == JsonValueKind.Object
+                                && v.TryGetProperty("base64", out var b64e) && b64e.ValueKind == JsonValueKind.String
+                                && v.TryGetProperty("subType", out var ste) && ste.ValueKind == JsonValueKind.String
+                                && ste.GetString() is { Length: > 0 and <= 2 } sts
+                                && int.TryParse(sts, NumberStyles.AllowHexSpecifier, inv, out var sub):
             {
-                var b64 = v.GetProperty("base64").GetString() ?? "";
-                var sub = int.Parse(v.GetProperty("subType").GetString() ?? "0", NumberStyles.HexNumber, CultureInfo.InvariantCulture);
-                var bytes = Convert.FromBase64String(b64);
-                return sub == 4 && bytes.Length == 16
-                    ? $"UUID({Str(new Guid(bytes, bigEndian: true).ToString())})"
-                    : $"BinData({sub}, {Str(b64)})";
+                var b64 = b64e.GetString()!;
+                var bytes = new byte[b64.Length * 3 / 4 + 3];
+                if (!Convert.TryFromBase64String(b64, bytes, out var len)) return null;
+                return sub == 4 && len == 16
+                    ? $"UUID({Str(new Guid(bytes.AsSpan(0, 16), bigEndian: true).ToString())})"
+                    : $"BinData({sub.ToString(inv)}, {Str(b64)})";
             }
             default: return null;
         }

@@ -183,6 +183,7 @@ public sealed class Collector : IAsyncDisposable
             producerRecords++;
             if (r.Ts > maxTs || r.Ts < minTs) // 03 §2: clamp, count per src
             {
+                r.OriginalTs = r.Ts; // a resend carries the same ts: dedup keys on it, not on the clamped value (FC-8)
                 r.Ts = now;
                 Interlocked.Increment(ref producer!.ClockSkewed);
                 Interlocked.Increment(ref ClockSkewed);
@@ -307,7 +308,8 @@ public sealed class Collector : IAsyncDisposable
         await _writer.Barrier().ConfigureAwait(false);
     }
 
-    public HealthReport Health()
+    /// <param name="detail">Include exception text (file paths, keys, SQLite messages): only for an authenticated caller; <c>/healthz</c> is served without auth (03 §8, FC-18).</param>
+    public HealthReport Health(bool detail = true)
     {
         var now = Environment.TickCount64;
         var checks = new List<HealthCheck>();
@@ -323,9 +325,9 @@ public sealed class Collector : IAsyncDisposable
         var aFailing = Volatile.Read(ref _analysis.StoreFailingSince); // aggregate/alert flushes run on the analysis thread
         if (aFailing != 0 && (failing == 0 || aFailing < failing)) { failing = aFailing; lastError = _analysis.LastStoreError; }
         checks.Add(new HealthCheck("storage", failing == 0 || now - failing < Options.HealthStorageFailing.TotalMilliseconds, true,
-            failing == 0 ? "writes succeeding" : $"writes failing for {(now - failing) / 1000.0:F0} s: {lastError}"));
+            failing == 0 ? "writes succeeding" : $"writes failing for {(now - failing) / 1000.0:F0} s" + (detail ? $": {lastError}" : "")));
         checks.Add(new HealthCheck("analysis-errors", true, false,
-            $"{Volatile.Read(ref _analysis.Errors)} exceptions isolated" + (_analysis.LastError is { } le ? $", last: {le}" : "")));
+            $"{Volatile.Read(ref _analysis.Errors)} exceptions isolated" + (detail && _analysis.LastError is { } le ? $", last: {le}" : "")));
         var queued = QueuedBytes;
         checks.Add(new HealthCheck("ingest-queue", queued <= Options.QueueBytes * 9 / 10, false,
             $"{queued * 100.0 / Options.QueueBytes:F1} % of {Options.QueueBytes / 1048576} MiB (429 above 90 %)"));
@@ -367,7 +369,7 @@ public sealed class Collector : IAsyncDisposable
         M("spyglass_collector_ops_analysed_total", "counter", "Operations through the analysis stage.", ("", _analysis.Processed));
         M("spyglass_collector_ops_stored_total", "counter", "Operations written to the store.", ("", _writer.Written));
         M("spyglass_collector_ops_sampled_out_total", "counter", "Operations not stored under write backpressure (03 §7).", ("", _writer.Sampled));
-        M("spyglass_collector_storage_dropped_total", "counter", "Records lost before storage: failed writes after retries, or over the backlog bound.",
+        M("spyglass_collector_storage_dropped_total", "counter", "Records lost before storage: failed writes after retries, or over the backlog or pending-update bounds (late context included).",
             ("kind=\"op\"", _writer.WriteDropped), ("kind=\"op_overflow\"", _writer.Overflowed), ("kind=\"update\"", _writer.UpdatesDropped),
             ("kind=\"callsite\"", _writer.CallsitesDropped));
         M("spyglass_collector_storage_write_retries_total", "counter", "Failed storage writes that were retried.", ("", _writer.Retries));
@@ -377,6 +379,7 @@ public sealed class Collector : IAsyncDisposable
         M("spyglass_collector_producers_expired_total", "counter", "Producers dropped as idle or over the cap.", ("", Producers.Expired));
         M("spyglass_collector_ops_pruned_total", "counter", "Operations removed by retention.", ("", _writer.Pruned));
         M("spyglass_collector_storage_backlog", "gauge", "Operations waiting to be written.", ("", _writer.Backlog));
+        M("spyglass_collector_aggregate_deltas_dropped_total", "counter", "Aggregate minute deltas dropped (oldest first) while the store kept failing.", ("", _analysis.Aggregates.DeltasDropped));
         M("spyglass_collector_analysis_errors_total", "counter", "Exceptions caught and isolated in the analysis stage.", ("", Volatile.Read(ref _analysis.Errors)));
         M("spyglass_collector_shapes", "gauge", "Shapes in the analysis catalog (03 §5: bounded).", ("", Volatile.Read(ref _analysis.ShapesTracked)));
         M("spyglass_collector_shapes_evicted_total", "counter", "Shapes dropped from the catalog (retention or the cap).", ("", Volatile.Read(ref _analysis.ShapesEvicted)));
