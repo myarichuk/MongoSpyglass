@@ -1,9 +1,11 @@
 /** @type {import('tailwindcss').Config} */
+const path = require("path");
+
 module.exports = {
   // The theme is what the collector UI reuses (src/Spyglass.Collector.Ui/tailwind.config.js extends this file);
   // the UI's own config lists the content it scans.
   content: [
-    "./src/Spyglass.Collector.Ui/**/*.{razor,html,js}"
+    path.join(__dirname, "src/Spyglass.Collector.Ui/**/*.{razor,html,js}")
   ],
   darkMode: "class",
   theme: {
