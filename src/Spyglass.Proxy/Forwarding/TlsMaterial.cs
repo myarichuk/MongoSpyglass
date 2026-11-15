@@ -30,7 +30,7 @@ internal static class TlsMaterial
                          || bytes.AsSpan().IndexOf("-----BEGIN"u8) < 0;
             return pkcs12 ? LoadPkcs12(bytes, keyPassword, certKey, certFile) : LoadPem(Encoding.UTF8.GetString(bytes), keyFile, keyPassword, certKey, keyKey, certFile);
         }
-        catch (CryptographicException e)
+        catch (Exception e) when (e is CryptographicException or ArgumentException or FormatException)
         {
             // Messages never contain the password.
             throw new ConfigException($"'{certKey}' {certFile}: cannot load certificate/key: {e.Message}");
@@ -53,7 +53,7 @@ internal static class TlsMaterial
         var keyPem = keyFile != null ? File.ReadAllText(keyFile) : certPem;
         if (!keyPem.Contains("PRIVATE KEY", StringComparison.Ordinal))
             throw new ConfigException(keyFile != null
-                ? $"'{keyKey}' {keyFile} contains no PEM private key"
+                ? $"'{keyKey}' {keyFile} contains no PEM private key (certificate: '{certKey}' {certFile})"
                 : $"'{certKey}' {certFile} contains no private key; set '{keyKey}' or use a combined PEM or .pfx");
         var encrypted = keyPem.Contains("ENCRYPTED", StringComparison.Ordinal);
         if (encrypted && password == null)

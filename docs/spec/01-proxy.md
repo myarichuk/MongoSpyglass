@@ -35,6 +35,11 @@ upstream:
     caFile: null            # PEM bundle; default = system trust store
     allowInvalidCertificates: false
     allowInvalidHostnames: false
+    certFile: null          # client certificate for a mongod that requires one (transport mTLS): PEM cert (+chain) with the key
+                            #   in the same file, or cert only with keyFile, or .pfx/.p12
+    keyFile: null           # PEM key when not inside certFile
+    keyPassword: null       # encrypted PEM key / PKCS#12; supports ${ENV}; never logged, reported or exposed
+    revocation: none        # none | online | offline  (X509RevocationMode; none = no check)
 
 listen:
   bindAddress: 127.0.0.1    # 0.0.0.0 MUST be explicit
@@ -43,8 +48,10 @@ listen:
   portRange: [27017, 27099] # dynamically discovered members are allocated here
   tls:
     mode: none              # none | tls
-    certFile: null          # PEM; if mode=tls and null → generate self-signed at start, log SHA-256 fingerprint
+    certFile: null          # PEM (cert + chain, key in the same file or in keyFile) or .pfx/.p12; intermediates in the file are
+                            #   sent to clients. If mode=tls and null → generate self-signed at start, log SHA-256 fingerprint
     keyFile: null
+    keyPassword: null       # as upstream.tls.keyPassword
 
 compression: strip          # strip | opaque | observe   (§8)
 
@@ -68,6 +75,8 @@ limits:
 collector:
   endpoint: "http://spyglass-collector:4318/ingest/v0"   # null = headless
   token: "${SPYGLASS_TOKEN}"
+  caFile: null              # PEM bundle trusted for an https endpoint (same chain logic as upstream.tls.caFile); default = system store
+  allowInvalidCertificates: false   # staging escape hatch; warns at startup
   batchMaxRecords: 2000
   batchMaxBytes: 1048576
   flushIntervalMs: 500
@@ -89,6 +98,12 @@ naming the key. In particular:
 * `bindAddress` other than loopback, combined with `listen.tls.mode=none`, logs a warning:
   traffic would be plaintext on the network.
 * `limits.helloBufferBytes` below `limits.helloRewriteMaxBytes` logs a warning: large hello replies would pass through unrewritten.
+* TLS options in `upstream.uri` (`tlsCAFile`, `tlsCertificateKeyFile`, `tlsCertificateKeyFilePassword`,
+  `tlsAllowInvalidCertificates`, `tlsAllowInvalidHostnames`, `tlsInsecure`; any of them implies `tls=true`) fill the
+  matching `upstream.tls.*` key when it is unset. An explicitly set key wins; a different URI value logs a warning.
+  `tlsDisableOCSPEndpointCheck` / `tlsDisableCertificateRevocationCheck` are accepted (revocation defaults to none).
+* An expired or not-yet-valid `listen.tls.certFile` / `upstream.tls.certFile` certificate, or one with fewer than 14 days left, logs a warning.
+* `keyPassword` values are never logged, exported in records or shown by `/readyz` and `/metrics`; prefer `${ENV}` over a flag.
 * `upstream.tls.enabled=false`, or `tls=false` in the URI, against a `+srv` URI is an error.
 * A configuration value set in the file and replaced by a different value from the environment logs a warning
   naming both sources (the container image sets some keys through the environment).
@@ -316,13 +331,19 @@ Sharded and standalone hello replies get R2 only.
   the member's DNS name. The `allowInvalid*` flags are honoured and logged at warning on
   every start.
 * TLS 1.2+.
-* No client certificate in v1 (X.509 user auth is a non-goal).
+* `caFile` (a bundle: root and intermediates) switches to custom-root trust: the chain is rebuilt against that bundle only,
+  with `upstream.tls.revocation`. With the system store the revocation mode is passed to `SslStream`. The same helper
+  validates the collector's HTTPS certificate (`collector.caFile`).
+* `upstream.tls.certFile` presents a client certificate (and its chain) to a mongod with required client certificates.
+  This is transport mTLS for the proxy's own connections; MONGODB-X509 user authentication remains a non-goal (§6.3).
+* The server certificate of each member is captured in the validation callback (summary rebuilt only when the SHA-256
+  changes) and reported in the `proxy` record (02 §4.2) and `spyglass_proxy_tls_cert_expiry_seconds`.
 
 ### 6.2 Downstream (client → proxy)
 
 * `mode: none` (default): plaintext. Services set `tls=false` (or omit it) in their proxy
   connection string.
-* `mode: tls`: `SslStream` server with the configured certificate, or a self-signed one
+* `mode: tls`: `SslStream` server with the configured certificate (full chain via `SslStreamCertificateContext`, so clients need trust only in the root), or a self-signed one
   generated at startup for `advertiseHost`. Its SHA-256 fingerprint is logged and exposed at
   `/readyz`. Services use `tlsCAFile` or (staging only) `tlsAllowInvalidCertificates=true`.
 
@@ -473,6 +494,7 @@ Self-telemetry:
 ```
 spyglass_proxy_connections{listener,state="open"}            gauge
 spyglass_proxy_connections_total{listener,result}            counter   result = ok|upstream_failed|tls_failed|limit
+spyglass_proxy_tls_cert_expiry_seconds{hop,member}           gauge     notAfter as unix seconds; hop = listen|upstream_client|upstream_server (member = listener member for upstream_server, else "")
 spyglass_proxy_bytes_total{listener,direction}               counter
 spyglass_proxy_frames_total{listener,direction}              counter
 spyglass_proxy_invalid_frames_total{listener}                counter

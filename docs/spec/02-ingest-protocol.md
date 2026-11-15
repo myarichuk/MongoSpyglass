@@ -204,9 +204,18 @@ Encoding:
 ```json
 {"type":"proxy","ts":…,"src":"<proxyId>","version":"1.0.0","schema":1,
  "topology":"replicaSet","setName":"rs0",
- "members":[{"member":"localhost:27017","upstream":"rs0-a.example.net:27017"}, …],
- "config":{"compression":"strip","values":"truncated","commandBytes":16384}}
+ "members":[{"member":"localhost:27017","upstream":"rs0-a.example.net:27017","cert":{CERT}}, …],
+ "config":{"compression":"strip","values":"truncated","commandBytes":16384,
+   "tls":{"upstream":{"enabled":true,"trust":"system|caFile|insecure","caFile":"/etc/ssl/corp-ca.pem",
+                      "allowInvalidHostnames":false,"revocation":"none","clientCert":{CERT}},
+          "listen":{"mode":"none|tls","source":"file|selfSigned","cert":{CERT}},
+          "collector":{"https":true,"trust":"system|caFile|insecure","caFile":"…"}}}}
 ```
+
+`members[].cert` (the last upstream server certificate seen for that member; absent without TLS or before the first
+handshake) and the `config.tls` block are optional; consumers ignore unknown fields. `CERT` =
+`{"subject","issuer","notBefore":<epoch µs>,"notAfter":<epoch µs>,"sha256":"HEX upper","dns":[≤16 SAN DNS names]}`.
+`caFile` is reported as configured (a path, not a secret); passwords, keys and tokens are never emitted.
 
 **`conn`**: once at open, once at close.
 
