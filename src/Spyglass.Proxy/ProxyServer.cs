@@ -20,6 +20,7 @@ public sealed class ProxyServer : IAsyncDisposable
     private readonly ConcurrentDictionary<long, ProxyConnection> _live = new();
     private readonly List<Task> _acceptLoops = [];
     private long _connSeq;
+    internal ByteBudget HelloBuffers { get; }
     private int _openConnections;
     private MetricsServer? _metricsServer;
     private bool _started;
@@ -27,6 +28,7 @@ public sealed class ProxyServer : IAsyncDisposable
     public ProxyServer(ProxyConfig config)
     {
         Config = config;
+        HelloBuffers = new ByteBudget(config.Limits.HelloBufferBytes);
         Uri = MongoUri.Parse(config.Upstream.Uri!);
         Upstream = new UpstreamConnector(config, Uri);
         if (config.Listen.Tls.Mode == DownstreamTlsMode.Tls)
@@ -35,7 +37,8 @@ public sealed class ProxyServer : IAsyncDisposable
     }
 
     public ProxyConfig Config { get; }
-    public MongoUri Uri { get; }
+    /// <summary>The configured URI; for +srv, with the TXT options merged in after resolution (URI options win).</summary>
+    public MongoUri Uri { get; private set; }
     public Guid ProxyId { get; } = Guid.NewGuid();
     public ProxyMetrics Metrics { get; } = new();
     public UpstreamConnector Upstream { get; }
@@ -67,20 +70,28 @@ public sealed class ProxyServer : IAsyncDisposable
         if (Config.Metrics.Bind != null)
         {
             _metricsServer = new MetricsServer(this, IPEndPoint.Parse(Config.Metrics.Bind));
-            _metricsServer.Start();
+            try { _metricsServer.Start(); }
+            catch (SocketException e) { throw new ConfigException($"cannot bind 'metrics.bind' {Config.Metrics.Bind}: {e.Message}"); }
         }
 
-        var seeds = Uri.IsSrv
-            ? await SrvResolver.ResolveSeedsAsync(Uri, ct).ConfigureAwait(false)
-            : Uri.Hosts;
+        IReadOnlyList<HostPort> seeds = Uri.Hosts;
+        if (Uri.IsSrv)
+        {
+            var srv = await SrvResolver.ResolveAsync(Uri, ct).ConfigureAwait(false);
+            seeds = srv.Seeds;
+            var merged = new Dictionary<string, string>(srv.TxtOptions, StringComparer.OrdinalIgnoreCase);
+            foreach (var (k, v) in Uri.Options)
+                merged[k] = v;
+            Uri = Uri with { Options = merged };
+        }
         await Topology.DiscoverAsync(seeds, ct).ConfigureAwait(false);
         Topology.StartMonitors();
         Ready = true;
 
-        var worstCase = Config.Limits.ObserveQueueBytes + Config.Collector.BufferBytes
+        var worstCase = Config.Limits.ObserveQueueBytes + Config.Collector.BufferBytes + Config.Limits.HelloBufferBytes
                         + (long)Config.Limits.MaxClientConnections * 2 * Config.Limits.ReadBufferBytes;
         Log.Info($"proxy {ProxyId} ready; worst-case buffer memory {worstCase / (1024 * 1024)} MiB " +
-                 $"(observe queue + export buffer + {Config.Limits.MaxClientConnections} connections × 2 × {Config.Limits.ReadBufferBytes / 1024} KiB)");
+                 $"(observe queue + export buffer + hello buffers + {Config.Limits.MaxClientConnections} connections × 2 × {Config.Limits.ReadBufferBytes / 1024} KiB)");
     }
 
     /// <summary>Binds and starts accepting for <paramref name="member"/>. Throws if the port can't be bound.</summary>
@@ -93,6 +104,11 @@ public sealed class ProxyServer : IAsyncDisposable
             socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
             socket.Bind(new IPEndPoint(bind, member.ListenPort));
             socket.Listen(512);
+        }
+        catch (SocketException e)
+        {
+            socket.Dispose();
+            throw new ConfigException($"cannot listen on {bind}:{member.ListenPort} (for {member.Upstream}): {e.Message}; check 'listen.basePort' and 'listen.portRange'");
         }
         catch
         {
@@ -113,19 +129,25 @@ public sealed class ProxyServer : IAsyncDisposable
     private async Task AcceptLoopAsync(Member member, Socket listener)
     {
         var ct = _shutdown.Token;
+        var failures = 0;
         while (!ct.IsCancellationRequested)
         {
             Socket client;
             try
             {
                 client = await listener.AcceptAsync(ct).ConfigureAwait(false);
+                failures = 0;
             }
             catch (OperationCanceledException) { return; }
             catch (ObjectDisposedException) { return; }
             catch (SocketException e) when (e.SocketErrorCode == SocketError.OperationAborted) { return; }
             catch (SocketException e)
             {
-                Log.Warn($"listener {member.Advertised}: accept failed: {e.SocketErrorCode}");
+                // e.g. EMFILE: the pending connection stays in the backlog, so retrying at once spins. Back off 10 ms → 1 s.
+                if (failures++ == 0)
+                    Log.Warn($"listener {member.Advertised}: accept failed: {e.SocketErrorCode} (retrying with backoff)");
+                try { await Task.Delay(Math.Min(1000, 10 << Math.Min(failures, 7)), ct).ConfigureAwait(false); }
+                catch (OperationCanceledException) { return; }
                 continue;
             }
 

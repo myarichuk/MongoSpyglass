@@ -30,7 +30,11 @@ public sealed class UpstreamConnector
             if (!File.Exists(_tlsConfig.CaFile))
                 throw new ConfigException($"'upstream.tls.caFile' {_tlsConfig.CaFile} not found");
             _trust = [];
-            _trust.ImportFromPemFile(_tlsConfig.CaFile);
+            try { _trust.ImportFromPemFile(_tlsConfig.CaFile); }
+            catch (System.Security.Cryptography.CryptographicException e)
+            {
+                throw new ConfigException($"'upstream.tls.caFile' {_tlsConfig.CaFile} is not a PEM certificate bundle: {e.Message}");
+            }
             if (_trust.Count == 0)
                 throw new ConfigException($"'upstream.tls.caFile' {_tlsConfig.CaFile} contains no certificates");
         }

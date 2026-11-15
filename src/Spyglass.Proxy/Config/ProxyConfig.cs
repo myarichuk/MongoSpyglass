@@ -19,6 +19,8 @@ public sealed class ProxyConfig
     public DiscoveryConfig Discovery { get; } = new();
     public MetricsConfig Metrics { get; } = new();
     public string LogLevel { get; set; } = "info";
+    /// <summary>Keys a lower-precedence source set that a higher one replaced with another value (reported as startup warnings).</summary>
+    public List<string> Overrides { get; } = [];
 }
 
 public sealed class UpstreamConfig
@@ -69,6 +71,8 @@ public sealed class LimitsConfig
     public long ObserveQueueBytes { get; set; } = 64L * 1024 * 1024;
     public int MaxPendingPerConnection { get; set; } = 1024;
     public int HelloRewriteMaxBytes { get; set; } = 1024 * 1024;
+    /// <summary>Process-wide budget for hello frames buffered for rewriting (01 §13); over it, frames pass through unmodified.</summary>
+    public long HelloBufferBytes { get; set; } = 16L * 1024 * 1024;
     public int ReadBufferBytes { get; set; } = 64 * 1024;
 }
 

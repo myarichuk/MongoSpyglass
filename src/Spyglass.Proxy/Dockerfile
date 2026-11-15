@@ -35,6 +35,8 @@ RUN --mount=type=cache,id=spyglass-nuget,target=/root/.nuget/packages \
 FROM mcr.microsoft.com/dotnet/runtime-deps:${DOTNET}-noble-chiseled
 WORKDIR /app
 COPY --from=build /out/app /app
+# These ENV values beat a mounted config file (flags > environment > file, 01 §2); the proxy logs a warning when one overrides a
+# file key. To change them, set the same variables yourself. The HEALTHCHECK reads the effective metrics.bind (same loader).
 ENV SPYGLASS_LISTEN__BINDADDRESS=0.0.0.0 \
     SPYGLASS_METRICS__BIND=0.0.0.0:9187
 USER $APP_UID

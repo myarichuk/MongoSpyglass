@@ -42,6 +42,7 @@ internal sealed class ProxyConnection
         var reason = CloseReason.ProxyShutdown;
         string? detail = null;
         var opened = false;
+        Task<PumpEnd>? c2sTask = null, s2cTask = null;
 
         try
         {
@@ -94,8 +95,8 @@ internal sealed class ProxyConnection
             var s2c = new Pump(upStream, clientStream, isRequest: false, _ctx, observer.CreateTap(_ctx, false), config,
                 _member.BytesFromServer, _member.FramesFromServer, _member.AddedLatency);
 
-            var c2sTask = c2s.RunAsync(cts.Token);
-            var s2cTask = s2c.RunAsync(cts.Token);
+            c2sTask = c2s.RunAsync(cts.Token);
+            s2cTask = s2c.RunAsync(cts.Token);
             var firstTask = await Task.WhenAny(c2sTask, s2cTask).ConfigureAwait(false);
             var firstIsClient = firstTask == c2sTask;
             var first = await firstTask.ConfigureAwait(false);
@@ -108,8 +109,10 @@ internal sealed class ProxyConnection
                 // Propagate the half-close and let the other direction drain (01 §3.1 step 5).
                 await TryShutdownSendAsync(firstIsClient ? upSocket : _client, firstIsClient ? upStream : clientStream).ConfigureAwait(false);
                 var other = firstIsClient ? s2cTask : c2sTask;
-                if (await Task.WhenAny(other, Task.Delay(HalfCloseGrace, shutdown)).ConfigureAwait(false) != other)
-                    cts.Cancel();
+                // WaitAsync's timer goes away when `other` completes (a bare Task.Delay would stay queued for 30 s)
+                try { await other.WaitAsync(HalfCloseGrace, shutdown).ConfigureAwait(false); }
+                catch (Exception e) when (e is TimeoutException or OperationCanceledException) { cts.Cancel(); }
+                catch { /* a pump fault is reported below */ }
             }
             else
             {
@@ -133,6 +136,10 @@ internal sealed class ProxyConnection
         {
             Log.Error($"conn {_ctx.ConnSeq}: unexpected {e.GetType().Name}: {e.Message}");
             detail ??= e.Message;
+            // stop and await both pumps before the close is posted: the other one may still be publishing frames
+            Reset();
+            if (c2sTask != null && s2cTask != null)
+                try { await Task.WhenAll(c2sTask, s2cTask).ConfigureAwait(false); } catch { }
         }
         finally
         {

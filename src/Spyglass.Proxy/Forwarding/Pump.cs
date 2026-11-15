@@ -35,6 +35,9 @@ internal sealed class Pump
 {
     private enum State { Header, Pass, Buffer }
 
+    /// <summary>A hello frame being buffered for rewriting must complete within this (01 §13): a stalled peer is not waited on forever.</summary>
+    internal static TimeSpan HelloBufferTimeout = TimeSpan.FromSeconds(10);
+
     private readonly Stream _src;
     private readonly Stream _dst;
     private readonly bool _isRequest;
@@ -58,6 +61,8 @@ internal sealed class Pump
     private int _remaining;     // body bytes of the current Pass frame still to come
     private FrameHeader _header;
     private byte[]? _frame;     // Buffer state: whole frame
+    private int _frameReserved; // bytes of the process-wide hello budget held for _frame
+    private CancellationTokenSource? _bufferCts; // deadline of an incomplete buffered frame
     private int _frameFilled;
     private RequestKind _kind;
 
@@ -112,11 +117,17 @@ internal sealed class Pump
                 int n;
                 try
                 {
-                    n = await _src.ReadAsync(_buf.AsMemory(_held), ct).ConfigureAwait(false);
+                    n = await _src.ReadAsync(_buf.AsMemory(_held), _bufferCts?.Token ?? ct).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
                 {
                     return PumpEnd.Cancelled;
+                }
+                catch (OperationCanceledException) when (_bufferCts != null)
+                {
+                    Failure = new TimeoutException($"hello frame not completed within {HelloBufferTimeout.TotalSeconds:0} s");
+                    InvalidFrameHeaderHex = "hello_buffer_timeout";
+                    return PumpEnd.InvalidFrame;
                 }
                 catch (Exception e) when (e is IOException or SocketException or ObjectDisposedException)
                 {
@@ -137,9 +148,26 @@ internal sealed class Pump
                 _unflushedBytes += n;
                 _totalBytes += n;
 
-                var r = await ProcessAsync(_held + n, now, ct).ConfigureAwait(false);
+                PumpEnd? r;
+                try
+                {
+                    r = await ProcessAsync(_held + n, now, ct).ConfigureAwait(false);
+                }
+                catch (Exception e) when (e is not (OperationCanceledException or IOException or SocketException or ObjectDisposedException))
+                {
+                    // A parser fault must never escape the pump: fail the connection closed like an invalid frame (01 §3.2).
+                    Log.Warn($"conn {_conn.ConnSeq}: frame processing fault: {e.GetType().Name}: {e.Message}");
+                    Failure = e;
+                    InvalidFrameHeaderHex = "processing_fault";
+                    return PumpEnd.InvalidFrame;
+                }
                 if (r != null)
                     return r.Value;
+                if (_state == State.Buffer && _bufferCts == null)
+                {
+                    _bufferCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                    _bufferCts.CancelAfter(HelloBufferTimeout);
+                }
                 if (now - _lastFlush > FlushTicks)
                     FlushStats(now);
             }
@@ -154,6 +182,21 @@ internal sealed class Pump
                 ArrayPool<byte>.Shared.Return(_frame);
                 _frame = null;
             }
+            ReleaseFrameBudget();
+        }
+    }
+
+    private void ReleaseFrameBudget()
+    {
+        if (_frameReserved != 0)
+        {
+            _conn.Server.HelloBuffers.Release(_frameReserved);
+            _frameReserved = 0;
+        }
+        if (_bufferCts != null)
+        {
+            _bufferCts.Dispose();
+            _bufferCts = null;
         }
     }
 
@@ -179,7 +222,10 @@ internal sealed class Pump
                     if (h.MessageLength < FrameHeader.Size || h.MessageLength > _conn.MaxFrame)
                     {
                         InvalidFrameHeaderHex = Convert.ToHexString(_buf, p, FrameHeader.Size);
-                        // Forward nothing more: we can no longer frame this stream (01 §3.2 FAIL_CLOSED).
+                        // Forward nothing from the bad header on: we can no longer frame this stream (01 §3.2 FAIL_CLOSED).
+                        // The complete frames before it in this read were already taken by the tap: deliver them.
+                        if (p > fwdStart && !await WriteAsync(fwdStart, p - fwdStart, ct).ConfigureAwait(false))
+                            return PumpEnd.DestinationFailed;
                         return PumpEnd.InvalidFrame;
                     }
 
@@ -193,18 +239,22 @@ internal sealed class Pump
                         kind = RequestInspector.Classify(_buf.AsSpan(p, need));
                         if (kind == RequestKind.Hello)
                             _conn.AddPendingHello(h.RequestId); // before any byte of the request is forwarded
-                        buffer = kind == RequestKind.Hello && _config.Compression == CompressionMode.Strip
-                                 && h.MessageLength <= _config.Limits.HelloRewriteMaxBytes;
+                        buffer = kind == RequestKind.Hello && _config.Compression == CompressionMode.Strip;
+                        if (buffer && !ReserveFrame(h.MessageLength))
+                            buffer = false;
                     }
                     else
                     {
+                        // a pending hello's reply needs its flags (bytes 16..19) to register a moreToCome stream
+                        if (_conn.HasPendingHello && avail < Math.Min(h.MessageLength, 20))
+                            goto Hold;
                         var isHelloReply = _conn.TakePendingHello(h.ResponseTo);
                         if (isHelloReply)
                         {
                             kind = RequestKind.Hello;
-                            buffer = h.MessageLength <= _config.Limits.HelloRewriteMaxBytes;
+                            buffer = ReserveFrame(h.MessageLength);
                             if (!buffer)
-                                _conn.Server.Metrics.RewritesSkipped.WithLabels("too_large").Inc();
+                                RegisterStream(h, _buf.AsSpan(p, Math.Min(h.MessageLength, 20)));
                         }
                         else buffer = false;
                     }
@@ -289,6 +339,31 @@ internal sealed class Pump
         return null;
     }
 
+    /// <summary>Reserves the hello-buffer budget for a frame about to be buffered; counts the skip when it can't be.</summary>
+    private bool ReserveFrame(int length)
+    {
+        if (length > _config.Limits.HelloRewriteMaxBytes)
+        {
+            _conn.Server.Metrics.RewritesSkipped.WithLabels("too_large").Inc();
+            return false;
+        }
+        if (!_conn.Server.HelloBuffers.TryAcquire(length))
+        {
+            _conn.Server.Metrics.RewritesSkipped.WithLabels("budget").Inc();
+            return false;
+        }
+        _frameReserved = length;
+        return true;
+    }
+
+    /// <summary>Streaming hello / exhaust (01 §3.3): the next reply in the stream answers this reply's requestId.</summary>
+    private void RegisterStream(in FrameHeader h, ReadOnlySpan<byte> prefix)
+    {
+        if (h.OpCode == OpCodes.Msg && prefix.Length >= 20 &&
+            ((MsgFlags)System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(prefix[16..]) & MsgFlags.MoreToCome) != 0)
+            _conn.AddPendingHello(h.RequestId);
+    }
+
     private void EndFrame(long now)
     {
         _tap.End(now);
@@ -340,6 +415,7 @@ internal sealed class Pump
         finally
         {
             ArrayPool<byte>.Shared.Return(frame);
+            ReleaseFrameBudget();
         }
     }
 
@@ -357,25 +433,36 @@ internal sealed class Pump
     {
         var facts = new HelloReplyFacts();
         var member = _conn.Member;
-        var result = HelloRewriter.RewriteReply(frame, member.RewriteContext, facts, out var failure);
-        if (result == null)
+        byte[]? result = null;
+        try
         {
-            _conn.Server.Metrics.RewritesSkipped.WithLabels(failure.ToString().ToLowerInvariant()).Inc();
-            HelloRewriter.ExtractFacts(frame, facts);
+            result = HelloRewriter.RewriteReply(frame, member.RewriteContext, facts, out var failure);
+            if (result == null)
+            {
+                _conn.Server.Metrics.RewritesSkipped.WithLabels(failure.ToString().ToLowerInvariant()).Inc();
+                HelloRewriter.ExtractFacts(frame, facts);
+                // 01 §5.1 step 5: members seen in a forwarded reply get a listener even when the reply isn't rewritten
+                if (member.RewriteContext.RewriteTopology)
+                    foreach (var hp in facts.Members)
+                        member.RewriteContext.Map.Advertise(hp);
+            }
+            else
+            {
+                _conn.Server.Metrics.Rewrites.WithLabels(member.RewriteContext.RewriteTopology ? "topology" : "discovery").Inc();
+            }
         }
-        else
+        catch (Exception e)
         {
-            _conn.Server.Metrics.Rewrites.WithLabels(member.RewriteContext.RewriteTopology ? "topology" : "discovery").Inc();
+            // The bookkeeping below must still happen, or later streaming replies go out un-rewritten.
+            _conn.Server.Metrics.RewritesSkipped.WithLabels("exception").Inc();
+            Log.Warn($"conn {_conn.ConnSeq}: hello rewrite failed, forwarding original: {e.GetType().Name}: {e.Message}");
+            result = null;
         }
 
         if (facts.MeMismatch != null)
             Log.Error($"listener {member.Advertised}: {facts.MeMismatch}");
 
-        // Streaming hello / exhaust: the next reply in the stream answers this reply's requestId (01 §3.3).
-        if (_header.OpCode == OpCodes.Msg && frame.Length >= 20 &&
-            ((MsgFlags)System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(frame[16..]) & MsgFlags.MoreToCome) != 0)
-            _conn.AddPendingHello(_header.RequestId);
-
+        RegisterStream(_header, frame.Length >= 20 ? frame[..20] : frame);
         _conn.OnHelloReply(facts);
         return result;
     }

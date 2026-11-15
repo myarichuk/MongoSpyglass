@@ -190,21 +190,17 @@ public static class HelloRewriter
             case OpCodes.Msg:
             {
                 var flags = (MsgFlags)BinaryPrimitives.ReadUInt32LittleEndian(frame[16..]);
-                end -= (flags & MsgFlags.ChecksumPresent) != 0 ? 4 : 0;
-                p = 20;
-                while (p + 5 <= end)
+                if ((flags & MsgFlags.ChecksumPresent) != 0) end = Math.Max(20, end - 4);
+                var sections = new MsgSections(frame[20..end]);
+                while (sections.MoveNext())
                 {
-                    var kind = frame[p];
-                    var len = BinaryPrimitives.ReadInt32LittleEndian(frame[(p + 1)..]);
-                    if (len < 5 || p + 1 + len > end) return false;
-                    if (kind == 0)
+                    if (sections.Truncated) return false;
+                    if (sections.Kind == 0)
                     {
-                        offset = p + 1;
-                        size = len;
+                        offset = 20 + sections.Offset + 1;
+                        size = sections.Size;
                         return true;
                     }
-                    if (kind != 1) return false;
-                    p += 1 + len;
                 }
                 return false;
             }
@@ -221,9 +217,9 @@ public static class HelloRewriter
             default:
                 return false;
         }
-        if (end < p + 5) return false;
+        if (end - p < 5) return false;
         var docLen = BinaryPrimitives.ReadInt32LittleEndian(frame[p..]);
-        if (docLen < 5 || p + docLen > end) return false;
+        if (docLen < 5 || docLen > end - p) return false;
         offset = p;
         size = docLen;
         return true;

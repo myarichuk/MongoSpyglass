@@ -42,14 +42,34 @@ catch (ConfigException e)
 
 Log.Level = Log.Parse(config.LogLevel);
 
-await using var server = new ProxyServer(config);
-using var stop = new CancellationTokenSource();
+// Not `using`: signal and exit callbacks can still fire after Main returns, and Cancel() on a disposed source would abort the process.
+var stop = new CancellationTokenSource();
+void Stop()
+{
+    try { stop.Cancel(); }
+    catch (ObjectDisposedException) { }
+}
+
+ProxyServer server;
+try
+{
+    server = new ProxyServer(config);
+}
+catch (Exception e) when (e is ConfigException or System.Security.Cryptography.CryptographicException or FormatException)
+{
+    Log.Error($"startup failed: {e.Message}");
+    return 3;
+}
+await using var disposeServer = server;
+
 Console.CancelKeyPress += (_, e) =>
 {
     e.Cancel = true;
-    stop.Cancel();
+    Stop();
 };
-AppDomain.CurrentDomain.ProcessExit += (_, _) => stop.Cancel();
+// `docker stop` sends SIGTERM: take the graceful path (close connections with proxy_shutdown, flush the sender) instead of dying with 143.
+using var sigterm = System.Runtime.InteropServices.PosixSignalRegistration.Create(System.Runtime.InteropServices.PosixSignal.SIGTERM, c => { c.Cancel = true; Stop(); });
+using var sigquit = System.Runtime.InteropServices.PosixSignalRegistration.Create(System.Runtime.InteropServices.PosixSignal.SIGQUIT, c => { c.Cancel = true; Stop(); });
 
 try
 {

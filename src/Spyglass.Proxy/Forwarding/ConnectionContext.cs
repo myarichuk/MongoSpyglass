@@ -42,6 +42,8 @@ internal sealed class ConnectionContext
     private readonly int[] _pendingHello = new int[8];
     private int _pendingHelloCount;
 
+    public bool HasPendingHello => Volatile.Read(ref _pendingHelloCount) != 0;
+
     public void AddPendingHello(int requestId)
     {
         lock (_helloGate)

@@ -21,9 +21,16 @@ public sealed class DownstreamTls
         {
             if (!File.Exists(config.CertFile)) throw new ConfigException($"'listen.tls.certFile' {config.CertFile} not found");
             if (!File.Exists(config.KeyFile)) throw new ConfigException($"'listen.tls.keyFile' {config.KeyFile} not found");
-            using var pem = X509Certificate2.CreateFromPemFile(config.CertFile, config.KeyFile);
-            // Re-import so the private key is usable by SslStream on every platform.
-            Certificate = X509CertificateLoader.LoadPkcs12(pem.Export(X509ContentType.Pkcs12), null);
+            try
+            {
+                using var pem = X509Certificate2.CreateFromPemFile(config.CertFile, config.KeyFile);
+                // Re-import so the private key is usable by SslStream on every platform.
+                Certificate = X509CertificateLoader.LoadPkcs12(pem.Export(X509ContentType.Pkcs12), null);
+            }
+            catch (CryptographicException e)
+            {
+                throw new ConfigException($"'listen.tls.certFile' {config.CertFile} / 'listen.tls.keyFile' {config.KeyFile} are not a usable PEM certificate and key: {e.Message}");
+            }
         }
         else
         {

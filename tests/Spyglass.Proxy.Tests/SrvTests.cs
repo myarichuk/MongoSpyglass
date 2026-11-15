@@ -183,4 +183,33 @@ public sealed class SrvTests
         var e = await Assert.ThrowsAsync<ConfigException>(() => Resolve(dns, "mongodb+srv://cluster0.example.net/"));
         Assert.Contains("no SRV records", e.Message);
     }
+
+    [Fact]
+    public async Task Txt_options_are_returned_for_merging()
+    {
+        using var dns = new FakeDns();
+        dns.Answers[("_mongodb._tcp.cluster0.example.net", 33)] = [FakeDns.Srv("a.example.net", 27017)];
+        dns.Answers[("cluster0.example.net", 16)] = [FakeDns.Txt("replicaSet=rs0&authSource=admin")];
+        SrvResolver.NameserversOverride = [dns.Endpoint];
+        try
+        {
+            var r = await SrvResolver.ResolveAsync(MongoUri.Parse("mongodb+srv://cluster0.example.net/"), CancellationToken.None);
+            Assert.Equal("rs0", r.TxtOptions["replicaset"]);
+            Assert.Equal("admin", r.TxtOptions["authsource"]);
+        }
+        finally { SrvResolver.NameserversOverride = null; }
+    }
+
+    [Theory]
+    [InlineData(2)]  // RDATA shorter than priority+weight+port
+    [InlineData(6)]  // no room for the target name
+    public void Short_srv_rdata_is_a_malformed_answer_not_an_argument_exception(int rdlen)
+    {
+        // header: id=7, QR/RD/RA, 0 questions, 1 answer; RR: root name, SRV, IN, ttl, rdlen, rdata (truncated)
+        var ms = new MemoryStream();
+        ms.Write([0, 7, 0x81, 0x80, 0, 0, 0, 1, 0, 0, 0, 0]);
+        ms.Write([0, 0, 33, 0, 1, 0, 0, 0, 60, 0, (byte)rdlen]);
+        ms.Write(new byte[rdlen]);
+        Assert.Throws<FormatException>(() => SrvResolver.Parse(ms.ToArray(), 7));
+    }
 }

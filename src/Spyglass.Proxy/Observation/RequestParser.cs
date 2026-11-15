@@ -316,24 +316,24 @@ internal sealed class RequestParser
     }
 
     /// <summary>First document of each kind-1 section present in the capture, as offsets into <paramref name="sections"/>.</summary>
-    private static void FirstSequenceDocuments(ReadOnlySpan<byte> sections, List<(int IdStart, int IdLength, int DocStart, int DocLength)> result)
+    internal static void FirstSequenceDocuments(ReadOnlySpan<byte> sections, List<(int IdStart, int IdLength, int DocStart, int DocLength)> result)
     {
-        var p = 0;
-        while (p + 5 <= sections.Length && sections[p] == 1)
+        var it = new MsgSections(sections);
+        while (it.MoveNext() && it.Kind == 1)
         {
-            var size = BinaryPrimitives.ReadInt32LittleEndian(sections[(p + 1)..]);
-            if (size < 4) break;
+            var p = it.Offset;
             var idStart = p + 5;
             var nul = sections[idStart..].IndexOf((byte)0);
             if (nul < 0) break;
             var docStart = idStart + nul + 1;
-            if (docStart + 4 <= sections.Length && docStart < p + 1 + size)
+            // no `docStart + docLen`: docLen is untrusted (PO-9)
+            if (sections.Length - docStart >= 4 && docStart - p - 1 < it.Size)
             {
                 var docLen = BinaryPrimitives.ReadInt32LittleEndian(sections[docStart..]);
-                if (docLen >= 5 && docStart + docLen <= sections.Length)
+                if (docLen >= 5 && docLen <= sections.Length - docStart)
                     result.Add((idStart, nul, docStart, docLen));
             }
-            p += 1 + size;
+            if (it.Truncated) break;
         }
     }
 

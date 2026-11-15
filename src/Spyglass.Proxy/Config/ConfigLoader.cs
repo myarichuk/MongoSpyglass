@@ -22,6 +22,13 @@ public static class ConfigLoader
         configPath ??= environment.TryGetValue("SPYGLASS_CONFIG", out var p) ? p : null;
 
         var values = new Dictionary<string, (string? Value, string Source)>(StringComparer.OrdinalIgnoreCase);
+        var overrides = new List<string>();
+        void Set(string key, string? value, string source)
+        {
+            if (values.TryGetValue(key, out var old) && old.Value != value && !old.Source.StartsWith("--", StringComparison.Ordinal))
+                overrides.Add($"'{key}' set in {old.Source} is overridden by {source}");
+            values[key] = (value, source);
+        }
 
         if (configPath != null)
         {
@@ -32,18 +39,18 @@ public static class ConfigLoader
                 ? FlattenJson(text)
                 : MiniYaml.Parse(text);
             foreach (var (k, v) in flat)
-                values[k] = (v, configPath);
+                Set(k, v, configPath);
         }
 
         foreach (var (k, v) in environment)
         {
             if (!k.StartsWith("SPYGLASS_", StringComparison.Ordinal) || ExporterOrVariableEnv.Contains(k))
                 continue;
-            values[k["SPYGLASS_".Length..].Replace("__", ".")] = (v, "environment " + k);
+            Set(k["SPYGLASS_".Length..].Replace("__", "."), v, "environment " + k);
         }
 
         foreach (var (k, v) in cli)
-            values[k] = (v, "--" + k);
+            Set(k, v, "--" + k);
 
         var config = new ProxyConfig();
         foreach (var (key, (raw, source)) in values)
@@ -62,6 +69,7 @@ public static class ConfigLoader
         }
 
         Validate(config);
+        config.Overrides.AddRange(overrides);
         return config;
     }
 
@@ -198,6 +206,7 @@ public static class ConfigLoader
             ["limits.observeQueueBytes"] = (c, v) => c.Limits.ObserveQueueBytes = Long(v, 0), // 0 = observe nothing (forwarding-only A/B runs)
             ["limits.maxPendingPerConnection"] = (c, v) => c.Limits.MaxPendingPerConnection = Int(v, 1, 1 << 20),
             ["limits.helloRewriteMaxBytes"] = (c, v) => c.Limits.HelloRewriteMaxBytes = Int(v, 4096, 48_000_000),
+            ["limits.helloBufferBytes"] = (c, v) => c.Limits.HelloBufferBytes = Long(v, 4096),
             ["limits.readBufferBytes"] = (c, v) => c.Limits.ReadBufferBytes = Int(v, 4096, 16 * 1024 * 1024),
 
             ["collector.endpoint"] = (c, v) => c.Collector.Endpoint = HttpUrl(v),
@@ -279,6 +288,9 @@ public static class ConfigLoader
         if (parsed.IsSrv && c.Upstream.Tls.Enabled == TriState.False)
             throw new ConfigException("'upstream.tls.enabled' is false but 'upstream.uri' is mongodb+srv:// (SRV implies TLS)");
 
+        if (parsed.IsSrv && parsed.Tls == false)
+            throw new ConfigException("'upstream.uri' is mongodb+srv:// with tls=false (SRV implies TLS)");
+
         if (!IPAddress.TryParse(c.Listen.BindAddress, out _))
             throw new ConfigException($"'listen.bindAddress' must be an IP address, got '{c.Listen.BindAddress}'");
 
@@ -302,6 +314,8 @@ public static class ConfigLoader
     {
         if (IPAddress.TryParse(c.Listen.BindAddress, out var ip) && !IPAddress.IsLoopback(ip) && c.Listen.Tls.Mode == DownstreamTlsMode.None)
             yield return $"listen.bindAddress={c.Listen.BindAddress} with listen.tls.mode=none: client traffic, including credentials exchanged during authentication, is plaintext on the network";
+        foreach (var o in c.Overrides)
+            yield return o;
         if (c.Upstream.Tls.AllowInvalidCertificates)
             yield return "upstream.tls.allowInvalidCertificates=true: upstream certificates are not validated";
         if (c.Upstream.Tls.AllowInvalidHostnames)

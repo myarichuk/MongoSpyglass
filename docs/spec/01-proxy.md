@@ -60,6 +60,7 @@ limits:
   observeQueueBytes: 67108864   # 64 MiB across all connections (I4)
   maxPendingPerConnection: 1024 # outstanding requests tracked per connection
   helloRewriteMaxBytes: 1048576
+  helloBufferBytes: 16777216    # process-wide budget for hello frames buffered for rewriting (§13)
 
 collector:
   endpoint: "http://spyglass-collector:4318/ingest/v0"   # null = headless
@@ -84,7 +85,11 @@ naming the key. In particular:
 
 * `bindAddress` other than loopback, combined with `listen.tls.mode=none`, logs a warning:
   traffic would be plaintext on the network.
-* `upstream.tls.enabled=false` against a `+srv` URI is an error.
+* `upstream.tls.enabled=false`, or `tls=false` in the URI, against a `+srv` URI is an error.
+* A configuration value set in the file and replaced by a different value from the environment logs a warning
+  naming both sources (the container image sets some keys through the environment).
+* Errors found while building the server (unreadable cert/key/CA PEM, a listener or metrics port that cannot be bound)
+  are startup errors naming the key, exit code 3, never a stack trace.
 
 ## 3. Forwarding path
 
@@ -128,7 +133,8 @@ on chunk:
   hello reply on the connection.
 * **FAIL_CLOSED:** close both sockets and emit `conn` with `closeReason=invalid_frame` and
   the offending 16 header bytes (hex). The proxy MUST NOT keep buffering or forwarding a
-  stream it can no longer frame.
+  stream it can no longer frame. Complete frames that precede the bad header in the same read ARE
+  forwarded; nothing from the bad header on is.
 * `tap.*` calls are O(1) apart from copying at most the configured capture bytes. They MUST
   NOT allocate on the steady-state path.
 
@@ -155,7 +161,7 @@ That's constant work per frame. The name is recorded in the connection's pending
 `admin.$cmd`.
 
 * **R3 (client hello, `compression=strip`).** For a hello-family request carrying a
-  `compression` array, buffer the frame (≤ `helloRewriteMaxBytes`), remove the element,
+  `compression` array, buffer the frame (≤ `helloRewriteMaxBytes`, within the `helloBufferBytes` budget, completed within 10 s), remove the element,
   re-frame, and forward. Hello requests are never compressed (wire spec), so this is always
   possible.
 * **R1 + R2 (hello reply).** When a reply's `responseTo` matches a pending hello-family
@@ -233,8 +239,10 @@ and grown only up to the queue byte bound.
 
 1. Resolve `upstream.uri`. For `mongodb+srv`, query `_mongodb._tcp.<host>` SRV and `<host>`
    TXT with an in-tree RFC 1035 UDP resolver, using `/etc/resolv.conf` nameservers with TCP
-   fallback on truncation. Apply TXT options `replicaSet` and `authSource` per the
-   initial-DNS-seedlist spec.
+   fallback on truncation; a malformed answer moves on to the next nameserver. Apply TXT options `replicaSet`
+   and `authSource` per the initial-DNS-seedlist spec (URI options win). If the URI (or TXT) names a
+   `replicaSet` that differs from the set the seeds report, startup fails. `directConnection=true` pins the proxy to
+   the one seed member that answered: no member discovery and no R1 rewriting.
 2. Open a **monitor connection** to each seed (TLS as configured) and send
    `hello` with `{ hello: 1, helloOk: true, client: { driver: { name: "spyglass-proxy", version } } }`.
    hello requires no authentication.
@@ -251,7 +259,9 @@ and grown only up to the queue byte bound.
 5. Keep the monitor connections running hello every 10 s. Members that appear later are
    allocated a listener from `portRange` on first sight, whether seen by the monitor or in
    a forwarded hello reply. Members that disappear keep their listener until no client
-   connections remain *and* they've been absent for 10 minutes.
+   connections remain *and* they've been absent for 10 minutes. "Absent" means missing from a
+   *successful* hello view of the set: a total outage never closes listeners, and the last member is never closed, so
+   the set is rediscovered when the upstream returns.
 
 Monitor connections are proxy-internal. They are never reported as client ops.
 
@@ -470,7 +480,7 @@ spyglass_cursors_open{database,collection}                                  gaug
 | Member down | New client connections to its listener fail fast at upstream connect. Existing connections close when the upstream does. |
 | Invalid frame | Fail closed (§3.2). |
 | Rewrite failure | Forward unmodified (§3.3). |
-| Proxy OOM risk | Can't happen by construction: all buffers are bounded by config. Total = `observeQueueBytes + bufferBytes + listeners × connections × 2 × 64 KiB` read buffers. Log the computed worst case at startup. |
+| Proxy OOM risk | Can't happen by construction: all buffers are bounded by config. Total = `observeQueueBytes + bufferBytes + helloBufferBytes + connections × 2 × readBufferBytes`. Hello frames are buffered only inside the process-wide `helloBufferBytes` budget (over it the frame passes through unmodified, `rewrite_skipped{reason="budget"}`) and a frame that is not complete within 10 s closes the connection (`invalid_frame`). Log the computed worst case at startup. |
 
 ## 14. Performance budget (enforced by 06 §4)
 

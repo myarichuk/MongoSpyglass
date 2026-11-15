@@ -10,13 +10,16 @@ namespace Spyglass.Proxy.Topology;
 /// </summary>
 public sealed class TopologyManager : IAddressMap
 {
-    private static readonly TimeSpan MonitorInterval = TimeSpan.FromSeconds(10);
-    private static readonly TimeSpan AbsentListenerTtl = TimeSpan.FromMinutes(10);
+    /// <summary>Test hooks: instance-wide intervals, read on every monitor iteration.</summary>
+    internal TimeSpan MonitorInterval = TimeSpan.FromSeconds(10);
+    internal TimeSpan AbsentListenerTtl = TimeSpan.FromMinutes(10);
 
     private readonly ProxyServer _server;
     private readonly ProxyConfig _config;
     private readonly object _gate = new();
     private readonly Dictionary<HostPort, Member> _byUpstream = new();
+    // Copy-on-write view of _byUpstream: the forwarding path's hits (every host of every hello reply) never take _gate (PW-12).
+    private volatile Dictionary<HostPort, Member> _snapshot = new();
     private readonly List<Member> _members = [];
     private readonly HashSet<int> _usedPorts = [];
     private readonly Dictionary<Member, CancellationTokenSource> _monitors = new();
@@ -66,8 +69,19 @@ public sealed class TopologyManager : IAddressMap
         if (_config.Upstream.Topology != TopologyKind.Auto && _config.Upstream.Topology != detected)
             throw new ConfigException($"'upstream.topology' is {_config.Upstream.Topology} but the upstream is {detected}");
 
+        // `replicaSet` from the URI or SRV TXT must name the set we found (01 §5.1)
+        if (_server.Uri.ReplicaSet is { } wanted && wanted != first.SetName)
+            throw new ConfigException($"'upstream.uri' says replicaSet={wanted} but the upstream is {(first.SetName != null ? "replica set " + first.SetName : detected.ToString().ToLowerInvariant())}");
+
+        // directConnection=true pins the proxy to the one member it was given: no member discovery, no R1 (01 §5.1)
+        if (detected == TopologyKind.ReplicaSet && _server.Uri.DirectConnection)
+        {
+            detected = TopologyKind.Standalone;
+            Log.Info("directConnection=true: proxying the one seed member only; replica-set members are not discovered");
+        }
+
         Kind = detected;
-        SetName = first.SetName;
+        SetName = detected == TopologyKind.ReplicaSet ? first.SetName : null;
 
         List<HostPort> members;
         switch (detected)
@@ -120,38 +134,57 @@ public sealed class TopologyManager : IAddressMap
 
     public string? Advertise(HostPort upstream)
     {
+        if (_snapshot.TryGetValue(upstream, out var m))
+        {
+            Volatile.Write(ref m.LastSeenTicks, DateTime.UtcNow.Ticks);
+            return m.Advertised;
+        }
+        return Kind == TopologyKind.ReplicaSet ? AdvertiseNew(upstream) : null;
+    }
+
+    private string? AdvertiseNew(HostPort upstream)
+    {
+        Member member;
         lock (_gate)
         {
-            if (_byUpstream.TryGetValue(upstream, out var m))
-            {
-                m.LastSeenTicks = DateTime.UtcNow.Ticks;
-                return m.Advertised;
-            }
-            if (Kind != TopologyKind.ReplicaSet)
-                return null;
+            if (_byUpstream.TryGetValue(upstream, out var existing))
+                return existing.Advertised;
             var port = NextFreePortLocked();
             if (port < 0)
             {
                 Log.Error($"no free port in 'listen.portRange' for new member {upstream}; clients will see its real address");
                 return null;
             }
-            try
-            {
-                return AddMemberLocked(upstream, port, startMonitor: true).Advertised;
-            }
-            catch (Exception e)
-            {
-                Log.Error($"cannot open listener for new member {upstream} on port {port}: {e.Message}");
-                _usedPorts.Add(port); // don't retry a port we failed to bind
-                return null;
-            }
+            member = CreateMemberLocked(upstream, port);
         }
+
+        // Bind outside the lock: socket syscalls must not stall other forwarding threads on _gate (PW-12).
+        try
+        {
+            _server.StartListener(member);
+        }
+        catch (Exception e)
+        {
+            Log.Error($"cannot open listener for new member {upstream} on port {member.ListenPort}: {e.Message}");
+            lock (_gate) // keep the port reserved: don't retry a port we failed to bind
+            {
+                _members.Remove(member);
+                _byUpstream.Remove(upstream);
+                _snapshot = new Dictionary<HostPort, Member>(_byUpstream);
+            }
+            return null;
+        }
+        Log.Info($"listener {member.Advertised} → {upstream}");
+        lock (_gate)
+            if (_byUpstream.TryGetValue(upstream, out var still) && still == member)
+                StartMonitorLocked(member);
+        return member.Advertised;
     }
 
     internal void OnForwardedHello(Member via, HelloReplyFacts facts)
     {
-        via.LastSeenTicks = DateTime.UtcNow.Ticks;
-        // Members in a rewritten reply were mapped (and allocated) during R1; nothing else to do.
+        Volatile.Write(ref via.LastSeenTicks, DateTime.UtcNow.Ticks);
+        // Members of a rewritten reply were mapped (and allocated) during R1; the pump advertises those of a reply it skipped.
     }
 
     private int NextFreePortLocked()
@@ -164,6 +197,27 @@ public sealed class TopologyManager : IAddressMap
 
     private Member AddMemberLocked(HostPort upstream, int port, bool startMonitor)
     {
+        var member = CreateMemberLocked(upstream, port);
+        try
+        {
+            _server.StartListener(member); // binds synchronously; throws if the port is taken (startup only)
+        }
+        catch
+        {
+            _members.Remove(member);
+            _byUpstream.Remove(upstream);
+            _snapshot = new Dictionary<HostPort, Member>(_byUpstream);
+            throw;
+        }
+        Log.Info($"listener {member.Advertised} → {upstream}");
+        if (startMonitor)
+            StartMonitorLocked(member);
+        return member;
+    }
+
+    /// <summary>Registers a member and reserves its port; the caller binds its listener.</summary>
+    private Member CreateMemberLocked(HostPort upstream, int port)
+    {
         var advertised = new HostPort(HostPort.NormalizeHost(_config.Listen.AdvertiseHost), port).ToString();
         var member = new Member(upstream, port, advertised, new HelloRewriteContext
         {
@@ -175,14 +229,10 @@ public sealed class TopologyManager : IAddressMap
         {
             LastSeenTicks = DateTime.UtcNow.Ticks
         };
-
-        _server.StartListener(member); // binds synchronously; throws if the port is taken
         _usedPorts.Add(port);
         _byUpstream[upstream] = member;
         _members.Add(member);
-        Log.Info($"listener {advertised} → {upstream}");
-        if (startMonitor)
-            StartMonitorLocked(member);
+        _snapshot = new Dictionary<HostPort, Member>(_byUpstream);
         return member;
     }
 
@@ -223,6 +273,9 @@ public sealed class TopologyManager : IAddressMap
                         Advertise(hp); // allocates listeners for members added with rs.add
                     if (facts.SetName != null && facts.SetName != SetName)
                         Log.Error($"monitor {member.Upstream}: reports replica set {facts.SetName}, expected {SetName}");
+                    // "Absent" means missing from a *successful* view of the set: after a total outage nobody
+                    // has been refreshed, so sweeping on failure would tear everything down (PW-1).
+                    SweepAbsent();
                 }
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -236,30 +289,41 @@ public sealed class TopologyManager : IAddressMap
                 failing = true;
             }
 
-            SweepAbsent();
             try { await Task.Delay(MonitorInterval, ct).ConfigureAwait(false); }
             catch (OperationCanceledException) { return; }
         }
     }
 
-    /// <summary>Closes listeners of members absent for 10 minutes that have no connections left.</summary>
-    private void SweepAbsent()
+    /// <summary>Closes listeners of members absent for 10 minutes that have no connections left.
+    /// Called only after a member answered hello; never removes the last member, so the set stays rediscoverable.</summary>
+    internal void SweepAbsent()
     {
         if (Kind != TopologyKind.ReplicaSet) return;
         var cutoff = DateTime.UtcNow.Ticks - AbsentListenerTtl.Ticks;
+        List<(Member Member, CancellationTokenSource? Monitor)>? removed = null;
         lock (_gate)
         {
             foreach (var m in _members.ToArray())
             {
+                if (_members.Count <= 1) break;
                 if (Volatile.Read(ref m.LastSeenTicks) >= cutoff || m.OpenConnections.Value > 0)
                     continue;
-                Log.Info($"listener {m.Advertised}: member {m.Upstream} absent for {AbsentListenerTtl.TotalMinutes} min; closing");
-                _server.StopListener(m);
-                if (_monitors.Remove(m, out var cts)) cts.Cancel();
+                _monitors.Remove(m, out var cts);
                 _members.Remove(m);
                 _byUpstream.Remove(m.Upstream);
                 _usedPorts.Remove(m.ListenPort);
+                (removed ??= []).Add((m, cts));
             }
+            if (removed != null)
+                _snapshot = new Dictionary<HostPort, Member>(_byUpstream);
+        }
+        if (removed == null) return;
+        // sockets and tokens are torn down outside the lock
+        foreach (var (m, cts) in removed)
+        {
+            Log.Info($"listener {m.Advertised}: member {m.Upstream} absent for {AbsentListenerTtl.TotalMinutes} min; closing");
+            _server.StopListener(m);
+            cts?.Cancel();
         }
     }
 
