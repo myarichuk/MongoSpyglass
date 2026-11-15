@@ -334,6 +334,7 @@ liveness one: restarting a collector that sheds load loses its in-memory state a
 | `GET /live?app&coll&command&status&minLatencyUs&uow` | SSE stream: `op.created`, `op.updated`, `alert.opened`, `alert.updated`; `dropped` (`{dropped, total}`) when a slow reader's buffer overflowed and events were lost |
 | `POST /export?from&to&…` | NDJSON download of ops and alerts for offline sharing. At most 100 000 ops: a `{"type":"truncated","limit":100000}` line follows the last op when there may be more. Stops when the client disconnects |
 | `GET /metrics` | collector self-telemetry (Prometheus) |
+| `GET /producers` | Every producer (proxy or exporter) with its last record's facts and counters. A proxy's `tls` (its `config.tls`, 02 §4.2) and each member's `cert` are echoed as the proxy sent them, only when present: raw JSON objects kept as received, `tls` up to 8 KiB and a `cert` up to 2 KiB each. A larger value, or one that is not an object, is ignored and the rest of the record is accepted. Each proxy record replaces the previous summary; nothing is persisted (producers are rebuilt from the next records after a restart). The UI shows them read-only; no key or certificate file is ever received. |
 
 ## 9. Security
 
@@ -373,6 +374,14 @@ liveness one: restarting a collector that sheds load loses its in-memory state a
   Basic client sees `Retry-After`). A success clears the address. A body past 4 KiB is 413 whether its length
   was declared or chunked.
 * **Binding:** API and UI bind to loopback by default.
+* **HTTPS:** `SPYGLASS_TLS_CERT` (`--tls-cert`) switches the listener to HTTPS: a PEM certificate (any
+  intermediates after the leaf in the same file are sent with it), the same PEM with the private key in it, or a
+  `.pfx`/`.p12`. `SPYGLASS_TLS_KEY` (`--tls-key`) names a separate PEM key (PKCS#8, PKCS#1 or SEC1; encrypted PKCS#8
+  with `SPYGLASS_TLS_KEY_PASSWORD`, `--tls-key-password`, which also opens a `.pfx`). The key is re-exported to PKCS#12
+  in memory so Linux can use it. A file that is missing, unreadable, without a key, or whose key matches no
+  certificate in it stops startup with exit 2 and a message that names the variable; a certificate that expires
+  within 14 days (or already has) is a startup warning on stderr. Proxies and exporters then use an `https://`
+  `collector.endpoint` (a private CA goes in the proxy's `collector.caFile`). The session cookie is `Secure` when the request arrived over HTTPS at the collector itself, or via a trusted proxy that sent `X-Forwarded-Proto: https`.
 * **Data:** stored data is already redacted by the proxy (I7). The collector MUST NOT accept
   `op` records whose `cmd` decodes to a redacted-command name with a non-redacted body
   (defence in depth: such records are rejected and counted).
@@ -428,7 +437,9 @@ circuit state.
   offer brotli only over HTTPS, so plain-HTTP deployments get gzip. The 3.0 MB runtime travels as 0.98 MB
   (brotli) or 1.2 MB (gzip).
 * **Configuration:** `SPYGLASS_*` environment variables. The image sets `SPYGLASS_BIND=0.0.0.0:8080` and
-  `SPYGLASS_DATA=/data` (a volume). A non-loopback bind needs password or header auth (§9), so a
+  `SPYGLASS_DATA=/data` (a volume). With `SPYGLASS_TLS_CERT` set (§9, mount the files into the container) the
+  HEALTHCHECK probe speaks TLS to the listener and accepts any certificate: it is a liveness check on localhost,
+  and a probe given `--tls-cert` instead of the variable does the same. A non-loopback bind needs password or header auth (§9), so a
   `docker run` passes `SPYGLASS_TOKEN` and `SPYGLASS_ADMIN_PASSWORD` (or `SPYGLASS_AUTH_HEADER`).
 * **Multi-arch:** the SDK stage runs on the build platform and publishes for `TARGETARCH`; crossgen2
   cross-compiles. The NuGet cache is a BuildKit cache mount, and restore sits on its own layer.

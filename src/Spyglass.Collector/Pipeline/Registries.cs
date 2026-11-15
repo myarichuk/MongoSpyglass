@@ -124,7 +124,9 @@ public sealed class ProducerInfo
     public string? Version;
     public int Schema;
     public string? Topology, SetName;
-    public List<(string Member, string Upstream)> Members = [];
+    public List<(string Member, string Upstream, string? Cert)> Members = [];
+    /// <summary>The proxy's <c>config.tls</c> as raw JSON (02 §4.2); replaced by each proxy record.</summary>
+    public string? Tls;
     public string? Compression, Values;
     public long FirstSeen, LastSeen;       // collector wall clock, µs
     public long Records, Rejected, ClockSkewed;
@@ -202,6 +204,7 @@ public sealed class ProducerRegistry
             p.Members = r.Members;
             p.Compression = r.Compression;
             p.Values = r.Values;
+            p.Tls = r.Tls;
         }
     }
 

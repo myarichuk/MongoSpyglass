@@ -141,9 +141,11 @@ public sealed class ProxyRecord : Record
     public int Schema;
     public string Topology = "";
     public string? SetName;
-    public List<(string Member, string Upstream)> Members = [];
+    public List<(string Member, string Upstream, string? Cert)> Members = [];
     public string? Compression;
     public string? Values;
+    /// <summary><c>config.tls</c> as raw JSON (02 §4.2); null when absent, not an object or over 8 KiB.</summary>
+    public string? Tls;
 }
 
 public sealed class StatsRecord : Record

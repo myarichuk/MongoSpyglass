@@ -17,6 +17,10 @@ public sealed class CollectorOptions
     public bool IngestInsecure { get; set; }
     public AuthMode Auth { get; set; } = AuthMode.Password;
     public string? AdminPassword { get; set; }
+    /// <summary>HTTPS on <see cref="Bind"/> (03 §9): a PEM certificate (+ key), or a .pfx/.p12. Null serves plain HTTP.</summary>
+    public string? TlsCert { get; set; }
+    public string? TlsKey { get; set; }
+    public string? TlsKeyPassword { get; set; }
     public string AuthHeader { get; set; } = "X-Forwarded-User";
     /// <summary>
     /// Peers (CIDRs or single addresses) whose <c>X-Forwarded-User</c> (header auth) and <c>X-Forwarded-Proto</c> (session
@@ -94,6 +98,9 @@ public sealed class CollectorOptions
                 };
                     break;
                 case "adminpassword": o.AdminPassword = v; break;
+                case "tlscert": o.TlsCert = v is "" ? null : v; break;
+                case "tlskey": o.TlsKey = v is "" ? null : v; break;
+                case "tlskeypassword": o.TlsKeyPassword = v is "" ? null : v; break;
                 case "authheader": authHeader = v; break;
                 case "trustedproxies" or "authheadertrustedproxies": o.TrustedProxies = ParseNetworks(v); break;
                 case "data": o.Data = v is "" or ":memory:" ? null : v; break;
@@ -146,6 +153,8 @@ public sealed class CollectorOptions
             throw new ArgumentException("SPYGLASS_ADMIN_PASSWORD is required with SPYGLASS_AUTH=password, 03 §9");
         if (o.Auth == AuthMode.None && !IPAddress.IsLoopback(o.Bind.Address))
             throw new ArgumentException("SPYGLASS_AUTH=none is allowed only on a loopback bind, 03 §9");
+        if (o.TlsCert is null && o.TlsKey is not null)
+            throw new ArgumentException("SPYGLASS_TLS_KEY needs SPYGLASS_TLS_CERT, 03 §9");
         if (o.Workers < 1) throw new ArgumentException("workers must be >= 1");
     }
 }

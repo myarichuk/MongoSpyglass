@@ -13,10 +13,13 @@ internal static class HealthProbe
     public static async Task<int> RunAsync(string[] args)
     {
         string? bind = Environment.GetEnvironmentVariable("SPYGLASS_BIND"), path = "/healthz";
+        // the listener speaks TLS when the collector has a certificate: the same variable (or flag) the container sets
+        var tls = Environment.GetEnvironmentVariable("SPYGLASS_TLS_CERT") is { Length: > 0 };
         for (var i = 0; i + 1 < args.Length; i += 2)
         {
             if (args[i] == "--bind") bind = args[i + 1];
             else if (args[i] == "--path") path = args[i + 1];
+            else if (args[i] == "--tls-cert") tls = args[i + 1].Length > 0;
         }
         var ep = bind is { Length: > 0 } ? IPEndPoint.Parse(bind) : new CollectorOptions().Bind;
         var host = ep.Address.Equals(IPAddress.Any) ? IPAddress.Loopback
@@ -28,18 +31,28 @@ internal static class HealthProbe
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
             using var socket = new System.Net.Sockets.Socket(host.AddressFamily, System.Net.Sockets.SocketType.Stream, System.Net.Sockets.ProtocolType.Tcp);
             await socket.ConnectAsync(new IPEndPoint(host, ep.Port), cts.Token).ConfigureAwait(false);
-            await socket.SendAsync(System.Text.Encoding.ASCII.GetBytes($"GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"), cts.Token).ConfigureAwait(false);
+            // a localhost liveness probe: the certificate (self-signed, a corporate CA, a name that is not "localhost") is not judged
+            Stream stream = new System.Net.Sockets.NetworkStream(socket);
+            if (tls)
+            {
+                var ssl = new System.Net.Security.SslStream(stream, false, (_, _, _, _) => true);
+                await ssl.AuthenticateAsClientAsync(new System.Net.Security.SslClientAuthenticationOptions { TargetHost = "localhost" }, cts.Token).ConfigureAwait(false);
+                stream = ssl;
+            }
+            await using var scope = stream;
+            await stream.WriteAsync(System.Text.Encoding.ASCII.GetBytes($"GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"), cts.Token).ConfigureAwait(false);
+            await stream.FlushAsync(cts.Token).ConfigureAwait(false);
             var buf = new byte[16 * 1024];
             var n = 0;
             int read;
-            while (n < buf.Length && (read = await socket.ReceiveAsync(buf.AsMemory(n), cts.Token).ConfigureAwait(false)) > 0) n += read;
+            while (n < buf.Length && (read = await stream.ReadAsync(buf.AsMemory(n), cts.Token).ConfigureAwait(false)) > 0) n += read;
             var response = System.Text.Encoding.UTF8.GetString(buf, 0, n);
             var body = response.IndexOf("\r\n\r\n", StringComparison.Ordinal) is var b and >= 0 ? response[(b + 4)..] : "";
             var ok = response.StartsWith("HTTP/1.1 200 ", StringComparison.Ordinal);
             Console.WriteLine($"{(response.Length >= 12 ? response[9..12] : "???")} {body}");
             return ok ? 0 : 1;
         }
-        catch (Exception e) when (e is System.Net.Sockets.SocketException or OperationCanceledException)
+        catch (Exception e) when (e is System.Net.Sockets.SocketException or OperationCanceledException or IOException or System.Security.Authentication.AuthenticationException)
         {
             Console.WriteLine($"{host}:{ep.Port}{path}: {e.Message}");
             return 1;

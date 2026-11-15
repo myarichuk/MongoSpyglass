@@ -393,13 +393,15 @@ public static class RecordParser
             {
                 if (x.TokenType != JsonTokenType.StartObject) throw new Malformed("members element is not an object");
                 string member = "", upstream = "";
+                string? cert = null;
                 while (x.Read() && x.TokenType == JsonTokenType.PropertyName)
                 {
                     if (x.ValueTextEquals("member"u8)) { x.Read(); member = NStr(ref x) ?? ""; }
                     else if (x.ValueTextEquals("upstream"u8)) { x.Read(); upstream = NStr(ref x) ?? ""; }
+                    else if (x.ValueTextEquals("cert"u8)) { x.Read(); cert = RawObject(ref x, MaxMemberCertBytes); }
                     else { x.Read(); x.Skip(); }
                 }
-                p.Members.Add((member, upstream));
+                p.Members.Add((member, upstream, cert));
             }
         }
         else if (x.ValueTextEquals("config"u8))
@@ -410,11 +412,27 @@ public static class RecordParser
             {
                 if (x.ValueTextEquals("compression"u8)) { x.Read(); p.Compression = NStr(ref x); }
                 else if (x.ValueTextEquals("values"u8)) { x.Read(); p.Values = NStr(ref x); }
+                else if (x.ValueTextEquals("tls"u8)) { x.Read(); p.Tls = RawObject(ref x, MaxTlsBytes); }
                 else { x.Read(); x.Skip(); }
             }
         }
         else return false;
         return true;
+    }
+
+    // 02 §4.2 / 03 §6: the proxy's TLS summary is shown, not interpreted: kept as the raw JSON object it arrived as
+    private const int MaxTlsBytes = 8 * 1024, MaxMemberCertBytes = 2 * 1024;
+
+    /// <summary>
+    /// The value at the reader as raw JSON text, or null when it is not an object or longer than <paramref name="max"/>
+    /// (ignored, the record is still accepted). Allocates: only the 60 s proxy record comes here.
+    /// </summary>
+    private static string? RawObject(ref Utf8JsonReader x, int max)
+    {
+        if (x.TokenType != JsonTokenType.StartObject) { x.Skip(); return null; }
+        using var doc = JsonDocument.ParseValue(ref x);
+        var raw = doc.RootElement.GetRawText();
+        return raw.Length <= max ? raw : null;
     }
 
     private static bool Stats(ref Utf8JsonReader x, StatsRecord s)

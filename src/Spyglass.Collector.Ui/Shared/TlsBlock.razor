@@ -1,0 +1,74 @@
+@* The proxy's effective TLS setup, three hops (02 §4.2 config.tls). Read-only; absent (an older proxy) renders nothing. *@
+@if (Tls.ValueKind == JsonValueKind.Object)
+{
+    var up = Obj(Tls, "upstream");
+    var listen = Obj(Tls, "listen");
+    var col = Obj(Tls, "collector");
+    var lc = Obj(listen, "cert");
+    <div class="flex flex-col gap-1">
+        <h2 class="text-ui-label-sm uppercase text-muted">TLS</h2>
+        <dl class="grid grid-cols-[10rem_1fr] gap-x-3 gap-y-1 items-baseline">
+            <dt class="text-muted">app → proxy</dt>
+            <dd class="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+                @if (listen.ValueKind == JsonValueKind.Object)
+                {
+                    @if (Str(listen, "mode") == "tls")
+                    {
+                        <span class="badge bg-ok/15 text-ok">TLS</span>
+                        <span class="text-muted">@(Str(listen, "source") == "selfSigned" ? "self-signed, generated at start" : "certificate file")</span>
+                        <CertSummary Cert="lc" />
+                    }
+                    else { <span class="badge bg-surface-3 text-muted">plaintext</span> }
+                }
+            </dd>
+            <dt class="text-muted">proxy → MongoDB</dt>
+            <dd class="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+                @if (up.ValueKind == JsonValueKind.Object)
+                {
+                    @if (Bool(up, "enabled") == true)
+                    {
+                        <span class="badge bg-ok/15 text-ok">TLS</span>
+                        @switch (Str(up, "trust"))
+                        {
+                            case "insecure": <span class="badge bg-bad/15 text-bad" title="the server certificate is not verified">trust: insecure</span> break;
+                            case "caFile": <span>trust: CA file <span class="mono">@Str(up, "caFile")</span></span> break;
+                            default: <span>trust: system store</span> break;
+                        }
+                        @if (Bool(up, "allowInvalidHostnames") == true) { <span class="badge bg-warn/15 text-warn" title="the server certificate's name is not checked">hostname check off</span> }
+                        @if (Str(up, "revocation") is { } rev && rev != "none") { <span>revocation: @rev</span> }
+                        @if (Obj(up, "clientCert") is { ValueKind: JsonValueKind.Object } cc) { <span>client cert <CertSummary Cert="cc" /></span> }
+                    }
+                    else { <span class="badge bg-surface-3 text-muted">plaintext</span> }
+                }
+            </dd>
+            <dt class="text-muted">proxy → collector</dt>
+            <dd class="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+                @if (col.ValueKind == JsonValueKind.Object)
+                {
+                    @if (Bool(col, "https") == true)
+                    {
+                        <span class="badge bg-ok/15 text-ok">HTTPS</span>
+                        @switch (Str(col, "trust"))
+                        {
+                            case "insecure": <span class="badge bg-bad/15 text-bad" title="the collector's certificate is not verified">trust: insecure</span> break;
+                            case "caFile": <span>trust: CA file <span class="mono">@Str(col, "caFile")</span></span> break;
+                            default: <span>trust: system store</span> break;
+                        }
+                    }
+                    else { <span class="badge bg-surface-3 text-muted">HTTP</span> }
+                }
+            </dd>
+        </dl>
+        <p class="text-ui-label-sm text-muted">As the proxy reports it every minute; no keys are sent. A member's server certificate is the last one the proxy saw from it.</p>
+    </div>
+}
+@code {
+    [Parameter] public JsonElement Tls { get; set; }
+
+    private static JsonElement Obj(JsonElement e, string name) =>
+        e.ValueKind == JsonValueKind.Object && e.TryGetProperty(name, out var v) ? v : default;
+    private static string? Str(JsonElement e, string name) =>
+        e.ValueKind == JsonValueKind.Object && e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+    private static bool? Bool(JsonElement e, string name) =>
+        e.ValueKind == JsonValueKind.Object && e.TryGetProperty(name, out var v) && (v.ValueKind is JsonValueKind.True or JsonValueKind.False) ? v.GetBoolean() : null;
+}

@@ -22,7 +22,7 @@ public sealed class UiContractTests : IAsyncLifetime
         _http = new HttpClient { BaseAddress = _s.BaseAddress };
         var lines = new List<string>
         {
-            $$$"""{"type":"proxy","ts":{{{T0}}},"src":"{{{Records.Proxy}}}","version":"0.1.0","schema":1,"topology":"replicaSet","setName":"rs0","members":[{"member":"localhost:27017","upstream":"db1:27017"}],"config":{"compression":"strip","values":"truncated","commandBytes":16384}}""",
+            $$$"""{"type":"proxy","ts":{{{T0}}},"src":"{{{Records.Proxy}}}","version":"0.1.0","schema":1,"topology":"replicaSet","setName":"rs0","members":[{"member":"localhost:27017","upstream":"db1:27017","cert":{"subject":"CN=a","issuer":"CN=ca","notBefore":1700000000000000,"notAfter":1900000000000000,"sha256":"AB","dns":["a"]}}],"config":{"compression":"strip","values":"truncated","commandBytes":16384,"tls":{"upstream":{"enabled":true,"trust":"insecure"},"listen":{"mode":"none"},"collector":{"https":false} } } }""",
             Conn(1, "orders-api"),
         };
         for (var i = 0; i < 3; i++)
@@ -104,6 +104,8 @@ public sealed class UiContractTests : IAsyncLifetime
         var producers = await Get("/api/v1/producers");
         AssertCovers<ProducerDto>(producers.GetProperty("items")[0]);
         var p = producers.GetProperty("items").Deserialize<ProducerDto[]>(Web)!.Single();
+        Assert.Equal("insecure", p.Tls.GetProperty("upstream").GetProperty("trust").GetString());
+        Assert.Equal("CN=ca", p.Members[0].GetProperty("cert").GetProperty("issuer").GetString());
         Assert.Equal("rs0", p.SetName);
         Assert.Equal(JsonValueKind.Array, p.Members.ValueKind);
     }

@@ -73,7 +73,7 @@ public sealed record ShapeDetail(string ShapeHash, string Command, string? Db, s
 
 public sealed record ProducerDto(string Src, string Kind, string? Version, int Schema, string? Topology, string? SetName, JsonElement Members,
     string? Values, string? Compression, long FirstSeen, long LastSeen, long Records, long Rejected, long ClockSkewed, Dictionary<string, long> Dropped,
-    string? Runtime = null, string? Driver = null, string? Host = null, long? Pid = null, string? App = null, string? AppVersion = null, JoinDto? Join = null);
+    string? Runtime = null, string? Driver = null, string? Host = null, long? Pid = null, string? App = null, string? AppVersion = null, JoinDto? Join = null, JsonElement Tls = default);
 
 /// <summary>02 §6 per exporter.</summary>
 public sealed record JoinDto(long Cmds, long Joined, long Orphans, long Conflicts, double? Rate, [property: JsonPropertyName("skew_us")] long? SkewUs);

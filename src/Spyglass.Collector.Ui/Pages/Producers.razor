@@ -18,18 +18,22 @@
             @if (p.Topology != null)
             {
                 <p>@p.Topology @(p.SetName != null ? $"({p.SetName})" : "") · capture values: <span class="mono">@p.Values</span> · compression: <span class="mono">@p.Compression</span></p>
-                <table class="tbl"><thead><tr><th>listener (member)</th><th>upstream</th></tr></thead>
+                var hasCerts = p.Members.ValueKind == JsonValueKind.Array && p.Members.EnumerateArray().Any(m => m.TryGetProperty("cert", out _));
+                <table class="tbl"><thead><tr><th>listener (member)</th><th>upstream</th>@if (hasCerts) { <th>server cert</th> }</tr></thead>
                     <tbody>
                         @if (p.Members.ValueKind == JsonValueKind.Array)
                         {
                             foreach (var m in p.Members.EnumerateArray())
                             {
-                                <tr><td class="mono">@m.GetProperty("member").GetString()</td><td class="mono">@m.GetProperty("upstream").GetString()</td></tr>
+                                <tr><td class="mono">@m.GetProperty("member").GetString()</td><td class="mono">@m.GetProperty("upstream").GetString()</td>
+                                    @if (hasCerts) { <td>@if (m.TryGetProperty("cert", out var cert)) { <span class="mono">@(cert.TryGetProperty("issuer", out var iss) ? iss.GetString() : "")</span> <CertExpiry Cert="cert" /> }</td> }
+                                </tr>
                             }
                         }
                     </tbody>
                 </table>
             }
+            <TlsBlock Tls="p.Tls" />
             @if (p.Kind != "proxy" && (p.Runtime ?? p.Driver ?? p.Host) != null)
             {
                 <p>@p.App @p.AppVersion · <span class="mono">@p.Runtime</span> · <span class="mono">@p.Driver</span> · @p.Host @(p.Pid is { } pid ? $"pid {pid}" : "")</p>

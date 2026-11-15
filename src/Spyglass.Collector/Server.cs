@@ -47,11 +47,20 @@ public sealed class Server : IAsyncDisposable
         object store = options.Data == null ? new MemoryStore() : new SqliteStore(options.Data);
         var collector = new Collector(options, (IOperationStore)store, (IAggregateStore)store, (IAlertStore)store, callsites: (ICallsiteStore)store);
 
+        var tls = options.TlsCert is null ? null : CollectorTls.Load(options.TlsCert, options.TlsKey, options.TlsKeyPassword); // before any thread starts: a bad file is a startup error
+        if (tls != null && tls.Certificate.NotAfter.ToUniversalTime() - DateTime.UtcNow < CollectorTls.ExpiryWarning)
+            Console.Error.WriteLine($"spyglass-collector: warning: the TLS certificate in SPYGLASS_TLS_CERT " +
+                (tls.Certificate.NotAfter < DateTime.Now ? "expired" : "expires") + $" on {tls.Certificate.NotAfter.ToUniversalTime():yyyy-MM-dd HH:mm} UTC");
         var builder = WebApplication.CreateSlimBuilder();
         builder.Logging.ClearProviders();
         builder.WebHost.ConfigureKestrel(k =>
         {
-            k.Listen(options.Bind);
+            if (tls == null) k.Listen(options.Bind);
+            else k.Listen(options.Bind, l => l.UseHttps(new Microsoft.AspNetCore.Server.Kestrel.Https.HttpsConnectionAdapterOptions
+            {
+                ServerCertificate = tls.Certificate, // intermediates go out with it: a client that trusts only the root still validates
+                ServerCertificateChain = tls.Chain.Count > 0 ? tls.Chain : null,
+            }));
             k.Limits.MaxRequestBodySize = options.MaxBodyBytes;
             k.AddServerHeader = false;
         });
@@ -684,10 +693,16 @@ public sealed class Server : IAsyncDisposable
             if (p.Topology != null) w.WriteString("topology", p.Topology);
             if (p.SetName != null) w.WriteString("setName", p.SetName);
             w.WriteStartArray("members");
-            foreach (var (m, u) in p.Members) { w.WriteStartObject(); w.WriteString("member", m); w.WriteString("upstream", u); w.WriteEndObject(); }
+            foreach (var (m, u, cert) in p.Members)
+            {
+                w.WriteStartObject(); w.WriteString("member", m); w.WriteString("upstream", u);
+                if (cert != null) { w.WritePropertyName("cert"); w.WriteRawValue(cert); }
+                w.WriteEndObject();
+            }
             w.WriteEndArray();
             if (p.Values != null) w.WriteString("values", p.Values);
             if (p.Compression != null) w.WriteString("compression", p.Compression);
+            if (p.Tls != null) { w.WritePropertyName("tls"); w.WriteRawValue(p.Tls); }
             w.WriteNumber("firstSeen", p.FirstSeen);
             w.WriteNumber("lastSeen", p.LastSeen);
             w.WriteNumber("records", p.Records);
