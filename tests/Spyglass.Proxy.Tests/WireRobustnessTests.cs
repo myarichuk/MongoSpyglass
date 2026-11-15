@@ -345,9 +345,14 @@ public sealed class WireRobustnessTests
             Assert.True(DateTime.UtcNow < deadline);
             await Task.Delay(20);
         }
-        var metrics = await proxy.HttpGetAsync("/metrics");
-        Assert.Contains("rewrite_skipped_total{reason=\"budget\"} 1", metrics);
-        Assert.Equal(0, proxy.Server.HelloBuffers.Used);
+        // the skip is counted on the pump after the bytes are forwarded: poll rather than read once
+        string metrics;
+        while (!(metrics = await proxy.HttpGetAsync("/metrics")).Contains("rewrite_skipped_total{reason=\"budget\"} 1") ||
+               proxy.Server.HelloBuffers.Used != 0)
+        {
+            Assert.True(DateTime.UtcNow < deadline, metrics);
+            await Task.Delay(20);
+        }
     }
 
     // ---- FP-2: an unexpected exception in a pump ------------------------------------------------
