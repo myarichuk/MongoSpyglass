@@ -28,6 +28,11 @@ public interface IOperationStore
     /// </summary>
     int Prune(long olderThanUs, long maxBytes, Action? progress = null);
     long Count { get; }
+    /// <summary>
+    /// Runs <paramref name="work"/> (this store's Append/Update/callsite calls) as one atomic write, so a failure leaves none
+    /// of it applied and the caller can retry the lot. Stores without transactions just run it (their writes are idempotent).
+    /// </summary>
+    void Transact(Action work) => work();
 }
 
 /// <summary>A change to a stored op. Null fields are left as they are.</summary>
@@ -61,11 +66,18 @@ public interface IAlertStore
     List<Alert> All();
 }
 
-/// <summary>Everything in memory, bounded: tests and <c>--data :memory:</c>.</summary>
+/// <summary>
+/// Everything in memory: tests and <c>--data :memory:</c>. Bounded where it grows with traffic: ops by count and (in
+/// <see cref="Prune"/>) by the size bound, minute buckets by rollup into hours and 30 d retention, callsites by a cap.
+/// Shapes and alerts are as many as the analysis stage keeps (its own retention), not unbounded streams.
+/// </summary>
 public sealed class MemoryStore : IOperationStore, IAggregateStore, IAlertStore, ICallsiteStore
 {
     private readonly ConcurrentDictionary<string, (CallsiteRecord Record, long LastUsed)> _callsites = new();
     private readonly int _maxOps;
+    private const int MaxCallsites = 50_000, RowOverhead = 256;
+    private long _bytes;
+    private readonly ConcurrentDictionary<(string, long), MinuteBucket> _hours = new();
     private readonly ConcurrentDictionary<string, Operation> _ops = new();
     private readonly ConcurrentQueue<string> _order = new();
     private readonly ConcurrentDictionary<(string, long), MinuteBucket> _buckets = new();
@@ -82,10 +94,13 @@ public sealed class MemoryStore : IOperationStore, IAggregateStore, IAlertStore,
         {
             _ops[op.Id] = op;
             _order.Enqueue(op.Id);
+            Interlocked.Add(ref _bytes, Size(op));
         }
         while (_ops.Count > _maxOps && _order.TryDequeue(out var old))
-            _ops.TryRemove(old, out _);
+            if (_ops.TryRemove(old, out var gone)) Interlocked.Add(ref _bytes, -Size(gone));
     }
+
+    private static long Size(Operation op) => (op.Op.Raw?.Length ?? 0) + RowOverhead;
 
     public Operation? Get(string id) => _ops.GetValueOrDefault(id);
 
@@ -114,6 +129,9 @@ public sealed class MemoryStore : IOperationStore, IAggregateStore, IAlertStore,
     public void Upsert(IReadOnlyList<CallsiteRecord> callsites, long nowUs)
     {
         foreach (var c in callsites) _callsites[c.Callsite] = (c, nowUs);
+        if (_callsites.Count > MaxCallsites) // over the cap: least recently used first
+            foreach (var (k, _) in _callsites.OrderBy(e => e.Value.LastUsed).Take(_callsites.Count - MaxCallsites))
+                _callsites.TryRemove(k, out _);
     }
 
     public void Touch(IReadOnlyCollection<string> hashes, long nowUs)
@@ -136,7 +154,9 @@ public sealed class MemoryStore : IOperationStore, IAggregateStore, IAlertStore,
     {
         var n = 0;
         while (_order.TryPeek(out var id) && (!_ops.TryGetValue(id, out var op) || op.Ts < olderThanUs) && _order.TryDequeue(out _))
-            if (_ops.TryRemove(id, out _)) n++;
+            if (_ops.TryRemove(id, out var gone)) { n++; Interlocked.Add(ref _bytes, -Size(gone)); }
+        while (Interlocked.Read(ref _bytes) > maxBytes && _order.TryDequeue(out var oldest)) // the size bound: oldest first
+            if (_ops.TryRemove(oldest, out var g)) { n++; Interlocked.Add(ref _bytes, -Size(g)); }
         return n;
     }
 
@@ -160,13 +180,37 @@ public sealed class MemoryStore : IOperationStore, IAggregateStore, IAlertStore,
 
     public List<MinuteBucket> Buckets(long fromMinute, long toMinute, string? shape = null) =>
         _buckets.Values.Where(b => b.Minute >= fromMinute && b.Minute <= toMinute && (shape == null || b.ShapeHash == shape))
-            .Select(b => { lock (b) return Copy(b); }).ToList();
+            .Select(b => { lock (b) return Copy(b); })
+            .Concat(_hours.Values.Where(h => h.Minute * 60 >= fromMinute && h.Minute * 60 <= toMinute && (shape == null || h.ShapeHash == shape))
+                .Select(h => { lock (h) { var c = Copy(h); c.Minute *= 60; return c; } })) // hourly ones at their hour's first minute, as SqliteStore reports them
+            .ToList();
 
     public ShapeInfo? Shape(string hash) => _shapes.GetValueOrDefault(hash);
 
     public List<ShapeInfo> Shapes() => [.. _shapes.Values];
 
-    public void Rollup(long nowUs) { } // memory mode: bounded by process lifetime
+    /// <summary>03 §7 as SqliteStore: minutes older than 48 h roll up to hours, hours are kept 30 d.</summary>
+    public void Rollup(long nowUs)
+    {
+        var nowMinute = nowUs / 60_000_000;
+        var cutoff = nowMinute - 48 * 60;
+        foreach (var (key, b) in _buckets)
+        {
+            if (b.Minute >= cutoff || !_buckets.TryRemove(key, out _)) continue;
+            lock (b)
+                _hours.AddOrUpdate((b.ShapeHash, b.Minute / 60), _ => Copy2(b, b.Minute / 60), (_, h) => { lock (h) h.Merge(b); return h; });
+        }
+        var keepHour = (nowMinute - 30 * 24 * 60) / 60;
+        foreach (var (key, _) in _hours)
+            if (key.Item2 < keepHour) _hours.TryRemove(key, out _);
+    }
+
+    private static MinuteBucket Copy2(MinuteBucket d, long key)
+    {
+        var b = new MinuteBucket { ShapeHash = d.ShapeHash, Minute = key };
+        b.Merge(d);
+        return b;
+    }
 
     public void Upsert(IReadOnlyList<Alert> alerts)
     {

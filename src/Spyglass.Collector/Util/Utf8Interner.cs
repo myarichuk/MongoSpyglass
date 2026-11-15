@@ -4,8 +4,9 @@ namespace Spyglass.Collector.Util;
 
 /// <summary>
 /// UTF-8 bytes → string, probed by span without allocating (.NET alternate lookup). Bounded: once full it stops
-/// admitting new keys, so producer-chosen names cannot grow it; a miss past the bound costs what it cost
-/// before. Single-threaded: one per thread.
+/// holding keys, so producer-chosen names cannot grow it: a full table is cleared and refills with the names in
+/// use (a hot name costs one allocation per clear, a high-cardinality field churns the table instead of locking
+/// it with whatever came first). Single-threaded: one per thread.
 /// </summary>
 internal sealed class Utf8Interner
 {
@@ -42,7 +43,11 @@ internal sealed class Utf8Interner
     {
         if (_lookup.TryGetValue(utf8, out var s)) return s;
         s = Encoding.UTF8.GetString(utf8);
-        if (utf8.Length <= MaxKeyBytes && _map.Count < _capacity) _lookup.TryAdd(utf8, s);
+        if (utf8.Length <= MaxKeyBytes)
+        {
+            if (_map.Count >= _capacity) _map.Clear(); // no allocation; the repeating names are back after one miss each
+            _lookup.TryAdd(utf8, s);
+        }
         return s;
     }
 }

@@ -18,6 +18,8 @@ public sealed class ConnectionInfo
     public long BytesIn, BytesOut;
     /// <summary>Wall clock (Environment.TickCount64) when closed: entries are kept a while for late ops.</summary>
     public long ClosedAtTick;
+    /// <summary>Environment.TickCount64 of the last conn record or op on this connection: idle eviction (PLAN 1.2).</summary>
+    public long LastSeenTick = Environment.TickCount64;
 }
 
 /// <summary>
@@ -29,12 +31,28 @@ public sealed class ConnectionRegistry
 {
     private readonly ConcurrentDictionary<(string, long), ConnectionInfo> _conns = new();
     private const long KeepClosedMs = 60_000;
+    private readonly long _idleMs;
+    private readonly int _cap;
+    private long _evicted;
+
+    /// <param name="idle">A connection with no record for this long is dropped: its <c>close</c> was lost, or its proxy died (PLAN 1.2).</param>
+    /// <param name="cap">Hard bound: past it the least recently seen go first.</param>
+    public ConnectionRegistry(TimeSpan? idle = null, int cap = 200_000)
+    {
+        _idleMs = (long)(idle ?? TimeSpan.FromHours(2)).TotalMilliseconds;
+        _cap = cap;
+    }
+
+    public int Count => _conns.Count;
+    /// <summary>Entries dropped for idleness or over the cap (never a normal close): /metrics.</summary>
+    public long Evicted => Interlocked.Read(ref _evicted);
 
     public void Apply(ConnRecord c)
     {
         var info = _conns.GetOrAdd((c.Src, c.ConnSeq), _ => new ConnectionInfo { ProxyId = c.Src, ConnSeq = c.ConnSeq, Member = c.Member, OpenedTs = c.Ts });
         lock (info)
         {
+            info.LastSeenTick = Environment.TickCount64;
             info.ServerConnectionId ??= c.ServerConnectionId;
             info.Client ??= c.Client;
             info.App ??= c.App;
@@ -55,7 +73,23 @@ public sealed class ConnectionRegistry
         }
     }
 
-    public ConnectionInfo? Get(string proxyId, long connSeq) => _conns.GetValueOrDefault((proxyId, connSeq));
+    /// <summary>Looks a connection up for an op or cmd on it: that is activity, so it is touched.</summary>
+    public ConnectionInfo? Get(string proxyId, long connSeq)
+    {
+        var info = _conns.GetValueOrDefault((proxyId, connSeq));
+        if (info != null) info.LastSeenTick = Environment.TickCount64; // a racy plain write of a long: only ever approximately read
+        return info;
+    }
+
+    /// <summary>The proxy instance is gone (producer expired, or restarted under a new id): its open connections can never close.</summary>
+    public int DropProxy(string proxyId)
+    {
+        var n = 0;
+        foreach (var (k, _) in _conns)
+            if (k.Item1 == proxyId && _conns.TryRemove(k, out _)) n++;
+        Interlocked.Add(ref _evicted, n);
+        return n;
+    }
 
     public IEnumerable<ConnectionInfo> All => _conns.Values;
 
@@ -63,9 +97,17 @@ public sealed class ConnectionRegistry
     {
         var now = Environment.TickCount64;
         var n = 0;
+        var idle = 0;
         foreach (var (k, v) in _conns)
-            if (v.ClosedTs != null && now - v.ClosedAtTick > KeepClosedMs && _conns.TryRemove(k, out _))
-                n++;
+        {
+            if (v.ClosedTs != null && now - v.ClosedAtTick > KeepClosedMs) { if (_conns.TryRemove(k, out _)) n++; }
+            else if (now - v.LastSeenTick > _idleMs && _conns.TryRemove(k, out _)) { n++; idle++; }
+        }
+        var over = _conns.Count - _cap;
+        if (over > 0)
+            foreach (var (k, _) in _conns.OrderBy(e => e.Value.LastSeenTick).Take(over))
+                if (_conns.TryRemove(k, out _)) { n++; idle++; }
+        Interlocked.Add(ref _evicted, idle);
         return n;
     }
 }
@@ -99,6 +141,36 @@ public sealed class ProducerInfo
 public sealed class ProducerRegistry
 {
     private readonly ConcurrentDictionary<string, ProducerInfo> _producers = new();
+    private readonly long _idleUs;
+    private readonly int _cap;
+    private long _expired;
+
+    /// <summary>Every process start is a new src (02 §4.1) and any token holder can mint more: idle ones expire, and the count is capped.</summary>
+    public ProducerRegistry(TimeSpan? idle = null, int cap = 10_000)
+    {
+        _idleUs = (long)(idle ?? TimeSpan.FromHours(24)).TotalMicroseconds;
+        _cap = cap;
+    }
+
+    public int Count => _producers.Count;
+    public long Expired => Interlocked.Read(ref _expired);
+
+    /// <summary>
+    /// Drops producers unseen for the idle period, then the least recently seen past the cap. Returns the srcs removed
+    /// so their per-src state elsewhere (connections, skew windows) can go with them.
+    /// </summary>
+    public List<string> Sweep(long nowUs)
+    {
+        var gone = new List<string>();
+        foreach (var (k, p) in _producers)
+            if (nowUs - Volatile.Read(ref p.LastSeen) > _idleUs && p.LastSeen != 0 && _producers.TryRemove(k, out _)) gone.Add(k);
+        var over = _producers.Count - _cap;
+        if (over > 0)
+            foreach (var (k, _) in _producers.OrderBy(e => e.Value.LastSeen).Take(over))
+                if (_producers.TryRemove(k, out _)) gone.Add(k);
+        Interlocked.Add(ref _expired, gone.Count);
+        return gone;
+    }
 
     public ProducerInfo Touch(string src, string? producerHeader, long nowUs)
     {

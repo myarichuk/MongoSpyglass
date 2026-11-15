@@ -283,7 +283,15 @@ Buckets roll up to hourly after 48 h.
 
 Writes are batched (≥ 500 rows or 250 ms per transaction). Under write backpressure, raw
 operations are sampled (keep every slow, errored or alerted op, plus 1/N of the rest)
-before aggregates are ever dropped.
+before aggregates are ever dropped. A batch (appends, updates, callsites) is one transaction: a failed
+write is retried with backoff (6 attempts, 250 ms to 4 s), then dropped and counted
+(`spyglass_collector_storage_dropped_total`); failed ops (`ok:0`, write errors, write-concern errors) are
+never sampled, but even they are not queued past 2× the backlog bound (200k ops), and updates and callsite
+records are bounded too (200k, 50k): over a bound they are dropped and counted. The WAL is capped
+(`journal_size_limit` 64 MiB, truncated after retention) and any excess counts toward the 5 GiB bound.
+The collector logs its configured memory worst case at startup (§11). Connections idle for 2 h (or past
+200k) and producers idle for 24 h (or past 10k) are evicted (`/metrics`). `--data :memory:` keeps ops by
+count and size, rolls minute buckets up to hours, and caps callsites.
 
 ## 8. API (REST + SSE, JSON)
 

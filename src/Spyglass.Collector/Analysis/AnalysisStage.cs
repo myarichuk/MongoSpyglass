@@ -40,6 +40,7 @@ internal sealed class AnalysisStage
     private readonly ConcurrentDictionary<string, Operation> _waiting = new();
     /// <summary>Per exporter src: recent <c>cmd.ts − op.ts</c> samples, for the exporter-skew rule.</summary>
     private readonly Dictionary<string, SkewWindow> _skew = [];
+    private int _skewPruneAt = 1024;
     private readonly HashSet<string> _touchedCallsites = [];
     private long _nextCallsiteTouchUs;
     private readonly WorkQueue<Item> _queue = new();
@@ -305,7 +306,15 @@ internal sealed class AnalysisStage
     /// </summary>
     private void Skew(CmdRecord c, long opTs, string opId)
     {
-        if (!_skew.TryGetValue(c.Src, out var w)) _skew[c.Src] = w = new SkewWindow();
+        if (!_skew.TryGetValue(c.Src, out var w))
+        {
+            if (_skew.Count >= _skewPruneAt) // windows of producers the registry has expired (idle, or over its cap)
+            {
+                foreach (var k in _skew.Keys.Where(k => _producers.Get(k) == null).ToList()) _skew.Remove(k);
+                _skewPruneAt = Math.Max(1024, _skew.Count * 2);
+            }
+            _skew[c.Src] = w = new SkewWindow();
+        }
         if (w.Add(c.Ts - opTs) is not { } median) return;
         if (_producers.Get(c.Src) is { } p) p.SkewUs = median;
         if (Math.Abs(median) > 1_000_000)

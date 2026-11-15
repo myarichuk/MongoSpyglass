@@ -23,20 +23,27 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
     private readonly SqliteConnection _write;
     private readonly object _writeLock = new();
     private long _count, _bytes;
-    /// <summary>Per-row overhead beyond the raw line: columns and the five index entries.</summary>
+    /// <summary>Per-row overhead beyond the raw line: columns and the secondary index entries.</summary>
     private const int RowOverhead = 256;
+    /// <summary>03 §7: the WAL is truncated back to this after a checkpoint; and past it, retention truncates it explicitly and counts it toward the size bound.</summary>
+    private const long WalLimit = 64L * 1024 * 1024;
+    private readonly string _walFile;
+    /// <summary>Inside <see cref="Transact"/>: Append/Update/callsites join the outer transaction, and their counters apply when it commits.</summary>
+    private bool _inTx;
+    private long _txCount, _txBytes;
 
     public SqliteStore(string directory)
     {
         Directory.CreateDirectory(directory);
         var file = Path.Combine(directory, "spyglass.db");
+        _walFile = file + "-wal";
         var cs = new SqliteConnectionStringBuilder { DataSource = file, Mode = SqliteOpenMode.ReadWriteCreate, Pooling = true }.ToString();
         _readCs = new SqliteConnectionStringBuilder(cs) { Mode = SqliteOpenMode.ReadOnly }.ToString();
         _write = new SqliteConnection(cs);
         _write.Open();
         // the ops table carries five secondary indexes: a 64 MiB page cache keeps their hot pages resident
         Exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=OFF; " +
-             "PRAGMA cache_size=-65536; PRAGMA mmap_size=268435456; PRAGMA temp_store=MEMORY;");
+             "PRAGMA cache_size=-65536; PRAGMA mmap_size=268435456; PRAGMA temp_store=MEMORY; PRAGMA journal_size_limit=67108864;");
         Exec("""
             CREATE TABLE IF NOT EXISTS ops (
               id TEXT PRIMARY KEY, ts INTEGER NOT NULL, command TEXT NOT NULL, coll TEXT, status TEXT NOT NULL,
@@ -47,6 +54,7 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
             CREATE INDEX IF NOT EXISTS ops_coll ON ops(coll, id);
             CREATE INDEX IF NOT EXISTS ops_command ON ops(command, id);
             CREATE INDEX IF NOT EXISTS ops_status ON ops(status, id) WHERE status <> 'ok';
+            CREATE INDEX IF NOT EXISTS ops_latency ON ops(latency, id) WHERE latency IS NOT NULL;
             CREATE TABLE IF NOT EXISTS agg_minute (shape TEXT NOT NULL, minute INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(shape, minute)) WITHOUT ROWID;
             CREATE INDEX IF NOT EXISTS agg_minute_t ON agg_minute(minute);
             CREATE TABLE IF NOT EXISTS agg_hour (shape TEXT NOT NULL, hour INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(shape, hour)) WITHOUT ROWID;
@@ -61,6 +69,42 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
         Exec("CREATE INDEX IF NOT EXISTS ops_uow ON ops(uow, id) WHERE uow IS NOT NULL;");
         _count = Scalar("SELECT count(*) FROM ops");
         _bytes = Scalar("SELECT coalesce(sum(size), 0) FROM ops");
+    }
+
+    /// <summary>A transaction scope that is a no-op inside <see cref="Transact"/> (SQLite has no nested ones; the outer one commits).</summary>
+    private sealed class Scope(SqliteTransaction? tx) : IDisposable
+    {
+        public void Commit() => tx?.Commit();
+        public void Dispose() => tx?.Dispose();
+    }
+
+    private Scope Begin() => new(_inTx ? null : _write.BeginTransaction());
+
+    /// <summary>Row and byte counters: held back while an outer transaction might still roll back.</summary>
+    private void Counted(long rows, long bytes)
+    {
+        if (_inTx) { _txCount += rows; _txBytes += bytes; return; }
+        Interlocked.Add(ref _count, rows);
+        Interlocked.Add(ref _bytes, bytes);
+    }
+
+    /// <summary>One atomic write of whatever Append/Update/Upsert/Touch calls <paramref name="work"/> makes (CI-3).</summary>
+    public void Transact(Action work)
+    {
+        lock (_writeLock)
+        {
+            using var tx = _write.BeginTransaction();
+            _inTx = true;
+            _txCount = _txBytes = 0;
+            try
+            {
+                work();
+                tx.Commit();
+                Interlocked.Add(ref _count, _txCount);
+                Interlocked.Add(ref _bytes, _txBytes);
+            }
+            finally { _inTx = false; }
+        }
     }
 
     private void Exec(string sql)
@@ -109,7 +153,7 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
             if (_insert == null)
                 Check(raw.sqlite3_prepare_v3(db, InsertSql, 1 /* SQLITE_PREPARE_PERSISTENT */, out _insert), db);
             var st = _insert;
-            using var tx = _write.BeginTransaction();
+            using var tx = Begin();
             long inserted = 0, bytes = 0;
             try
             {
@@ -147,8 +191,7 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
             {
                 raw.sqlite3_reset(st); // a failed step leaves it mid-execution: reset before the rollback
             }
-            Interlocked.Add(ref _count, inserted);
-            Interlocked.Add(ref _bytes, bytes);
+            Counted(inserted, bytes);
         }
     }
 
@@ -193,7 +236,12 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
         if (q.Coll != null) Add("coll = $coll", "$coll", q.Coll);
         if (q.Command != null) Add("command = $command", "$command", q.Command);
         if (q.Shape != null) Add("shape = $shape", "$shape", q.Shape);
-        if (q.Status != null) Add("status = $status", "$status", q.Status);
+        if (q.Status != null)
+        {
+            Add("status = $status", "$status", q.Status);
+            // SQLite uses the partial index ops_status only when the query repeats its WHERE term (CI-4)
+            if (q.Status != "ok") where.Add("status <> 'ok'");
+        }
         if (q.Uow != null) Add("uow = $uow", "$uow", q.Uow);
         if (q.MinLatencyUs != null) Add("latency >= $lat", "$lat", q.MinLatencyUs);
         cmd.CommandText = $"SELECT {Columns} FROM ops" +
@@ -234,7 +282,7 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
         if (updates.Count == 0) return;
         lock (_writeLock)
         {
-            using var tx = _write.BeginTransaction();
+            using var tx = Begin();
             using var cmd = _write.CreateCommand();
             cmd.CommandText = """
                 UPDATE ops SET reply_count = coalesce($rc, reply_count), alerts = coalesce($alerts, alerts),
@@ -257,7 +305,7 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
                 bytes += cmd.ExecuteNonQuery() * grow;
             }
             tx.Commit();
-            Interlocked.Add(ref _bytes, bytes);
+            Counted(0, bytes);
         }
     }
 
@@ -275,12 +323,21 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
             removed += deleted;
             progress?.Invoke();
         } while (deleted == PruneChunk);
+        // the WAL is disk the 03 §7 bound must count. Up to WalLimit it is working space (journal_size_limit keeps it there);
+        // past that, truncate it, and charge what a busy reader kept us from reclaiming
+        var wal = WalBytes();
+        if (wal > WalLimit)
+        {
+            lock (_writeLock) Exec("PRAGMA wal_checkpoint(TRUNCATE);");
+            wal = Math.Max(0, WalBytes() - WalLimit);
+        }
+        else wal = 0;
         // size bound: oldest first, a proportional estimate at a time (rows differ in size), until it fits
-        while (Interlocked.Read(ref _bytes) > maxBytes && Interlocked.Read(ref _count) > 0)
+        while (Interlocked.Read(ref _bytes) + wal > maxBytes && Interlocked.Read(ref _count) > 0)
         {
             lock (_writeLock)
             {
-                var excess = (double)(_bytes - maxBytes) / _bytes;
+                var excess = (double)(_bytes + wal - maxBytes) / Math.Max(1, _bytes);
                 var n = (int)Math.Clamp(Math.Ceiling(_count * excess), 1, PruneChunk);
                 deleted = Delete("id IN (SELECT id FROM ops ORDER BY id LIMIT $n)", ("$n", n));
             }
@@ -293,21 +350,20 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
         return removed;
     }
 
+    private long WalBytes() => File.Exists(_walFile) ? new FileInfo(_walFile).Length : 0;
+
+    /// <summary>One statement per chunk: RETURNING gives the sizes of the rows it removed, so the subquery runs once (CI-20).</summary>
     private int Delete(string where, params (string Name, object Value)[] ps)
     {
-        using var size = _write.CreateCommand();
-        size.CommandText = $"SELECT count(*), coalesce(sum(size), 0) FROM ops WHERE {where}";
-        foreach (var p in ps) size.Parameters.AddWithValue(p.Name, p.Value);
-        long rows, bytes;
-        using (var rd = size.ExecuteReader()) { rd.Read(); rows = rd.GetInt64(0); bytes = rd.GetInt64(1); }
-        if (rows == 0) return 0;
         using var del = _write.CreateCommand();
-        del.CommandText = $"DELETE FROM ops WHERE {where}";
+        del.CommandText = $"DELETE FROM ops WHERE {where} RETURNING size";
         foreach (var p in ps) del.Parameters.AddWithValue(p.Name, p.Value);
-        var n = del.ExecuteNonQuery();
-        Interlocked.Add(ref _count, -n);
+        long rows = 0, bytes = 0;
+        using (var rd = del.ExecuteReader())
+            while (rd.Read()) { rows++; bytes += rd.GetInt64(0); }
+        Interlocked.Add(ref _count, -rows);
         Interlocked.Add(ref _bytes, -bytes);
-        return n;
+        return (int)rows;
     }
 
     /// <summary>
@@ -490,7 +546,7 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
         if (callsites.Count == 0) return;
         lock (_writeLock)
         {
-            using var tx = _write.BeginTransaction();
+            using var tx = Begin();
             foreach (var c in callsites)
             {
                 using var cmd = _write.CreateCommand();
@@ -509,7 +565,7 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
         if (hashes.Count == 0) return;
         lock (_writeLock)
         {
-            using var tx = _write.BeginTransaction();
+            using var tx = Begin();
             using var cmd = _write.CreateCommand();
             cmd.CommandText = "UPDATE callsites SET last_used = $t WHERE hash = $h";
             var h = cmd.Parameters.Add("$h", SqliteType.Text);

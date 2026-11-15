@@ -70,7 +70,18 @@ public sealed class Collector : IAsyncDisposable
         _partitions = new Partition[options.Workers];
         for (var i = 0; i < _partitions.Length; i++)
             _partitions[i] = new Partition(options, Connections, Producers, Join, _analysis.Post, Release, NowUs, ExportersActive);
-        _sweep = new Timer(_ => Connections.Sweep(), null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
+        _sweep = new Timer(_ => Sweep(), null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
+    }
+
+    /// <summary>Every 30 s: closed and idle connections (PLAN 1.2), idle producers and what hangs off them.</summary>
+    private void Sweep()
+    {
+        try
+        {
+            foreach (var src in Producers.Sweep(NowUs())) Connections.DropProxy(src);
+            Connections.Sweep();
+        }
+        catch (Exception e) { Console.Error.WriteLine($"sweep: {e.GetType().Name}: {e.Message}"); }
     }
 
     internal AnalysisStage Analysis => _analysis;
@@ -80,9 +91,22 @@ public sealed class Collector : IAsyncDisposable
 
     public void Start()
     {
+        Console.Error.WriteLine(WorstCase());
         _writer.Start();
         _analysis.Start();
         for (var i = 0; i < _partitions.Length; i++) _partitions[i].Start(i);
+    }
+
+    /// <summary>03 §11: the memory the configured bounds allow, logged at startup. Op lines are bounded by the command size cap plus the envelope.</summary>
+    internal string WorstCase()
+    {
+        const long OpLine = 24 * 1024; // 16 KiB command default + reply, context and envelope
+        var waiting = ((long)Options.JoinMaxWaitingOps + Options.JoinMaxWaitingCmds) * OpLine;
+        var backlog = (long)StorageWriter.HardCapacity * OpLine;
+        var total = Options.QueueBytes + waiting + backlog;
+        return $"memory worst case ~{total / 1048576} MiB: ingest queue {Options.QueueBytes / 1048576} MiB + join waiting " +
+               $"{waiting / 1048576} MiB ({Options.JoinMaxWaitingOps} ops, {Options.JoinMaxWaitingCmds} cmds) + storage backlog {backlog / 1048576} MiB " +
+               $"({StorageWriter.HardCapacity} ops) at ~{OpLine / 1024} KiB per op; typical ops are far smaller";
     }
 
     private void Release(long bytes) => Interlocked.Add(ref _charged, -bytes);
@@ -329,6 +353,14 @@ public sealed class Collector : IAsyncDisposable
         M("spyglass_collector_ops_analysed_total", "counter", "Operations through the analysis stage.", ("", _analysis.Processed));
         M("spyglass_collector_ops_stored_total", "counter", "Operations written to the store.", ("", _writer.Written));
         M("spyglass_collector_ops_sampled_out_total", "counter", "Operations not stored under write backpressure (03 §7).", ("", _writer.Sampled));
+        M("spyglass_collector_storage_dropped_total", "counter", "Records lost before storage: failed writes after retries, or over the backlog bound.",
+            ("kind=\"op\"", _writer.WriteDropped), ("kind=\"op_overflow\"", _writer.Overflowed), ("kind=\"update\"", _writer.UpdatesDropped),
+            ("kind=\"callsite\"", _writer.CallsitesDropped));
+        M("spyglass_collector_storage_write_retries_total", "counter", "Failed storage writes that were retried.", ("", _writer.Retries));
+        M("spyglass_collector_connections", "gauge", "Connections held in the registry.", ("", Connections.Count));
+        M("spyglass_collector_connections_evicted_total", "counter", "Connections dropped as idle or over the cap, without a close record.", ("", Connections.Evicted));
+        M("spyglass_collector_producers", "gauge", "Producers held in the registry.", ("", Producers.Count));
+        M("spyglass_collector_producers_expired_total", "counter", "Producers dropped as idle or over the cap.", ("", Producers.Expired));
         M("spyglass_collector_ops_pruned_total", "counter", "Operations removed by retention.", ("", _writer.Pruned));
         M("spyglass_collector_storage_backlog", "gauge", "Operations waiting to be written.", ("", _writer.Backlog));
         M("spyglass_collector_cursors_open", "gauge", "Server cursors tracked as open (03 §5.4).", ("", _analysis.OpenCursors.Length));
