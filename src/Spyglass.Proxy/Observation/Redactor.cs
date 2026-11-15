@@ -27,6 +27,7 @@ internal sealed class Redactor
     /// <summary>Field name → pattern verdict. The pattern is fixed for the process, so a cached verdict is exact.</summary>
     private readonly Utf8Table<bool> _verdicts = new(4096);
     private readonly byte[] _truncated;
+    private readonly byte[] _errmsg = new byte[2048]; // 256 captured bytes + a "$redacted" (11 bytes) per scrubbed value
     private LsidHasher _lsids = new(capacity: 64);
 
     public Redactor(CaptureConfig config)
@@ -36,6 +37,9 @@ internal sealed class Redactor
         _fieldPattern = new Regex(config.RedactFieldPattern, RegexOptions.CultureInvariant);
         _truncated = new byte[_truncateAt + 32];
     }
+
+    public ValueMode Mode => _mode;
+    public int TruncateAt => _truncateAt;
 
     /// <summary>Convenience for tests and one-offs: a fresh buffer per call.</summary>
     public (byte[] Bson, bool Truncated, bool WholeCommandRedacted) Redact(string command, ReadOnlySpan<byte> doc, bool isHello, bool captureTruncated)
@@ -85,6 +89,7 @@ internal sealed class Redactor
         var elements = Bson.Elements(doc);
         var index = 0;
         Span<byte> scratch = stackalloc byte[12];
+        var redactLiterals = isArray && HasSecretPath(doc);
         while (elements.MoveNext())
         {
             var e = elements.Current;
@@ -115,10 +120,20 @@ internal sealed class Redactor
                 continue;
             }
 
-            if (topLevel && (e.NameIs("$db"u8) || e.Index0()))
+            if (topLevel && ((e.NameIs("$db"u8) && e.Type == BsonType.String) ||
+                             (e.Index0() && e.Type is BsonType.String or BsonType.Int32 or BsonType.Int64 or BsonType.Double or BsonType.Boolean)))
             {
-                // command name/target and database are identifiers, never truncated or shaped
+                // command name/target and database are identifiers, never truncated or shaped. A document or array as the
+                // first value (explain, applyOps, ...) is a body like any other: it goes through the value policy.
                 w.WriteElement(e);
+                continue;
+            }
+
+            // {$eq: ["$password", "hunter2"]}: the literals next to a secret field path are secrets too
+            if (redactLiterals && e.Type is not (BsonType.Document or BsonType.Array) &&
+                !(e.Type == BsonType.String && e.StringBytes.Length > 0 && e.StringBytes[0] == (byte)'$'))
+            {
+                w.WriteStringUtf8(e.Name, "$redacted"u8);
                 continue;
             }
 
@@ -151,20 +166,19 @@ internal sealed class Redactor
             return;
         }
 
+        if (e.Type == BsonType.JavaScriptWithScope)
+        {
+            WriteCodeWithScope(w, e, depth);
+            return;
+        }
+
         if (_mode == ValueMode.Truncated)
         {
-            if (e.Type == BsonType.String && e.StringBytes.Length > _truncateAt)
+            if (e.Type is BsonType.String or BsonType.JavaScript or BsonType.Symbol && e.StringBytes.Length > _truncateAt)
             {
-                var s = e.StringBytes;
-                var cut = Utf8Boundary(s, _truncateAt);
-                s[..cut].CopyTo(_truncated);
-                var n = cut;
-                "…(+"u8.CopyTo(_truncated.AsSpan(n));
-                n += "…(+"u8.Length;
-                (s.Length - cut).TryFormat(_truncated.AsSpan(n), out var digits, provider: System.Globalization.CultureInfo.InvariantCulture);
-                n += digits;
-                _truncated[n++] = (byte)')';
-                w.WriteStringUtf8(e.Name, _truncated.AsSpan(0, n));
+                var cut = Cut(e.StringBytes);
+                if (e.Type == BsonType.String) w.WriteStringUtf8(e.Name, cut);
+                else WriteStringLike(w, e.Name, e.Type, cut);
                 return;
             }
             if (e.Type == BsonType.Binary)
@@ -181,6 +195,153 @@ internal sealed class Redactor
         }
 
         w.WriteElement(e);
+    }
+
+    /// <summary><paramref name="s"/> cut at <c>truncateStringsAt</c> and suffixed <c>…(+N)</c> (a view of a scratch buffer valid until the next call).</summary>
+    private ReadOnlySpan<byte> Cut(ReadOnlySpan<byte> s)
+    {
+        if (s.Length <= _truncateAt) return s;
+        var cut = Utf8Boundary(s, _truncateAt);
+        s[..cut].CopyTo(_truncated);
+        var n = cut;
+        "…(+"u8.CopyTo(_truncated.AsSpan(n));
+        n += "…(+"u8.Length;
+        (s.Length - cut).TryFormat(_truncated.AsSpan(n), out var digits, provider: System.Globalization.CultureInfo.InvariantCulture);
+        n += digits;
+        _truncated[n++] = (byte)')';
+        return _truncated.AsSpan(0, n);
+    }
+
+    /// <summary>A string-valued element of type <paramref name="type"/> (JavaScript, Symbol) with the given UTF-8 text.</summary>
+    private static void WriteStringLike(BsonWriter w, ReadOnlySpan<byte> name, byte type, ReadOnlySpan<byte> utf8)
+    {
+        w.WriteElement(name, type, default);
+        w.WriteInt32Raw(utf8.Length + 1);
+        w.WriteRaw(utf8);
+        w.WriteByteRaw(0);
+    }
+
+    /// <summary>JavaScriptWithScope: the code is cut like a string, the scope document is walked like any other.</summary>
+    private void WriteCodeWithScope(BsonWriter w, in BsonElement e, int depth)
+    {
+        var v = e.Value;
+        var codeLen = v.Length >= 8 ? BinaryPrimitives.ReadInt32LittleEndian(v[4..]) : -1;
+        if (depth >= MaxDepth || codeLen < 1 || 8L + codeLen > v.Length)
+        {
+            w.WriteString(e.Name, depth >= MaxDepth ? "$depth" : "$redacted");
+            return;
+        }
+        var code = v.Slice(8, codeLen - 1);
+        if (_mode == ValueMode.Truncated) code = Cut(code);
+        w.WriteElement(e.Name, BsonType.JavaScriptWithScope, default);
+        var start = w.Length;
+        w.WriteInt32Raw(0);
+        w.WriteInt32Raw(code.Length + 1);
+        w.WriteRaw(code);
+        w.WriteByteRaw(0);
+        w.StartDocument();
+        WriteElements(w, v[(8 + codeLen)..], depth + 1, topLevel: false, isHello: false);
+        w.EndDocument();
+        w.PatchInt32(start, w.Length - start);
+    }
+
+    /// <summary>True when an array holds a field path (<c>"$password"</c>) whose name the pattern redacts.</summary>
+    private bool HasSecretPath(ReadOnlySpan<byte> arrayDoc)
+    {
+        foreach (var e in Bson.Elements(arrayDoc))
+        {
+            if (e.Type != BsonType.String) continue;
+            var s = e.StringBytes;
+            if (s.Length > 1 && s[0] == (byte)'$' && s[1] != (byte)'$' && NameMatches(s[1..]))
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// A server error message as exported (01 §10); the caller drops it in <c>shape</c> mode (<see cref="Mode"/>). Otherwise
+    /// every <c>name: value</c> whose name the redaction pattern matches (the <c>dup key: { token: "…" }</c> of an E11000)
+    /// has its value replaced by <c>"$redacted"</c>, and in <c>truncated</c> mode quoted values are cut like any string.
+    /// The result lives in a per-redactor buffer, valid until the next call.
+    /// </summary>
+    public ReadOnlySpan<byte> ScrubErrmsg(ReadOnlySpan<byte> msg)
+    {
+        var o = 0;
+        var copied = 0;
+        var i = 0;
+        var buf = _errmsg;
+        while (i < msg.Length)
+        {
+            var rel = msg[i..].IndexOf((byte)':');
+            if (rel < 0) break;
+            var p = i + rel;
+            i = p + 1;
+            var ts = p;
+            while (ts > copied && IsNameByte(msg[ts - 1])) ts--;
+            var vs = p + 1;
+            while (vs < msg.Length && msg[vs] == (byte)' ') vs++;
+            if (vs >= msg.Length) break;
+
+            if (ts < p && NameMatches(msg[ts..p]))
+            {
+                var end = ValueEnd(msg, vs);
+                Put(buf, ref o, msg[copied..vs]);
+                Put(buf, ref o, "\"$redacted\""u8);
+                copied = i = end;
+            }
+            else if (_mode == ValueMode.Truncated && msg[vs] is (byte)'"' or (byte)'\'')
+            {
+                var end = ValueEnd(msg, vs);
+                var closed = end > vs + 1 && msg[end - 1] == msg[vs];
+                var content = msg[(vs + 1)..(closed ? end - 1 : end)];
+                if (content.Length <= _truncateAt) continue;
+                Put(buf, ref o, msg[copied..(vs + 1)]);
+                Put(buf, ref o, Cut(content));
+                if (closed) Put(buf, ref o, msg.Slice(vs, 1));
+                copied = i = end;
+            }
+        }
+        Put(buf, ref o, msg[copied..]);
+        return buf.AsSpan(0, o);
+    }
+
+    private static void Put(byte[] buf, ref int o, ReadOnlySpan<byte> b)
+    {
+        var n = Math.Min(b.Length, buf.Length - o);
+        b[..n].CopyTo(buf.AsSpan(o));
+        o += n;
+    }
+
+    private static bool IsNameByte(byte b) => b is >= (byte)'a' and <= (byte)'z' or >= (byte)'A' and <= (byte)'Z' or >= (byte)'0' and <= (byte)'9'
+        or (byte)'_' or (byte)'.' or (byte)'$' or (byte)'-' or >= 0x80;
+
+    /// <summary>End (exclusive) of the value starting at <paramref name="vs"/> in a server message: a quoted string, or up to the next top-level separator.</summary>
+    private static int ValueEnd(ReadOnlySpan<byte> m, int vs)
+    {
+        var j = vs;
+        if (m[j] is (byte)'"' or (byte)'\'')
+        {
+            var q = m[j++];
+            while (j < m.Length)
+            {
+                if (m[j] == (byte)'\\') j += 2;
+                else if (m[j++] == q) return j;
+            }
+            return m.Length;
+        }
+        var depth = 0;
+        for (; j < m.Length; j++)
+        {
+            var c = m[j];
+            if (c is (byte)'(' or (byte)'{' or (byte)'[') depth++;
+            else if (c is (byte)')' or (byte)'}' or (byte)']')
+            {
+                if (depth == 0) break;
+                depth--;
+            }
+            else if (depth == 0 && c is (byte)',' or (byte)' ') break;
+        }
+        return j;
     }
 
     /// <summary>03 §4.1 leaf tags.</summary>

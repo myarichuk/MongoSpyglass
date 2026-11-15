@@ -149,17 +149,12 @@ public sealed class BodyFieldScanner
         else if (NameIs("id"u8) && _type == BsonType.Binary) _plan = Plan.LsidId;
 
         _have = 0;
-        switch (_type)
+        switch (BsonLayout.Classify(_type, out var fixedSize))
         {
-            case BsonType.Double or BsonType.DateTime or BsonType.Timestamp or BsonType.Int64: Fixed(8); break;
-            case BsonType.Int32: Fixed(4); break;
-            case BsonType.Boolean: Fixed(1); break;
-            case BsonType.ObjectId: Fixed(12); break;
-            case BsonType.Decimal128: Skip(16); break;
-            case BsonType.Undefined or BsonType.Null or BsonType.MinKey or BsonType.MaxKey: _s = S.Type; break;
-            case BsonType.Regex: _regexNuls = 0; _s = S.Regex; break;
-            case BsonType.String or BsonType.JavaScript or BsonType.Symbol or BsonType.Document or BsonType.Array
-                or BsonType.JavaScriptWithScope or BsonType.Binary or BsonType.DbPointer:
+            case BsonKind.Fixed: Fixed(fixedSize); break;
+            case BsonKind.Zero: _s = S.Type; break;
+            case BsonKind.Regex: _regexNuls = 0; _s = S.Regex; break;
+            case BsonKind.Prefixed:
                 _need = 4;
                 _s = S.Len;
                 break;
@@ -183,33 +178,27 @@ public sealed class BodyFieldScanner
 
     private void OnLength(int len)
     {
+        var rest = BsonLayout.PrefixedRest(_type, len);
+        if (rest < 0) { _s = S.Done; return; }
         switch (_type)
         {
             case BsonType.Document or BsonType.Array or BsonType.JavaScriptWithScope:
-                if (len < 5) { _s = S.Done; return; }
                 if (_plan == Plan.DescendLsid) { _depth = 1; _s = S.Type; return; }
-                Skip(len - 4L);
+                Skip(rest);
                 return;
             case BsonType.Binary:
-                if (len < 0) { _s = S.Done; return; }
                 if (_plan == Plan.LsidId && len <= LsidId.Length)
                 {
-                    StartCapture(LsidId, skipFirst: 1, captureLen: len, total: len + 1L); // subtype byte, then data
+                    StartCapture(LsidId, skipFirst: 1, captureLen: len, total: rest); // subtype byte, then data
                     return;
                 }
-                Skip(len + 1L);
+                Skip(rest);
                 return;
-            case BsonType.DbPointer:
-                Skip(len + 12L);
+            case BsonType.String when _plan == Plan.Db:
+                StartCapture(Db, skipFirst: 0, captureLen: Math.Min(DbCap, len - 1), total: rest);
                 return;
-            default: // string-like
-                if (len < 1) { _s = S.Done; return; }
-                if (_plan == Plan.Db)
-                {
-                    StartCapture(Db, skipFirst: 0, captureLen: Math.Min(DbCap, len - 1), total: len);
-                    return;
-                }
-                Skip(len);
+            default: // other strings, dbPointer
+                Skip(rest);
                 return;
         }
     }

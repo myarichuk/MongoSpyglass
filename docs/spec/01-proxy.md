@@ -50,10 +50,10 @@ compression: strip          # strip | opaque | observe   (§8)
 
 capture:
   commandBytes: 16384       # max bytes of each request body copied for observation
-  replyBytes: 0             # max bytes of each reply body copied (0 = facts only, no reply content)
+  replyBytes: 0             # accepted and ignored: replies are scanned for facts, never copied (§10)
   values: truncated         # full | truncated | shape   (§9.3)
   truncateStringsAt: 64
-  redactFieldPattern: "(?i)^(pass(word)?|pwd|secret|token|api[-_]?key|authorization|cookie|ssn|card(number)?)$"
+  redactFieldPattern: "(?i)(passw(or)?d|passphrase|pwd|^pass$|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|authorization|cookie|credential|^ssn$|[-_]ssn$|^card$|card[-_]?num|^cvv$)"
 
 limits:
   maxClientConnections: 4096
@@ -192,7 +192,7 @@ exporter marker (02 §2.4).
 
 ## 4. Observation tap
 
-Each pump has a per-connection capture ring of fixed-size slots (default 32 slots). A slot
+Each pump has a per-connection capture ring of fixed-size slots (512 slots per direction). A slot
 holds:
 
 ```
@@ -202,17 +202,22 @@ struct FrameCapture {
   int    requestId, responseTo, opCode, originalOpCode, flags;
   int    frameLength;
   long   tFirst, tLast;      // monotonic ticks
-  int    capturedLength;     // ≤ capture.commandBytes / replyBytes
+  int    capturedLength;     // ≤ capture.commandBytes (requests; OP_COMPRESSED replies under compression=observe)
   bool   truncated;
   ReplyFacts facts;          // replies only, filled by the streaming scanner (§10)
   byte[] buffer;             // pooled, length = capture limit
 }
 ```
 
-* `tap.begin` claims a slot. If none is free, it marks the frame `unobserved` and counts a
-  drop (I4). Forwarding continues regardless.
-* `tap.body` copies bytes into the slot only while `capturedLength < limit`. For replies, it
-  also feeds the streaming scanner, which inspects and does not copy.
+* `tap.begin` claims a slot. If the connection's ring is full it counts `no_slot`; if the global
+  byte bound (`observeQueueBytes`) is reached it counts `queue_full` (I4). Either way the frame is
+  `unobserved` and forwarding continues. An unobserved *reply* still posts a header-only item
+  (`responseTo`, `requestId`, flags), so the observer releases the request it answers and keeps a
+  `moreToCome` stream chained; that op produces no record.
+* `tap.body` copies request bytes into the slot only while `capturedLength < limit`. Replies are
+  fed to the streaming scanner, which inspects and does not copy; the one exception is an
+  OP_COMPRESSED reply under `compression=observe`, whose first `capture.commandBytes` are kept so
+  the observer can inflate them (§8).
 * `tap.end` publishes the slot to the **observer queue**. That's an MPSC queue bounded by
   `limits.observeQueueBytes`, counting `capturedLength`. If enqueueing would exceed the
   bound, the slot is released and a drop is counted.
@@ -327,7 +332,9 @@ Sharded and standalone hello replies get R2 only.
 
 The observer keeps a per-connection pending table: `requestId → PendingRequest{commandName,
 tFirst, tLast, capture, flags}`, bounded by `maxPendingPerConnection` (oldest evicted and
-counted).
+counted) and by age: a request or exhaust stream with no reply for 10 minutes is dropped and
+counted as `pending_evicted` (no `op` record), so a lost reply can't pin memory or later surface
+as a false `connection_closed`. A client reusing an id it has no reply for is counted the same way.
 
 | Situation | Rule |
 |---|---|
@@ -345,8 +352,8 @@ Correlation therefore never races against the server's reply.
 | Mode | Client hello | On the wire | What the proxy sees |
 |---|---|---|---|
 | `strip` (default) | R3 removes `compression` | uncompressed on both hops | everything |
-| `opaque` | unchanged | whatever was negotiated | OP_COMPRESSED frames get header facts and sizes only; the command name comes from the reply if possible, else `"(compressed)"` |
-| `observe` | unchanged | whatever was negotiated | the observer (never the pump) decompresses captured bytes. v1 supports `zlib` (BCL `ZLibStream`) only. `snappy`/`zstd` frames are treated as `opaque` and counted. |
+| `opaque` | unchanged | whatever was negotiated | OP_COMPRESSED frames get header facts and sizes only; the command is `"(compressed)"` (a reply doesn't name its command) and replies are not parsed (`reply.parsed=false`) |
+| `observe` | unchanged | whatever was negotiated | the observer (never the pump) decompresses captured bytes: requests in full (up to 16 MiB inflated, so command, `$db`, `seqDocs` and the redacted body are all available), replies from the captured head (`capture.commandBytes` compressed), run through the reply scanner, so status, errors, cursors and `moreToCome` streams work. A reply cut off by the capture limit reports `parsed=false` and no `nReturned` metric. v1 supports `zlib` (BCL `ZLibStream`) only. `snappy`/`zstd` frames are treated as `opaque` and counted. |
 
 `strip` costs bandwidth on the proxy→member hop. It's the default because it keeps the
 proxy dependency-free and fully observant.
@@ -372,6 +379,8 @@ Replies to these are reduced to `ok`/`code`/`codeName` only.
 * Any field, at any depth, whose name matches `capture.redactFieldPattern`: value replaced
   by `"$redacted"`. Dotted paths (`{"profile.password": …}` in a filter or `$set`) match if any
   segment matches.
+* A string `"$<field>"` in an array (an aggregation expression such as `{$eq: ["$password", "hunter2"]}`)
+  whose field name matches the pattern makes the other literals of that array `"$redacted"`.
 * `lsid.id` is replaced by a 16-hex-char SHA-256 prefix of its bytes. That keeps grouping by
   session without exporting the UUID.
 
@@ -380,7 +389,7 @@ Replies to these are reduced to `ok`/`code`/`codeName` only.
 | Mode | Leaf values in exported command bodies |
 |---|---|
 | `full` | as captured |
-| `truncated` (default) | strings longer than `truncateStringsAt` are cut and suffixed `…(+N)`; BinData shows subtype + length only; arrays with more than 20 elements keep the first 20 plus `{"$more": N}` |
+| `truncated` (default) | strings (also JavaScript and Symbol) longer than `truncateStringsAt` are cut and suffixed `…(+N)`; BinData shows subtype + length only; arrays with more than 20 elements keep the first 20 plus `{"$more": N}` |
 | `shape` | every leaf replaced by its type tag (03 §4). `valueHash` can't be computed, so duplicate-query detection is off. |
 
 ### 9.4 Kind-1 document sequences
@@ -396,12 +405,12 @@ partial strings as if they were complete.
 
 ## 10. Streaming reply scanner (no buffering)
 
-Replies are not copied beyond `capture.replyBytes` (default 0), but these facts are always
-extracted, by a resumable state machine fed by `tap.body` chunks:
+Replies are never copied (§4), but these facts are always extracted, by a resumable state
+machine fed by `tap.body` chunks:
 
 | Fact | Source |
 |---|---|
-| `ok`, `code`, `codeName`, `errmsg` (first 256 bytes) | top-level |
+| `ok`, `code`, `codeName`, `errmsg` (first 256 bytes) | top-level. `ok` other than a number ≥ 1 (0, NaN) is an error. An `errmsg` is exported under the value mode (§9.3): omitted for `shape`; otherwise every `name: value` whose name matches `redactFieldPattern` (the `dup key: { apiKey: "…" }` of an E11000) has its value replaced by `"$redacted"`, and with `truncated` quoted values are cut at `truncateStringsAt`. |
 | `cursor.id`, `cursor.ns` | `cursor` subdocument |
 | `nReturned` | element count of `cursor.firstBatch` / `cursor.nextBatch`, counted by skipping each element by its length prefix |
 | `n`, `nModified`, `writeErrorsCount`, `upsertedCount`, `writeConcernError` (present?) | write replies |
@@ -429,7 +438,12 @@ Wire records (02 §4.2) are built by the observer and handed to one sender threa
 * batches per 02 §5;
 * on an unreachable collector or a 5xx: one retry after 1 s, then drop the batch and count
   it;
-* on 429: honour `Retry-After` (capped at 10 s), dropping new batches meanwhile.
+* on 429: honour `Retry-After` (delta-seconds or HTTP-date; capped at 10 s), dropping new op records meanwhile. `conn`
+  records have a reserved slice of the buffer (1/16 of `bufferBytes`, on top of it) and are held through a pause, then
+  sent: losing one costs attribution for a connection's whole life;
+* the sender drains everything queued on each flush (one batch per interval would cap export at
+  `batchMaxBytes` per `flushIntervalMs`) and wakes early when either batch limit is reached; an
+  exception in a flush is logged and the loop continues.
 
 With `collector.endpoint=null`, records are not built at all (headless mode). The Prometheus
 metrics (§12) are still maintained.
@@ -466,7 +480,9 @@ spyglass_cursors_open{database,collection}                                  gaug
 ```
 
 `app` = client metadata `application.name`, or `driver.name` if absent. Label sets beyond
-`metrics.maxSeries` fold into `collection="__other__"`.
+`metrics.maxSeries` fold into `collection="__other__"`; once a family has twice that many series, every label but
+`status` folds, into a single overflow series (`command`, `database`, `app` and `code_name` come from clients and
+servers, so they can't stay open). Histogram `le` labels print as the shortest round-trip number (`0.00025`).
 
 * `/healthz`: process alive.
 * `/readyz`: all listeners bound, and at least one monitor hello succeeded in the last 30 s.

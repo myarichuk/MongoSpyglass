@@ -62,7 +62,7 @@ public sealed class CaptureConfig
     public ValueMode Values { get; set; } = ValueMode.Truncated;
     public int TruncateStringsAt { get; set; } = 64;
     public string RedactFieldPattern { get; set; } =
-        "(?i)^(pass(word)?|pwd|secret|token|api[-_]?key|authorization|cookie|ssn|card(number)?)$";
+        "(?i)(passw(or)?d|passphrase|pwd|^pass$|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|authorization|cookie|credential|^ssn$|[-_]ssn$|^card$|card[-_]?num|^cvv$)";
 }
 
 public sealed class LimitsConfig

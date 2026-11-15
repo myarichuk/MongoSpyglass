@@ -25,6 +25,8 @@ internal sealed class FrameCapture
     public readonly SequenceScanner Sequences = new();
 
     public ConnectionContext Conn = null!;
+    /// <summary>The owning tap's in-flight counter (per connection and direction), released by <see cref="CapturePool.Return"/>.</summary>
+    public int[]? Inflight;
     public int RequestId, ResponseTo, OpCode, FrameLength;
     public MsgFlags Flags;
     public RequestKind Kind;
@@ -38,9 +40,12 @@ internal sealed class FrameCapture
 /// <summary>
 /// Work for an observer worker: a captured frame or a connection lifecycle event, in per-connection order.
 /// </summary>
-internal readonly record struct ObserverItem(FrameCapture? Frame, ConnectionContext Conn, ObserverEvent Event, CloseReason Reason = default, string? Detail = null);
+/// <param name="Tick">Stopwatch timestamp of the event (open/close: when the pump raised it, not when the worker got to it).</param>
+/// <param name="ResponseTo">With <see cref="ObserverEvent.UnobservedReply"/>: a reply that got no capture slot (header facts only).</param>
+internal readonly record struct ObserverItem(FrameCapture? Frame, ConnectionContext Conn, ObserverEvent Event, CloseReason Reason = default, string? Detail = null,
+    long Tick = 0, int ResponseTo = 0, int RequestId = 0, MsgFlags Flags = MsgFlags.None, int OpCode = 0);
 
-internal enum ObserverEvent : byte { Frame, Opened, Closed }
+internal enum ObserverEvent : byte { Frame, Opened, Closed, UnobservedReply }
 
 /// <summary>
 /// Slot pool bounded by <c>limits.observeQueueBytes</c> (I4): every slot in use — being filled by a pump,
@@ -55,6 +60,8 @@ internal sealed class CapturePool
     private readonly long _bound;
     private long _charged;
 
+    /// <param name="replyBytes">Capture size of a reply slot: 0 (facts only; replies are scanned, never copied) except for
+    /// compression=observe, which keeps the head of an OP_COMPRESSED reply to inflate it (01 §8).</param>
     public CapturePool(int requestBytes, int replyBytes, long bound)
     {
         _requestBytes = requestBytes;
@@ -81,6 +88,11 @@ internal sealed class CapturePool
     public void Return(FrameCapture slot)
     {
         slot.Conn = null!;
+        if (slot.Inflight != null)
+        {
+            Interlocked.Decrement(ref slot.Inflight[0]);
+            slot.Inflight = null;
+        }
         Interlocked.Add(ref _charged, -slot.Charge);
         (slot.IsRequest ? _requests : _replies).Enqueue(slot);
     }

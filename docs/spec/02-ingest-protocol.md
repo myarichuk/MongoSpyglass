@@ -219,6 +219,7 @@ Encoding:
  "exporter":"spyglass-node",                     // absent if no marker
  "os":"linux","platform":"Node.js v22.4.0, LE",
  "closeReason":"client_closed|upstream_closed|invalid_frame|upstream_connect_failed|proxy_shutdown",   // close only
+ "invalidHeader":"0c0000000100000000000000",     // close only, closeReason invalid_frame: the offending 16-byte header, hex
  "bytesIn":…, "bytesOut":…}                      // close only
 ```
 
@@ -233,13 +234,13 @@ Encoding:
  "status":"ok|error|connection_closed|unacknowledged",
  "reqBytes":412,"respBytes":19384,                // respBytes absent = 0 (no reply)
  "t":{"reqLast_us":3,"respFirst_us":812,"respLast_us":845},  // relative to ts (= reqFirst); resp* absent without a reply
- "reply":{"ok":1,"code":11000,"codeName":"DuplicateKey","errmsg":"…",   // absent without a reply; each field absent if not in the reply
+ "reply":{"ok":1,"code":11000,"codeName":"DuplicateKey","errmsg":"…",   // absent without a reply; each field absent if not in the reply; errmsg per 01 §10 (absent when values=shape; secret values scrubbed)
           "cursorId":"0","nReturned":17,"n":5,"nModified":5,
           "writeErrors":2,"writeConcernError":true,"upserted":1,           // absent = 0 / false
           "cursorsKilled":1,"cursorsNotFound":0,                           // killCursors replies: counts; both absent when both are 0
           "parsed":false},                                                 // absent = true: the scanner read the whole reply
  "lsid":"3fa1c09e5b7d2e11","txnNumber":7,         // absent outside a session / transaction
- "comment":"…",                                   // string comments only, truncated to 256; absent if none
+ "comment":"…",                                   // string comments only, truncated to 256 (and to truncateStringsAt when values=truncated); absent if none or values=shape
  "cmd":"<base64 of redacted BSON command body>",  // absent if values=shape and not needed; see 01 §9
  "cmdTruncated":true,                             // absent = false
  "seqDocs":{"documents":120},                     // kind-1 sequence identifiers → counts; absent if none
@@ -271,8 +272,9 @@ Derived by the consumer, not sent:
 ```
 
 `dropped` maps a reason to a count; consumers show whatever reasons arrive. The proxy's: `no_slot`
-and `queue_full` (01 §4), `pending_evicted` (a request evicted from the per-connection pending table when it
-exceeds `maxPendingPerConnection`, 01 §7), `export` (01 §11).
+(the connection's capture ring is full) and `queue_full` (the global byte bound, 01 §4), `pending_evicted` (a request
+evicted from the per-connection pending table: over `maxPendingPerConnection`, or no reply within 10 minutes, 01 §7),
+`tap_fault` and `observer_fault` (a capture or observer step threw), `export` (01 §11).
 
 ### 4.3 Context records (producer: exporter)
 

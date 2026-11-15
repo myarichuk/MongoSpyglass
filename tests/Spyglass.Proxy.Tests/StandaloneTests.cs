@@ -151,7 +151,7 @@ public sealed class StandaloneTests(StandaloneFixture f) : IClassFixture<Standal
         Assert.StartsWith("ready", ready);
         var metrics = await f.Proxy.HttpGetAsync("/metrics");
         Assert.Contains("spyglass_proxy_frames_total{listener=", metrics);
-        Assert.Contains("spyglass_proxy_forward_added_latency_seconds_bucket{le=\"5.0000000000000004E-06\"}", metrics);
+        Assert.Contains("spyglass_proxy_forward_added_latency_seconds_bucket{le=\"5E-06\"}", metrics);
     }
 
     internal static byte[] OpMsg(int requestId, BsonDocument body)

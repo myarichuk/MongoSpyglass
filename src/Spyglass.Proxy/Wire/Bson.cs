@@ -25,52 +25,19 @@ public static class Bson
     /// </summary>
     public static int ValueSize(byte type, ReadOnlySpan<byte> s)
     {
-        switch (type)
+        switch (BsonLayout.Classify(type, out var fixedSize))
         {
-            case BsonType.Double:
-            case BsonType.DateTime:
-            case BsonType.Timestamp:
-            case BsonType.Int64:
-                return Fixed(8, s);
-            case BsonType.Int32:
-                return Fixed(4, s);
-            case BsonType.Boolean:
-                return Fixed(1, s);
-            case BsonType.ObjectId:
-                return Fixed(12, s);
-            case BsonType.Decimal128:
-                return Fixed(16, s);
-            case BsonType.Undefined:
-            case BsonType.Null:
-            case BsonType.MinKey:
-            case BsonType.MaxKey:
+            case BsonKind.Zero:
                 return 0;
-            case BsonType.String:
-            case BsonType.JavaScript:
-            case BsonType.Symbol:
+            case BsonKind.Fixed:
+                return Fit(fixedSize, s);
+            case BsonKind.Prefixed:
             {
                 if (s.Length < 4) return -2;
-                var len = BinaryPrimitives.ReadInt32LittleEndian(s);
-                if (len < 1) return -1;
-                return Fit(4L + len, s);
+                var rest = BsonLayout.PrefixedRest(type, BinaryPrimitives.ReadInt32LittleEndian(s));
+                return rest < 0 ? -1 : Fit(4L + rest, s);
             }
-            case BsonType.Document:
-            case BsonType.Array:
-            case BsonType.JavaScriptWithScope:
-            {
-                if (s.Length < 4) return -2;
-                var len = BinaryPrimitives.ReadInt32LittleEndian(s);
-                if (len < 5) return -1;
-                return Fit(len, s);
-            }
-            case BsonType.Binary:
-            {
-                if (s.Length < 4) return -2;
-                var len = BinaryPrimitives.ReadInt32LittleEndian(s);
-                if (len < 0) return -1;
-                return Fit(5L + len, s);
-            }
-            case BsonType.Regex:
+            case BsonKind.Regex:
             {
                 var a = s.IndexOf((byte)0);
                 if (a < 0) return -2;
@@ -78,18 +45,10 @@ public static class Bson
                 if (b < 0) return -2;
                 return a + 1 + b + 1;
             }
-            case BsonType.DbPointer:
-            {
-                if (s.Length < 4) return -2;
-                var len = BinaryPrimitives.ReadInt32LittleEndian(s);
-                if (len < 1) return -1;
-                return Fit(4L + len + 12, s);
-            }
             default:
                 return -1;
         }
 
-        static int Fixed(int n, ReadOnlySpan<byte> s) => s.Length >= n ? n : -2;
         static int Fit(long n, ReadOnlySpan<byte> s) => n > int.MaxValue ? -1 : s.Length >= n ? (int)n : -2;
     }
 

@@ -283,44 +283,19 @@ public sealed class ReplyScanner
             ChoosePlan(ctx);
 
         _have = 0;
-        switch (_type)
+        switch (BsonLayout.Classify(_type, out var fixedSize))
         {
-            case BsonType.Double:
-            case BsonType.DateTime:
-            case BsonType.Timestamp:
-            case BsonType.Int64:
-                StartFixed(8);
+            case BsonKind.Fixed:
+                StartFixed(fixedSize);
                 break;
-            case BsonType.Int32:
-                StartFixed(4);
-                break;
-            case BsonType.Boolean:
-                StartFixed(1);
-                break;
-            case BsonType.ObjectId:
-                StartFixed(12);
-                break;
-            case BsonType.Decimal128:
-                StartFixed(16);
-                break;
-            case BsonType.Undefined:
-            case BsonType.Null:
-            case BsonType.MinKey:
-            case BsonType.MaxKey:
+            case BsonKind.Zero:
                 _s = S.ElemType;
                 break;
-            case BsonType.Regex:
+            case BsonKind.Regex:
                 _regexNuls = 0;
                 _s = S.Regex;
                 break;
-            case BsonType.String:
-            case BsonType.JavaScript:
-            case BsonType.Symbol:
-            case BsonType.Document:
-            case BsonType.Array:
-            case BsonType.JavaScriptWithScope:
-            case BsonType.Binary:
-            case BsonType.DbPointer:
+            case BsonKind.Prefixed:
                 _s = S.Len;
                 break;
             default:
@@ -414,12 +389,13 @@ public sealed class ReplyScanner
 
     private void OnLength(int len)
     {
+        var rest = BsonLayout.PrefixedRest(_type, len);
+        if (rest < 0) { _s = S.Done; return; }
         switch (_type)
         {
             case BsonType.Document:
             case BsonType.Array:
             case BsonType.JavaScriptWithScope:
-                if (len < 5) { _s = S.Done; return; }
                 if (_plan == Plan.WriteConcernError)
                     _f.WriteConcernError = true;
                 if (_plan == Plan.Descend && _type != BsonType.JavaScriptWithScope)
@@ -428,18 +404,11 @@ public sealed class ReplyScanner
                     _s = S.ElemType;
                     return;
                 }
-                BeginSkip(len - 4L);
+                BeginSkip(rest);
                 return;
-            case BsonType.Binary:
-                if (len < 0) { _s = S.Done; return; }
-                BeginSkip(len + 1L);
-                return;
-            case BsonType.DbPointer:
-                if (len < 1) { _s = S.Done; return; }
-                BeginSkip(len + 12L);
-                return;
-            default: // string, code, symbol
-                if (len < 1) { _s = S.Done; return; }
+            case BsonType.String:
+            case BsonType.JavaScript:
+            case BsonType.Symbol:
                 if (_plan is Plan.CodeName or Plan.Errmsg or Plan.Ns)
                 {
                     _strLen = len;
@@ -447,7 +416,10 @@ public sealed class ReplyScanner
                     _s = S.StringBody;
                     return;
                 }
-                BeginSkip(len);
+                BeginSkip(rest);
+                return;
+            default: // binary, dbPointer
+                BeginSkip(rest);
                 return;
         }
     }
