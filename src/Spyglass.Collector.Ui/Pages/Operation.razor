@@ -1,9 +1,10 @@
 @page "/ops/{Id}"
-@inject Api Api
+@inherits LoadPage
 @inject IJSRuntime JS
 @inject NavigationManager Nav
 
 <PageTitle>@(_op?.Command ?? "Operation") · Spyglass</PageTitle>
+<ErrorBanner Error="@Error" OnRetry="Reload" />
 @if (_missing)
 {
     <p class="p-container-padding text-muted">Operation @Id is not in the store (retention, or never stored under backpressure).</p>
@@ -87,7 +88,7 @@ else if (_op is { } o)
             <div class="flex items-center gap-2 mb-2">
                 <h2 class="text-ui-label-sm uppercase text-muted">Command (redacted by the proxy)</h2>
                 @if (o.CmdTruncated) { <span class="badge bg-warn/15 text-warn">truncated capture</span> }
-                <button class="btn ml-auto" @onclick="CopyMongosh">@(_copied ? "copied" : "copy as mongosh command")</button>
+                <button class="btn ml-auto" @onclick="CopyMongosh" disabled="@(o.CommandEjson == null)">@(_copied == null ? "copy as mongosh command" : _copied.Value ? "copied" : "copy failed")</button>
             </div>
             <pre class="mono whitespace-pre-wrap break-all select-text bg-surface p-2 rounded-lg max-h-96 overflow-auto">@(o.CommandEjson ?? "(not captured)")</pre>
         </section>
@@ -154,12 +155,15 @@ else if (_op is { } o)
     [Parameter] public string Id { get; set; } = "";
     private OpDetailDto? _op;
     private AlertDto[] _alerts = [];
-    private bool _missing, _copied;
+    private bool _missing;
+    private bool? _copied;
     private double _span = 1;
 
-    protected override async Task OnParametersSetAsync()
+    protected override async Task LoadAsync(CancellationToken ct)
     {
-        var r = await Api.Op(Id);
+        var r = await Api.Op(Id, ct);
+        ct.ThrowIfCancellationRequested();
+        _copied = null;
         _missing = r == null;
         _op = r?.Op;
         _alerts = r?.Alerts ?? [];
@@ -185,13 +189,12 @@ else if (_op is { } o)
     private async Task CopyMongosh()
     {
         if (_op?.CommandEjson is not { } cmd) return;
-        // the shell adds $db, the session and $clusterTime itself, and rejects a command that carries them
-        if (System.Text.Json.Nodes.JsonNode.Parse(cmd) is System.Text.Json.Nodes.JsonObject obj)
-        {
-            foreach (var k in (string[])["$db", "lsid", "$clusterTime", "txnNumber", "autocommit", "startTransaction"]) obj.Remove(k);
-            cmd = obj.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
-        }
-        await JS.InvokeVoidAsync("spyglass.copy", $"db.getSiblingDB({JsonSerializer.Serialize(_op.Db ?? "admin")}).runCommand({cmd})");
-        _copied = true;
+        // real shell syntax when the capture converts; "(undecodable)" or a truncated capture is copied as it is
+        var text = MongoShell.RunCommand(_op.Db, cmd) ?? cmd;
+        try { _copied = await JS.InvokeAsync<bool>("spyglass.copy", text); }
+        catch (JSException) { _copied = false; }
+        StateHasChanged();
+        await Task.Delay(2000);
+        _copied = null;
     }
 }

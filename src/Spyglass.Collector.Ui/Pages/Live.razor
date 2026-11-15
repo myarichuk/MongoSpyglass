@@ -18,25 +18,27 @@
                 </select>
             </Field>
             <Field Label="min latency (ms)"><input class="input w-24" type="number" min="0" step="any" @bind="_minMs" /></Field>
+            @if (Shape != null) { <Field Label="shape"><span class="badge bg-accent/15 text-accent mono">@Shape <a href="@Nav.GetUriWithQueryParameter("shape", (string?)null)" title="clear">✕</a></span></Field> }
             @if (Uow != null) { <Field Label="unit of work"><span class="badge bg-accent/15 text-accent mono">@Uow <a href="@Nav.GetUriWithQueryParameter("uow", (string?)null)" title="clear">✕</a></span></Field> }
             <button class="btn" type="submit">Apply</button>
         </form>
         <div class="ml-auto flex items-center gap-2 text-ui-label-sm text-muted">
-            <span class="@(_connected ? "text-ok" : "text-warn")">● @(_connected ? "streaming" : "connecting")</span>
+            @if (_error != null) { <span class="text-bad" role="alert" title="@_error">@_error</span> }
+            <span class="@(_connected ? "text-ok" : "text-warn")">● @(_connected ? "streaming" : _everConnected ? "reconnecting" : "connecting")</span>
             @if (_paused)
             {
-                <button class="btn text-warn" @onclick="Resume">Paused · @_pending new · resume</button>
+                <button class="btn text-warn" @onclick="Resume">Paused · @(_buffer.Count + _dropped)@(_dropped > 0 ? "+" : "") new · resume</button>
             }
         </div>
     </header>
-    <div class="flex-1 overflow-auto" @ref="_scroller" @onscroll="OnScroll">
+    <div class="flex-1 overflow-auto" @ref="_scroller">
         <table class="tbl" aria-label="Live operations">
             <thead><tr>
-                <th>time</th><th>app</th><th>command</th><th>namespace</th><th class="num">server latency</th><th class="num">client latency</th>
+                <th>time (UTC)</th><th>app</th><th>command</th><th>namespace</th><th class="num">server latency</th><th class="num">client latency</th>
                 <th class="num">docs</th><th class="num">bytes</th><th>status</th><th>UoW</th><th></th>
             </tr></thead>
             <tbody>
-                @foreach (var o in _rows)
+                @foreach (var o in _rows.Concat(_older))
                 {
                     <tr data-href="ops/@o.Id" tabindex="0" @key="o.Id" @onclick="() => Open(o.Id)">
                         <td class="mono text-muted">@Fmt.Clock(o.Ts)</td>
@@ -58,26 +60,36 @@
         {
             <p class="p-container-padding text-muted">No operations yet. Point a driver at the proxy; operations show up here as they happen.</p>
         }
+        @if (_next != null)
+        {
+            <div class="p-container-padding"><button class="btn" @onclick="LoadOlder" disabled="@_loadingOlder">@(_loadingOlder ? "loading…" : "load older operations")</button></div>
+        }
     </div>
 </div>
 
 @code {
-    private const int MaxRows = 500;
+    private const int MaxRows = 500, PageSize = 100, FlushMs = 150;
     [SupplyParameterFromQuery] public string? App { get; set; }
     [SupplyParameterFromQuery] public string? Coll { get; set; }
     [SupplyParameterFromQuery] public string? Command { get; set; }
     [SupplyParameterFromQuery] public string? Status { get; set; }
     [SupplyParameterFromQuery] public double? MinMs { get; set; }
     [SupplyParameterFromQuery] public string? Uow { get; set; }
+    [SupplyParameterFromQuery] public string? Shape { get; set; }
 
     private string? _app, _coll, _command, _status;
     private double? _minMs;
-    private readonly List<OpSummary> _rows = [];
-    private readonly List<OpSummary> _buffer = [];
+    private readonly List<OpSummary> _rows = [];      // newest first, at most MaxRows
+    private readonly List<OpSummary> _buffer = [];    // arrivals while the user is scrolled away, newest first, at most MaxRows
+    private readonly List<OpSummary> _older = [];     // "load older" pages, below _rows
+    private readonly List<(OpSummary Op, bool Updated)> _early = []; // events that arrive while the snapshot is in flight
     private ElementReference _scroller;
+    private DotNetObjectReference<Live>? _self;
     private CancellationTokenSource? _cts;
-    private bool _connected, _paused, _loaded;
-    private int _pending;
+    private bool _connected, _everConnected, _paused, _loaded, _loading, _flushQueued, _disposed, _loadingOlder;
+    private int _dropped;
+    private long _lastTs;
+    private string? _next, _error;
     private string _query = "";
 
     protected override async Task OnParametersSetAsync()
@@ -85,7 +97,7 @@
         (_app, _coll, _command, _status, _minMs) = (App, Coll, Command, Status, MinMs);
         var q = new List<string>();
         void Add(string k, string? v) { if (!string.IsNullOrWhiteSpace(v)) q.Add($"{k}={Uri.EscapeDataString(v)}"); }
-        Add("app", App); Add("coll", Coll); Add("command", Command); Add("status", Status); Add("uow", Uow);
+        Add("app", App); Add("coll", Coll); Add("command", Command); Add("status", Status); Add("uow", Uow); Add("shape", Shape);
         if (MinMs is > 0) q.Add($"minLatencyUs={(long)(MinMs * 1000)}");
         var query = string.Join('&', q);
         if (query == _query && _cts != null) return;
@@ -93,72 +105,159 @@
 
         if (_cts != null) await _cts.CancelAsync();
         _cts = new CancellationTokenSource();
-        _rows.Clear();
-        _buffer.Clear();
-        _pending = 0;
-        _paused = false;
-        var page = await Api.Ops(query + (query.Length > 0 ? "&" : "") + "limit=100");
-        if (page != null) _rows.AddRange(page.Items);
-        _loaded = true;
-        _ = Stream(_cts.Token);
+        _rows.Clear(); _buffer.Clear(); _older.Clear(); _early.Clear();
+        (_dropped, _lastTs, _next, _error, _loaded, _paused, _connected, _everConnected) = (0, 0, null, null, false, false, false, false);
+        _ = Stream(query, _cts.Token);
     }
 
-    private async Task Stream(CancellationToken ct)
+    protected override async Task OnAfterRenderAsync(bool firstRender)
     {
+        if (!firstRender) return;
+        // one callback per flip of "scrolled away from the top", not one per scroll event (UD-8)
+        _self = DotNetObjectReference.Create(this);
+        await JS.InvokeVoidAsync("spyglass.watchTop", _scroller, _self);
+    }
+
+    [JSInvokable]
+    public void SetAtTop(bool atTop)
+    {
+        if (atTop) Resume(); else _paused = true;
+        StateHasChanged();
+    }
+
+    /// <summary>
+    /// Subscribe first, then fetch the snapshot and merge by id (UD-6): nothing completes unseen between the two. A dropped stream
+    /// reconnects with backoff and fills the gap from the newest timestamp seen. Events are rendered in batches (UD-7).
+    /// </summary>
+    private async Task Stream(string query, CancellationToken ct)
+    {
+        var attempt = 0;
         while (!ct.IsCancellationRequested)
         {
+            _loading = true;
+            _early.Clear();
             try
             {
-                _connected = true;
-                StateHasChanged();
-                await foreach (var (ev, data) in Api.Live(_query, ct))
+                await foreach (var (ev, data) in Api.Live(query, ct))
                 {
-                    if (!ev.StartsWith("op.", StringComparison.Ordinal)) continue;
-                    var op = JsonSerializer.Deserialize<OpSummary>(data, Api.Json)!;
-                    if (ev == "op.updated")
+                    if (ev == "open")
                     {
-                        var i = _rows.FindIndex(r => r.Id == op.Id);
-                        if (i >= 0) _rows[i] = op;
+                        (_connected, _everConnected, _error, attempt) = (true, true, null, 0);
+                        _ = Snapshot(query, ct);
                     }
-                    else if (_paused) { _buffer.Insert(0, op); _pending++; }
-                    else Prepend(op);
-                    StateHasChanged();
+                    else if (ev.StartsWith("op.", StringComparison.Ordinal))
+                    {
+                        var op = JsonSerializer.Deserialize<OpSummary>(data, Api.Json)!;
+                        if (_loading) _early.Add((op, ev == "op.updated")); else Merge(op, ev == "op.updated");
+                    }
+                    Touch();
                 }
+                _error = "the stream ended";
             }
-            catch (OperationCanceledException) { return; }
-            catch (Exception) { }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+            catch (Exception ex) { _error = ex.Message; }
             _connected = false;
-            StateHasChanged();
-            try { await Task.Delay(2000, ct); } catch (OperationCanceledException) { return; }
+            Touch();
+            try { await Task.Delay(TimeSpan.FromSeconds(Math.Min(30, 1 << Math.Min(attempt++, 5))), ct); } catch (OperationCanceledException) { return; }
         }
     }
 
-    private void Prepend(OpSummary op)
+    private async Task Snapshot(string query, CancellationToken ct)
     {
-        _rows.Insert(0, op);
-        if (_rows.Count > MaxRows) _rows.RemoveRange(MaxRows, _rows.Count - MaxRows);
+        try
+        {
+            var gap = _lastTs > 0;
+            var page = await Api.Ops(query + (query.Length > 0 ? "&" : "") + (gap ? $"from={_lastTs}&limit=1000" : $"limit={PageSize}"), ct);
+            ct.ThrowIfCancellationRequested();
+            if (page != null)
+            {
+                foreach (var o in page.Items.OrderBy(o => o.Ts).ThenBy(o => o.Id, StringComparer.Ordinal)) Merge(o, false);
+                if (!gap) _next = page.Next;
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+        catch (Exception ex) { _error = "could not load operations: " + ex.Message; }
+        // the events that raced the snapshot, in arrival order: creations dedupe by id, updates patch whichever list holds the row
+        foreach (var (op, updated) in _early) Merge(op, updated);
+        _early.Clear();
+        (_loading, _loaded) = (false, true);
+        Touch();
     }
 
-    private async Task OnScroll()
+    private void Merge(OpSummary op, bool updated)
     {
-        var top = await JS.InvokeAsync<double>("spyglass.scrollTop", _scroller);
-        if (top > 4 && !_paused) _paused = true;
-        else if (top <= 4 && _paused) Resume();
+        if (op.Ts > _lastTs) _lastTs = op.Ts;
+        foreach (var list in (List<OpSummary>[])[_rows, _buffer, _older])
+        {
+            var i = list.FindIndex(r => r.Id == op.Id);
+            if (i < 0) continue;
+            list[i] = op;   // op.updated for a row that is buffered or shown, or a creation seen twice (snapshot + stream)
+            return;
+        }
+        if (updated) return; // an op we hold no row for (older than the window)
+        if (_paused)
+        {
+            _buffer.Insert(0, op);
+            if (_buffer.Count > MaxRows) { _buffer.RemoveAt(_buffer.Count - 1); _dropped++; }
+        }
+        else
+        {
+            _rows.Insert(0, op);
+            if (_rows.Count > MaxRows) _rows.RemoveRange(MaxRows, _rows.Count - MaxRows);
+        }
+    }
+
+    /// <summary>At most one render per <see cref="FlushMs"/> however many events arrived.</summary>
+    private void Touch()
+    {
+        if (_flushQueued || _disposed) return;
+        _flushQueued = true;
+        _ = Flush();
+    }
+
+    private async Task Flush()
+    {
+        await Task.Delay(FlushMs);
+        _flushQueued = false;
+        if (!_disposed) StateHasChanged();
     }
 
     private void Resume()
     {
         _paused = false;
-        _rows.InsertRange(0, _buffer.Take(MaxRows));
+        if (_buffer.Count == 0 && _dropped == 0) return;
+        _rows.InsertRange(0, _buffer);
         if (_rows.Count > MaxRows) _rows.RemoveRange(MaxRows, _rows.Count - MaxRows);
         _buffer.Clear();
-        _pending = 0;
+        _dropped = 0;
+    }
+
+    private async Task LoadOlder()
+    {
+        if (_next == null || _cts == null) return;
+        var ct = _cts.Token;
+        _loadingOlder = true;
+        try
+        {
+            var page = await Api.Ops(_query + (_query.Length > 0 ? "&" : "") + $"limit={PageSize}&cursor={Uri.EscapeDataString(_next)}", ct);
+            ct.ThrowIfCancellationRequested();
+            if (page != null)
+            {
+                var have = new HashSet<string>(_rows.Concat(_buffer).Concat(_older).Select(r => r.Id));
+                _older.AddRange(page.Items.Where(o => have.Add(o.Id)));
+            }
+            _next = page?.Next;
+            _error = null;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+        catch (Exception ex) { _error = "could not load older operations: " + ex.Message; }
+        finally { _loadingOlder = false; }
     }
 
     private void Apply() => Nav.NavigateTo(Nav.GetUriWithQueryParameters(new Dictionary<string, object?>
     {
         ["app"] = Nullify(_app), ["coll"] = Nullify(_coll), ["command"] = Nullify(_command), ["status"] = Nullify(_status), ["minMs"] = _minMs is > 0 ? _minMs : null,
-        ["uow"] = Uow,
+        ["uow"] = Uow, ["shape"] = Shape,
     }));
 
     private static string? Nullify(string? s) => string.IsNullOrWhiteSpace(s) ? null : s.Trim();
@@ -167,6 +266,9 @@
 
     public async ValueTask DisposeAsync()
     {
+        _disposed = true;
         if (_cts != null) await _cts.CancelAsync();
+        try { await JS.InvokeVoidAsync("spyglass.unwatchTop", _scroller); } catch (JSException) { } catch (InvalidOperationException) { }
+        _self?.Dispose();
     }
 }

@@ -27,6 +27,17 @@
     <ProjectReference Include="..\Spyglass.Proxy.Tests\Spyglass.Proxy.Tests.csproj" />
   </ItemGroup>
 
+  <!-- The UI's pure code (DTOs, formatting, shell conversion) is compiled in so its contract with the server is tested here. -->
+  <ItemGroup>
+    <Compile Include="..\..\src\Spyglass.Collector.Ui\Services\Dtos.cs" LinkBase="Ui" />
+    <Compile Include="..\..\src\Spyglass.Collector.Ui\Services\Fmt.cs" LinkBase="Ui" />
+    <Compile Include="..\..\src\Spyglass.Collector.Ui\Services\MongoShell.cs" LinkBase="Ui" />
+    <Compile Include="..\..\src\Spyglass.Collector.Ui\Services\Redirect.cs" LinkBase="Ui" />
+    <Compile Include="..\..\src\Spyglass.Collector.Ui\Services\AlertRules.cs" LinkBase="Ui" />
+    <Compile Include="..\..\src\Spyglass.Collector.Ui\Services\Chart.cs" LinkBase="Ui" />
+    <Compile Include="..\..\src\Spyglass.Collector.Ui\Shared\Range.cs" LinkBase="Ui" />
+  </ItemGroup>
+
   <ItemGroup>
     <Content Include="xunit.runner.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>

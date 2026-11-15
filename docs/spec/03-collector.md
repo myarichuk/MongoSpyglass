@@ -370,7 +370,7 @@ circuit state.
 | Page | Content |
 |---|---|
 | **Live** | Streaming op table: time, app, command, ns, server latency, client latency (if joined), docs, bytes, status, UoW badge. Filters persist in the URL. Paused automatically when scrolled. |
-| **Operation** | Command (shell-syntax EJSON, copy-to-clipboard as a mongosh command), reply facts, **timing waterfall** (pool wait → client→proxy → proxy→server+server → server→client), alerts, cursor lifecycle, callsite frames, "other ops in this UoW" |
+| **Operation** | Command (relaxed EJSON as captured; the copy button converts it to mongosh syntax — `ObjectId("…")`, `ISODate("…")`, `NumberLong("…")` — client side, and copies unconvertible captures as they are), times in UTC, reply facts, **timing waterfall** (pool wait → client→proxy → proxy→server+server → server→client), alerts, cursor lifecycle, callsite frames, "other ops in this UoW" |
 | **Shapes** | Leaderboard by total time / p95 / count / errors. Sparkline per shape. Click through to shape detail with examples and callsites. |
 | **Units of work** | List by duration / op count. Detail is the HR-profiler view: numbered statements, duplicated shapes highlighted, N+1 groups collapsed with counts. |
 | **Alerts** | Grouped by rule, with occurrence counts and sample ops, mute/unmute |

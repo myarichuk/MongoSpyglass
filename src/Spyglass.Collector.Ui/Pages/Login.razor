@@ -6,22 +6,51 @@
 <PageTitle>Sign in · Spyglass</PageTitle>
 <form class="card p-6 w-80 flex flex-col gap-3" @onsubmit="Submit" @onsubmit:preventDefault>
     <h1 class="font-display-mono text-display-mono text-accent">spyglass</h1>
-    <label class="text-ui-label-sm text-muted" for="pw">Admin password</label>
-    <input id="pw" class="input" type="password" autocomplete="current-password" @bind="_password" autofocus />
-    @if (_error) { <p class="text-bad text-ui-label-sm" role="alert">Wrong password.</p> }
-    <button class="btn justify-center" type="submit" disabled="@_busy">Sign in</button>
+    @if (_headerMode)
+    {
+        <p class="text-muted" role="alert">Sign-in is handled by a reverse proxy in front of the collector (SPYGLASS_AUTH=header), and it did not send the identity header for this request. Check the proxy's authentication, then <a href="">reload</a>.</p>
+    }
+    else
+    {
+        <label class="text-ui-label-sm text-muted" for="pw">Admin password</label>
+        <input id="pw" class="input" type="password" autocomplete="current-password" @bind="_password" autofocus />
+        @if (_error != null) { <p class="text-bad text-ui-label-sm" role="alert">@_error</p> }
+        <button class="btn justify-center" type="submit" disabled="@_busy">Sign in</button>
+    }
 </form>
 
 @code {
     [SupplyParameterFromQuery(Name = "return")] public string? Return { get; set; }
     private string _password = "";
-    private bool _error, _busy;
+    private string? _error;
+    private bool _busy, _headerMode;
+
+    // The login endpoint answers 200 {auth} without a password in the modes that have none: "none" needs no login at all and
+    // "header" means this page is a dead end (a 401 elsewhere is the proxy's missing header), so say so instead of showing a form.
+    protected override async Task OnInitializedAsync()
+    {
+        try
+        {
+            var probe = await Api.Login("");
+            _headerMode = probe is { Ok: true, Auth: "header" };
+            if (probe is { Ok: true, Auth: not "header" }) Leave();
+        }
+        catch (HttpRequestException) { }
+    }
 
     private async Task Submit()
     {
         _busy = true;
-        _error = !await Api.Login(_password);
-        _busy = false;
-        if (!_error) Nav.NavigateTo(string.IsNullOrEmpty(Return) || Return.StartsWith("login") ? "" : Return);
+        _error = null;
+        try
+        {
+            var r = await Api.Login(_password);
+            if (r.Ok) Leave();
+            else _error = r.Error == null ? "Wrong password." : $"Sign-in failed: the collector answered {r.Error}.";
+        }
+        catch (HttpRequestException) { _error = "Could not reach the collector. Check the connection and try again."; }
+        finally { _busy = false; }
     }
+
+    private void Leave() => Nav.NavigateTo(Redirect.Safe(Return));
 }
