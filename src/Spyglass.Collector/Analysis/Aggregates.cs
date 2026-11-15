@@ -99,6 +99,7 @@ public sealed class AggregateBook(TimeSpan? exampleRetention = null)
                 ShapeHash = op.ShapeHash, ShapeJson = op.ShapeJson ?? "{}", Command = r.Command, Db = r.Db, Coll = r.Coll, FirstSeen = r.Ts,
             };
         }
+        else if (s.ShapeJson == "{}" && op.ShapeJson != null) s.ShapeJson = op.ShapeJson; // re-created without JSON: heal on the next op that has it
         s.LastSeen = Math.Max(s.LastSeen, r.Ts);
         s.Count++;
         s.MaxInCardinality = Math.Max(s.MaxInCardinality, op.InCardinality);

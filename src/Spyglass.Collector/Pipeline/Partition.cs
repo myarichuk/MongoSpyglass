@@ -72,7 +72,7 @@ internal sealed class Partition
     private const int MaxConnState = 50_000, MaxValues = 256;
     /// <summary>State older than this has nothing left to say: the rules look back 1 s and a few ms of gap.</summary>
     private const long StateIdleUs = 60_000_000, StateSweepUs = 10_000_000;
-    private long _nextStateSweepUs, _clockUs;
+    private long _nextStateSweepUs, _clockUs, _knownShapesClearUs;
     private Thread? _thread;
 
     public long Duplicates, DecodeFailures, Processed;
@@ -249,7 +249,13 @@ internal sealed class Partition
         }
 
         var valuesPreserved = _producers.Get(r.Src)?.ValuesPreserved ?? true;
-        if (_knownShapes.Count > 100_000) _knownShapes.Clear(); // a bound; clearing only means JSON is sent again
+        // a bound, and hourly: the analysis stage expires shapes unused for 30 d (and caps its catalog), and a shape it no longer
+        // has must arrive with its JSON again; clearing only means JSON is sent again
+        if (_knownShapes.Count > 100_000 || _clockUs - _knownShapesClearUs > 3_600_000_000)
+        {
+            _knownShapes.Clear();
+            _knownShapesClearUs = _clockUs;
+        }
         // a getMore's own shape is replaced by its cursor's in the analysis stage, so its JSON may be used up on an op that
         // never registers it: getMores always carry theirs (a few bytes: the command name and namespace)
         var shape = ShapeNormalizer.Normalize(r.Command, r.Db, r.Coll, cmd, r.CmdTruncated, valuesPreserved, r.Command == "getMore" ? null : _knownShapes);
