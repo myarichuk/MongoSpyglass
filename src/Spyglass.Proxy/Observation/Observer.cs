@@ -113,7 +113,7 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
 
     // ---- records ---------------------------------------------------------------------------
 
-    private byte[] ProxyRecord()
+    internal byte[] ProxyRecord()
     {
         var rw = new RecordWriter();
         var j = rw.Begin("proxy", Clock.NowUnixMicros(), _src);
@@ -133,6 +133,11 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
             j.WriteStartObject();
             j.WriteString("member", mem.Advertised);
             j.WriteString("upstream", mem.Upstream.ToString());
+            if (_server.Upstream.ServerCert(mem.Upstream) is { } sc)
+            {
+                j.WritePropertyName("cert");
+                sc.Write(j);
+            }
             j.WriteEndObject();
         }
         j.WriteEndArray();
@@ -140,8 +145,46 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
         j.WriteString("compression", _config.Compression.ToString().ToLowerInvariant());
         j.WriteString("values", _config.Capture.Values.ToString().ToLowerInvariant());
         j.WriteNumber("commandBytes", _config.Capture.CommandBytes);
+        WriteTlsConfig(j);
         j.WriteEndObject();
         return rw.End().ToArray();
+    }
+
+    /// <summary>config.tls of the proxy record (02 §4.2): the effective TLS setup, never keys or passwords.</summary>
+    private void WriteTlsConfig(System.Text.Json.Utf8JsonWriter j)
+    {
+        var up = _config.Upstream.Tls;
+        var conn = _server.Upstream;
+        j.WriteStartObject("tls");
+        j.WriteStartObject("upstream");
+        j.WriteBoolean("enabled", conn.UsesTls);
+        j.WriteString("trust", conn.TrustMode);
+        if (up.CaFile != null) j.WriteString("caFile", up.CaFile);
+        j.WriteBoolean("allowInvalidHostnames", up.AllowInvalidHostnames);
+        j.WriteString("revocation", up.Revocation.ToString().ToLowerInvariant());
+        if (conn.ClientCert is { } cc)
+        {
+            j.WritePropertyName("clientCert");
+            cc.Write(j);
+        }
+        j.WriteEndObject();
+        j.WriteStartObject("listen");
+        var dtls = _server.DownstreamTls;
+        j.WriteString("mode", dtls != null ? "tls" : "none");
+        if (dtls != null)
+        {
+            j.WriteString("source", dtls.SelfSigned ? "selfSigned" : "file");
+            j.WritePropertyName("cert");
+            dtls.Summary.Write(j);
+        }
+        j.WriteEndObject();
+        var col = _config.Collector;
+        j.WriteStartObject("collector");
+        j.WriteBoolean("https", col.Endpoint?.StartsWith("https://", StringComparison.OrdinalIgnoreCase) == true);
+        j.WriteString("trust", col.AllowInvalidCertificates ? "insecure" : col.CaFile != null ? "caFile" : "system");
+        if (col.CaFile != null) j.WriteString("caFile", col.CaFile);
+        j.WriteEndObject();
+        j.WriteEndObject();
     }
 
     private byte[] StatsRecord()

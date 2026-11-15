@@ -7,6 +7,7 @@ public enum TriState { Auto, True, False }
 public enum DownstreamTlsMode { None, Tls }
 public enum CompressionMode { Strip, Opaque, Observe }
 public enum ValueMode { Full, Truncated, Shape }
+public enum RevocationCheck { None, Online, Offline }
 
 public sealed class ProxyConfig
 {
@@ -21,6 +22,8 @@ public sealed class ProxyConfig
     public string LogLevel { get; set; } = "info";
     /// <summary>Keys a lower-precedence source set that a higher one replaced with another value (reported as startup warnings).</summary>
     public List<string> Overrides { get; } = [];
+    /// <summary>Warnings found while loading (URI/config TLS conflicts); logged at startup next to <see cref="Config.ConfigLoader.Warnings"/>.</summary>
+    public List<string> LoadWarnings { get; } = [];
 }
 
 public sealed class UpstreamConfig
@@ -36,6 +39,12 @@ public sealed class UpstreamTlsConfig
     public string? CaFile { get; set; }
     public bool AllowInvalidCertificates { get; set; }
     public bool AllowInvalidHostnames { get; set; }
+    /// <summary>Client certificate for mongod's required client certs (transport mTLS): PEM (+key), or .pfx/.p12.</summary>
+    public string? CertFile { get; set; }
+    public string? KeyFile { get; set; }
+    /// <summary>Never logged, reported or echoed (01 §2).</summary>
+    public string? KeyPassword { get; set; }
+    public RevocationCheck Revocation { get; set; } = RevocationCheck.None;
 }
 
 public sealed class ListenConfig
@@ -53,6 +62,8 @@ public sealed class DownstreamTlsConfig
     public DownstreamTlsMode Mode { get; set; } = DownstreamTlsMode.None;
     public string? CertFile { get; set; }
     public string? KeyFile { get; set; }
+    /// <summary>Never logged, reported or echoed (01 §2).</summary>
+    public string? KeyPassword { get; set; }
 }
 
 public sealed class CaptureConfig
@@ -84,6 +95,9 @@ public sealed class CollectorConfig
 {
     public string? Endpoint { get; set; }
     public string? Token { get; set; }
+    /// <summary>Custom trust for an https endpoint (PEM bundle); null = system store.</summary>
+    public string? CaFile { get; set; }
+    public bool AllowInvalidCertificates { get; set; }
     public int BatchMaxRecords { get; set; } = 2000;
     public int BatchMaxBytes { get; set; } = 1024 * 1024;
     public int FlushIntervalMs { get; set; } = 500;

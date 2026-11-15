@@ -178,12 +178,12 @@ public sealed class Deployment : IAsyncDisposable
         }
     }
 
-    public static async Task<Deployment> StartStandaloneAsync(TestCertificates? tls = null)
+    public static async Task<Deployment> StartStandaloneAsync(TestCertificates? tls = null, bool requireClientCert = false)
     {
         MongodBinaries.SkipIfMissing();
         var root = NewRoot();
         var port = Ports.FreeRange(1);
-        var m = MongodProcess.Start(port, root, TlsArgs(tls));
+        var m = MongodProcess.Start(port, root, TlsArgs(tls, requireClientCert));
         await m.WaitListeningAsync(TimeSpan.FromSeconds(30));
         return new Deployment { Kind = "standalone", Members = [m], Root = root, Tls = tls };
     }
@@ -287,9 +287,9 @@ public sealed class Deployment : IAsyncDisposable
     /// <summary>Processes behind <see cref="Members"/> (config and shard servers of a sharded deployment).</summary>
     public IReadOnlyList<MongodProcess> Backing { get; init; } = [];
 
-    private static IEnumerable<string> TlsArgs(TestCertificates? tls) => tls == null
+    private static IEnumerable<string> TlsArgs(TestCertificates? tls, bool requireClientCert = false) => tls == null
         ? []
-        : ["--tlsMode", "requireTLS", "--tlsCertificateKeyFile", tls.ServerPemFile, "--tlsCAFile", tls.CaFile, "--tlsAllowConnectionsWithoutCertificates"];
+        : ["--tlsMode", "requireTLS", "--tlsCertificateKeyFile", tls.ServerPemFile, "--tlsCAFile", tls.CaFile, .. (requireClientCert ? Array.Empty<string>() : ["--tlsAllowConnectionsWithoutCertificates"])];
 
     private static string NewRoot()
     {

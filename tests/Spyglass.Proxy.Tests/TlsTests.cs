@@ -26,7 +26,8 @@ public sealed class TlsReplicaSetFixture : IAsyncLifetime
 }
 
 /// <summary>06 §2.4 TLS against a 3-member TLS replica set.</summary>
-public sealed class TlsTests(TlsReplicaSetFixture f) : IClassFixture<TlsReplicaSetFixture>
+[Collection("tls-rs")]
+public sealed class TlsTests(TlsReplicaSetFixture f)
 {
     [Fact]
     public async Task Upstream_tls_with_test_ca()

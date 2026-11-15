@@ -20,6 +20,7 @@ public sealed class ProxyMetrics
     public readonly CounterFamily UncorrelatedReplies;
     public readonly CounterFamily ObserverBusy;
     public readonly HistogramFamily AddedLatency;
+    public readonly GaugeFamily TlsCertExpiry;
     private readonly Gauge _allocated, _rss, _cpuMicros, _gcCount;
 
     public ProxyMetrics()
@@ -39,6 +40,8 @@ public sealed class ProxyMetrics
         AddedLatency = Registry.Histogram("spyglass_proxy_forward_added_latency_seconds",
             "Proxy residency of a read chunk that completed at least one frame: read completion to write completion.",
             AddedLatencyBuckets);
+        TlsCertExpiry = Registry.Gauge("spyglass_proxy_tls_cert_expiry_seconds",
+            "notAfter (unix seconds) of the listen certificate, the upstream client certificate and the last server certificate seen per member.", "hop", "member");
         _allocated = Registry.Gauge("spyglass_proxy_process_allocated_bytes", "Managed bytes allocated since process start (GC.GetTotalAllocatedBytes).").WithLabels();
         _rss = Registry.Gauge("spyglass_proxy_process_resident_bytes", "Process working set.").WithLabels();
         _cpuMicros = Registry.Gauge("spyglass_proxy_process_cpu_microseconds", "Process CPU time (user + system) in microseconds.").WithLabels();

@@ -65,7 +65,14 @@ public sealed class ProxyServer : IAsyncDisposable
         foreach (var w in ConfigLoader.Warnings(Config))
             Log.Warn(w);
         if (DownstreamTls is { } tls)
+        {
             Log.Info($"client TLS: {(tls.SelfSigned ? "self-signed" : "configured")} certificate, SHA-256 {tls.Sha256Fingerprint}");
+            if (!tls.SelfSigned && TlsMaterial.ExpiryWarning(tls.Certificate, "listen.tls.certFile", DateTimeOffset.UtcNow) is { } w)
+                Log.Warn(w);
+        }
+        if (Upstream.ClientCertificate is { } cc && TlsMaterial.ExpiryWarning(cc, "upstream.tls.certFile", DateTimeOffset.UtcNow) is { } uw)
+            Log.Warn(uw);
+        Metrics.BeforeScrape += UpdateTlsGauges;
 
         Observation = new Observer(this);
         Observation.Start();
@@ -103,6 +110,19 @@ public sealed class ProxyServer : IAsyncDisposable
                  $"(observe queue + export buffer incl. its conn slice + hello buffers (replies + requests)" +
                  $"{(inflate > 0 ? " + observe-mode inflate" : "")} + {Config.Limits.MaxClientConnections} connections × " +
                  $"({Config.Limits.ReadBufferBytes / 1024} KiB × 2 + notices))");
+    }
+
+    /// <summary>spyglass_proxy_tls_cert_expiry_seconds (01 §12), refreshed at scrape time.</summary>
+    private void UpdateTlsGauges()
+    {
+        var f = Metrics.TlsCertExpiry;
+        if (DownstreamTls is { } d)
+            f.WithLabels("listen", "").Set(d.Summary.NotAfterUnixSeconds);
+        if (Upstream.ClientCert is { } c)
+            f.WithLabels("upstream_client", "").Set(c.NotAfterUnixSeconds);
+        foreach (var m in Topology.Members)
+            if (Upstream.ServerCert(m.Upstream) is { } s)
+                f.WithLabels("upstream_server", m.Advertised).Set(s.NotAfterUnixSeconds);
     }
 
     /// <summary>Binds and starts accepting for <paramref name="member"/>. Throws if the port can't be bound.</summary>

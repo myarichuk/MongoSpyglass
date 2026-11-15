@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
@@ -14,11 +15,15 @@ public sealed class UpstreamConnector
     private readonly bool _tls;
     private readonly UpstreamTlsConfig _tlsConfig;
     private readonly X509Certificate2Collection? _trust;
+    private readonly X509RevocationMode _revocation;
+    private readonly SslStreamCertificateContext? _clientContext;
+    private readonly ConcurrentDictionary<HostPort, CertSummary> _serverCerts = new();
     public TimeSpan ConnectTimeout { get; init; } = TimeSpan.FromSeconds(10);
 
     public UpstreamConnector(ProxyConfig config, MongoUri uri)
     {
         _tlsConfig = config.Upstream.Tls;
+        _revocation = TlsTrust.Mode(_tlsConfig.Revocation);
         _tls = _tlsConfig.Enabled switch
         {
             TriState.True => true,
@@ -26,19 +31,27 @@ public sealed class UpstreamConnector
             _ => uri.IsSrv || uri.Tls == true
         };
         if (_tls && _tlsConfig.CaFile != null)
+            _trust = TlsTrust.LoadCaFile(_tlsConfig.CaFile, "upstream.tls.caFile");
+        if (_tls && _tlsConfig.CertFile != null)
         {
-            if (!File.Exists(_tlsConfig.CaFile))
-                throw new ConfigException($"'upstream.tls.caFile' {_tlsConfig.CaFile} not found");
-            _trust = [];
-            try { _trust.ImportFromPemFile(_tlsConfig.CaFile); }
-            catch (System.Security.Cryptography.CryptographicException e)
-            {
-                throw new ConfigException($"'upstream.tls.caFile' {_tlsConfig.CaFile} is not a PEM certificate bundle: {e.Message}");
-            }
-            if (_trust.Count == 0)
-                throw new ConfigException($"'upstream.tls.caFile' {_tlsConfig.CaFile} contains no certificates");
+            var loaded = TlsMaterial.Load(_tlsConfig.CertFile, _tlsConfig.KeyFile, _tlsConfig.KeyPassword, "upstream.tls.certFile", "upstream.tls.keyFile");
+            _clientContext = SslStreamCertificateContext.Create(loaded.Leaf, loaded.Extras, offline: true);
+            ClientCertificate = loaded.Leaf;
+            ClientCert = CertSummary.From(loaded.Leaf);
         }
     }
+
+    /// <summary>Summary of the configured client certificate (null if none).</summary>
+    internal CertSummary? ClientCert { get; }
+    internal X509Certificate2? ClientCertificate { get; }
+
+    /// <summary>Last server certificate seen per upstream member (any handshake, trusted or not).</summary>
+    internal CertSummary? ServerCert(HostPort member) => _serverCerts.GetValueOrDefault(member);
+
+    internal IEnumerable<KeyValuePair<HostPort, CertSummary>> ServerCerts => _serverCerts;
+
+    /// <summary>"system", "caFile" or "insecure" (02 §4.2).</summary>
+    internal string TrustMode => _tlsConfig.AllowInvalidCertificates ? "insecure" : _trust != null ? "caFile" : "system";
 
     public bool UsesTls => _tls;
 
@@ -73,6 +86,8 @@ public sealed class UpstreamConnector
                     TargetHost = member.Host,
                     EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
                     RemoteCertificateValidationCallback = (_, cert, chain, errors) => Validate(member, cert, chain, errors),
+                    ClientCertificateContext = _clientContext,
+                    CertificateRevocationCheckMode = _revocation,
                 }, timeout.Token).ConfigureAwait(false);
             }
             return (socket, StreamDecorator?.Invoke(ssl) ?? ssl);
@@ -86,32 +101,24 @@ public sealed class UpstreamConnector
 
     private bool Validate(HostPort member, X509Certificate? cert, X509Chain? chain, SslPolicyErrors errors)
     {
-        if (cert == null)
-            return false;
-        if (_tlsConfig.AllowInvalidCertificates)
-            return true;
+        if (cert != null)
+            Capture(member, cert);
+        return TlsTrust.Validate($"upstream TLS {member}", "upstream.tls.caFile", cert, chain, errors,
+            _trust, _tlsConfig.AllowInvalidCertificates, _tlsConfig.AllowInvalidHostnames, _revocation);
+    }
 
-        if ((errors & SslPolicyErrors.RemoteCertificateNameMismatch) != 0 && !_tlsConfig.AllowInvalidHostnames)
+    // Handshake path: the summary (subject, SANs, ...) is only built when the fingerprint changes.
+    private void Capture(HostPort member, X509Certificate cert)
+    {
+        try
         {
-            Log.Warn($"upstream TLS {member}: certificate name does not match host");
-            return false;
+            var fp = CertSummary.Fingerprint(cert);
+            if (_serverCerts.TryGetValue(member, out var known) && known.Sha256 == fp) return;
+            _serverCerts[member] = CertSummary.From(cert);
         }
-
-        if (_trust == null)
-            return (errors & ~SslPolicyErrors.RemoteCertificateNameMismatch) == SslPolicyErrors.None;
-
-        // Custom trust: rebuild the chain against the configured CA bundle only.
-        using var custom = new X509Chain();
-        custom.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
-        custom.ChainPolicy.CustomTrustStore.AddRange(_trust);
-        custom.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
-        if (chain != null)
-            foreach (var el in chain.ChainElements.Skip(1))
-                custom.ChainPolicy.ExtraStore.Add(el.Certificate);
-        var ok = custom.Build(new X509Certificate2(cert));
-        if (!ok)
-            Log.Warn($"upstream TLS {member}: certificate not trusted by upstream.tls.caFile: " +
-                     string.Join("; ", custom.ChainStatus.Select(s => s.StatusInformation.Trim())));
-        return ok;
+        catch (Exception e) when (e is System.Security.Cryptography.CryptographicException or ArgumentException)
+        {
+            Log.Debug($"upstream TLS {member}: cannot summarize server certificate: {e.Message}");
+        }
     }
 }

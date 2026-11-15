@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Security.Cryptography.X509Certificates;
+using Spyglass.Proxy.Forwarding;
 using Spyglass.Proxy.Config;
 using Spyglass.Proxy.Diagnostics;
 using Spyglass.Proxy.Metrics;
@@ -148,15 +150,29 @@ internal sealed class CollectorSender : IAsyncDisposable
         _dropped = dropped;
         _chunkBytes = (int)Math.Min(ChunkBytes, Math.Max(1024, config.BatchMaxBytes));
         _reservedBound = Math.Max(_chunkBytes, config.BufferBytes / 16); // PLAN 1.2: conn records' own slice, on top of the op bound
-        _http = new HttpClient(handler ?? new SocketsHttpHandler
-        {
-            PooledConnectionLifetime = TimeSpan.FromMinutes(2),
-            ConnectTimeout = TimeSpan.FromSeconds(2),
-        })
+        _http = new HttpClient(handler ?? CreateHandler(config))
         {
             Timeout = TimeSpan.FromSeconds(5),
         };
         _own = CreateBuffer();
+    }
+
+    private static SocketsHttpHandler CreateHandler(CollectorConfig config)
+    {
+        var h = new SocketsHttpHandler
+        {
+            PooledConnectionLifetime = TimeSpan.FromMinutes(2),
+            ConnectTimeout = TimeSpan.FromSeconds(2),
+        };
+        // Custom trust for an https endpoint: same chain logic as upstream.tls.caFile (TlsTrust).
+        if (config.CaFile != null || config.AllowInvalidCertificates)
+        {
+            var trust = config.CaFile != null ? TlsTrust.LoadCaFile(config.CaFile, "collector.caFile") : null;
+            var insecure = config.AllowInvalidCertificates;
+            h.SslOptions.RemoteCertificateValidationCallback = (_, cert, chain, errors) =>
+                TlsTrust.Validate("collector TLS", "collector.caFile", cert, chain, errors, trust, insecure, allowInvalidHostnames: false, X509RevocationMode.NoCheck);
+        }
+        return h;
     }
 
     internal int BatchMaxRecords => _config.BatchMaxRecords;

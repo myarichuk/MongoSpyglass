@@ -68,13 +68,17 @@ public static class TestClients
             settings.UseTls = true;
             settings.SslSettings = new MongoDB.Driver.SslSettings
             {
-                ServerCertificateValidationCallback = (_, cert, _, errors) =>
+                ServerCertificateValidationCallback = (_, cert, presented, errors) =>
                 {
                     if (cert == null || (errors & System.Net.Security.SslPolicyErrors.RemoteCertificateNameMismatch) != 0) return false;
                     using var chain = new X509Chain();
                     chain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
                     chain.ChainPolicy.CustomTrustStore.AddRange(trust);
                     chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+                    // Intermediates only from what the server sent in the handshake (a leaf-only server fails here).
+                    if (presented != null)
+                        foreach (var el in presented.ChainElements.Skip(1))
+                            chain.ChainPolicy.ExtraStore.Add(el.Certificate);
                     return chain.Build(new X509Certificate2(cert));
                 }
             };
