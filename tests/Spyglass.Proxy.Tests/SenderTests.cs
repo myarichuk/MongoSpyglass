@@ -208,4 +208,183 @@ public sealed class SenderTests
             Assert.Equal(Enumerable.Range(0, each), g.Select(e => e.GetProperty("i").GetInt32()));
         Assert.Equal(0, dropped.Value);
     }
+
+    [Fact]
+    public async Task Large_records_drain_without_waiting_for_the_record_limit()
+    {
+        // 10 KB records never reach batchMaxRecords (2000) before the 16 MiB buffer bound does. The sender used to send one
+        // batch per flush interval, i.e. ~1 MiB / 500 ms.
+        var h = new Handler(_ => new HttpResponseMessage(HttpStatusCode.NoContent));
+        var dropped = new Counter();
+        var cfg = Config();
+        cfg.FlushIntervalMs = 500;
+        await using var s = new CollectorSender(cfg, "src", dropped, h);
+        var buf = s.CreateBuffer();
+        s.Start();
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        for (var i = 0; i < 1000; i++) buf.Append(Encoding.UTF8.GetBytes(Line(i, pad: 10_000)));
+        await Until(() => h.All.Count + dropped.Value == 1000);
+        Assert.Equal(0, dropped.Value);
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(3), $"{sw.Elapsed}: {h.PostSizes.Count} posts");
+        Assert.Equal(Enumerable.Range(0, 1000).Select(i => Line(i, 10_000)), h.All);
+    }
+
+    [Fact]
+    public async Task Retry_after_may_be_an_http_date()
+    {
+        var reject = 1;
+        var h = new Handler(_ =>
+        {
+            if (Interlocked.Exchange(ref reject, 0) != 1) return new HttpResponseMessage(HttpStatusCode.NoContent);
+            var r = new HttpResponseMessage(HttpStatusCode.TooManyRequests);
+            r.Headers.RetryAfter = new System.Net.Http.Headers.RetryConditionHeaderValue(DateTimeOffset.UtcNow.AddSeconds(6));
+            return r;
+        });
+        await using var s = new CollectorSender(Config(), "src", new Counter(), h);
+        var buf = s.CreateBuffer();
+        s.Start();
+        buf.Append("{\"first\":1}"u8);
+        await Until(() => s.Paused);
+        Assert.InRange(s.PausedForMs, 3_000, 6_100); // not the 1 s fallback
+    }
+
+    [Fact]
+    public async Task Second_half_of_a_split_batch_honours_a_429_from_the_first()
+    {
+        var calls = 0;
+        var h = new Handler(lines =>
+        {
+            switch (Interlocked.Increment(ref calls))
+            {
+                case 1: return new HttpResponseMessage(HttpStatusCode.RequestEntityTooLarge);
+                default:
+                    var r = new HttpResponseMessage(HttpStatusCode.TooManyRequests);
+                    r.Headers.RetryAfter = new System.Net.Http.Headers.RetryConditionHeaderValue(TimeSpan.FromSeconds(5));
+                    return r;
+            }
+        });
+        var dropped = new Counter();
+        await using var s = new CollectorSender(Config(maxRecords: 4), "src", dropped, h);
+        var buf = s.CreateBuffer();
+        for (var i = 0; i < 4; i++) buf.Append(Encoding.UTF8.GetBytes(Line(i)));
+        s.Start();
+        await Until(() => dropped.Value == 4);
+        await Task.Delay(200);
+        Assert.Equal([4, 2], h.PostSizes.ToArray()); // the 413'd batch, then the first half: the second was not sent
+    }
+
+    [Fact]
+    public async Task Conn_records_survive_a_429_pause()
+    {
+        var reject = 1;
+        var h = new Handler(_ =>
+        {
+            if (Interlocked.Exchange(ref reject, 0) != 1) return new HttpResponseMessage(HttpStatusCode.NoContent);
+            var r = new HttpResponseMessage(HttpStatusCode.TooManyRequests);
+            r.Headers.RetryAfter = new System.Net.Http.Headers.RetryConditionHeaderValue(TimeSpan.FromSeconds(1));
+            return r;
+        });
+        var dropped = new Counter();
+        await using var s = new CollectorSender(Config(), "src", dropped, h);
+        var ops = s.CreateBuffer();
+        var conns = s.CreateBuffer(reserved: true);
+        ops.Append("{\"type\":\"op\",\"n\":1}"u8);
+        conns.Append("{\"type\":\"conn\",\"n\":1}"u8);
+        s.Start();
+        await Until(() => s.Paused);                       // the first post (the op batch) drew the 429
+        conns.Append("{\"type\":\"conn\",\"n\":2}"u8);     // not dropped at append while paused
+        ops.Append("{\"type\":\"op\",\"n\":2}"u8);          // dropped at append
+        await Until(() => h.All.Count == 2);
+        Assert.Equal(["{\"type\":\"conn\",\"n\":1}", "{\"type\":\"conn\",\"n\":2}"], h.All);
+        Assert.Equal(2, dropped.Value);                    // both ops, no conn
+    }
+
+    [Fact]
+    public async Task Loop_survives_a_failing_periodic_record_builder_and_a_throwing_handler()
+    {
+        var calls = 0;
+        var h = new Handler(_ =>
+        {
+            if (Interlocked.Increment(ref calls) == 1) throw new InvalidOperationException("handler bug");
+            return new HttpResponseMessage(HttpStatusCode.NoContent);
+        });
+        var dropped = new Counter();
+        await using var s = new CollectorSender(Config(), "src", dropped, h) { Periodic60s = () => throw new InvalidOperationException("builder bug") };
+        var buf = s.CreateBuffer();
+        s.Start();
+        buf.Append("{\"first\":1}"u8);
+        await Until(() => h.All.Count == 1);               // retried once after the handler threw
+        buf.Append("{\"second\":1}"u8);
+        await Until(() => h.All.Count == 2);
+        Assert.Equal(0, dropped.Value);
+    }
+
+    [Fact]
+    public async Task Linked_conn_and_op_buffers_of_many_workers_flush_as_one_batch_with_conns_first()
+    {
+        // FP-7: each worker's conn buffer is sealed ahead of its op chunk; that used to alternate conn | op | conn | op batches
+        var h = new Handler(_ => new HttpResponseMessage(HttpStatusCode.NoContent));
+        var dropped = new Counter();
+        await using var s = new CollectorSender(Config(), "src", dropped, h);
+        for (var w = 0; w < 8; w++)
+        {
+            var conn = s.CreateBuffer(reserved: true);
+            var op = s.CreateBuffer(before: conn);
+            op.Append(Encoding.UTF8.GetBytes($"{{\"type\":\"op\",\"w\":{w}}}"));
+            conn.Append(Encoding.UTF8.GetBytes($"{{\"type\":\"conn\",\"w\":{w}}}"));
+        }
+        s.Start();
+        await Until(() => h.All.Count == 16);
+        Assert.Equal([16], h.PostSizes.ToArray());
+        Assert.Equal(8, h.All.Take(8).Count(l => l.Contains("\"conn\""))); // every conn record ahead of every op record
+        Assert.Equal(0, dropped.Value);
+    }
+
+    [Fact]
+    public async Task A_conn_chunk_held_through_a_pause_goes_ahead_of_ops_sealed_meanwhile()
+    {
+        var reject = 1;
+        var h = new Handler(_ =>
+        {
+            if (Interlocked.Exchange(ref reject, 0) != 1) return new HttpResponseMessage(HttpStatusCode.NoContent);
+            var r = new HttpResponseMessage(HttpStatusCode.TooManyRequests);
+            r.Headers.RetryAfter = new System.Net.Http.Headers.RetryConditionHeaderValue(TimeSpan.FromSeconds(1));
+            return r;
+        });
+        var dropped = new Counter();
+        await using var s = new CollectorSender(Config(), "src", dropped, h);
+        var conns = s.CreateBuffer(reserved: true);
+        var ops = s.CreateBuffer(before: conns);
+        conns.Append("{\"type\":\"conn\",\"n\":1}"u8);
+        ops.Append("{\"type\":\"op\",\"n\":1}"u8);
+        s.Start();
+        await Until(() => s.Paused);                         // one POST with the conn and the op: 429
+        Assert.Equal(1, dropped.Value);                      // the op only: the conn is held
+        await Until(() => !s.Paused);
+        ops.Append("{\"type\":\"op\",\"n\":2}"u8);
+        await Until(() => h.All.Count == 2);
+        Assert.Equal(["{\"type\":\"conn\",\"n\":1}", "{\"type\":\"op\",\"n\":2}"], h.All);
+    }
+
+    [Fact]
+    public async Task Conn_chunks_still_held_at_shutdown_are_counted_dropped()
+    {
+        var h = new Handler(_ =>
+        {
+            var r = new HttpResponseMessage(HttpStatusCode.TooManyRequests);
+            r.Headers.RetryAfter = new System.Net.Http.Headers.RetryConditionHeaderValue(TimeSpan.FromSeconds(10));
+            return r;
+        });
+        var dropped = new Counter();
+        var s = new CollectorSender(Config(), "src", dropped, h);
+        var conns = s.CreateBuffer(reserved: true);
+        var ops = s.CreateBuffer(before: conns);
+        conns.Append("{\"type\":\"conn\"}"u8);
+        ops.Append("{\"type\":\"op\"}"u8);
+        s.Start();
+        await Until(() => s.Paused);
+        await s.DisposeAsync();
+        Assert.Empty(h.All);
+        Assert.Equal(2, dropped.Value);                      // delivered or counted: the held conn record too
+    }
 }

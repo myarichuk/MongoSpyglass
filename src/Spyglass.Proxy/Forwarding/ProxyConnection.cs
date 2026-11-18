@@ -42,6 +42,9 @@ internal sealed class ProxyConnection
         var reason = CloseReason.ProxyShutdown;
         string? detail = null;
         var opened = false;
+        Task<PumpEnd>? c2sTask = null, s2cTask = null;
+        // Declared outside the try so the catch below can still cancel the pumps; disposed in finally once they are done.
+        CancellationTokenSource? cts = null;
 
         try
         {
@@ -86,7 +89,7 @@ internal sealed class ProxyConnection
             opened = true;
             observer.Opened(_ctx);
 
-            using var cts = CancellationTokenSource.CreateLinkedTokenSource(shutdown);
+            cts = CancellationTokenSource.CreateLinkedTokenSource(shutdown);
             _cts = cts;
             var config = _server.Config;
             var c2s = new Pump(clientStream, upStream, isRequest: true, _ctx, observer.CreateTap(_ctx, true), config,
@@ -94,8 +97,8 @@ internal sealed class ProxyConnection
             var s2c = new Pump(upStream, clientStream, isRequest: false, _ctx, observer.CreateTap(_ctx, false), config,
                 _member.BytesFromServer, _member.FramesFromServer, _member.AddedLatency);
 
-            var c2sTask = c2s.RunAsync(cts.Token);
-            var s2cTask = s2c.RunAsync(cts.Token);
+            c2sTask = c2s.RunAsync(cts.Token);
+            s2cTask = s2c.RunAsync(cts.Token);
             var firstTask = await Task.WhenAny(c2sTask, s2cTask).ConfigureAwait(false);
             var firstIsClient = firstTask == c2sTask;
             var first = await firstTask.ConfigureAwait(false);
@@ -108,8 +111,10 @@ internal sealed class ProxyConnection
                 // Propagate the half-close and let the other direction drain (01 §3.1 step 5).
                 await TryShutdownSendAsync(firstIsClient ? upSocket : _client, firstIsClient ? upStream : clientStream).ConfigureAwait(false);
                 var other = firstIsClient ? s2cTask : c2sTask;
-                if (await Task.WhenAny(other, Task.Delay(HalfCloseGrace, shutdown)).ConfigureAwait(false) != other)
-                    cts.Cancel();
+                // WaitAsync's timer goes away when `other` completes (a bare Task.Delay would stay queued for 30 s)
+                try { await other.WaitAsync(HalfCloseGrace, shutdown).ConfigureAwait(false); }
+                catch (Exception e) when (e is TimeoutException or OperationCanceledException) { cts.Cancel(); }
+                catch { /* a pump fault is reported below */ }
             }
             else
             {
@@ -124,22 +129,31 @@ internal sealed class ProxyConnection
                 _member.InvalidFrames.Inc();
                 Log.Warn($"conn {_ctx.ConnSeq} ({_member.Advertised}): invalid frame from {(firstIsClient ? "client" : "server")}, header {firstPump.InvalidFrameHeaderHex}; closing");
             }
+            else if (first is PumpEnd.HelloTimeout or PumpEnd.ProcessingFault)
+            {
+                Log.Warn($"conn {_ctx.ConnSeq} ({_member.Advertised}): {reason.Wire()} on the {(firstIsClient ? "client" : "server")} side: {detail}; closing");
+            }
         }
         catch (OperationCanceledException) when (shutdown.IsCancellationRequested)
         {
             reason = CloseReason.ProxyShutdown;
+            await StopPumpsAsync(c2sTask, s2cTask).ConfigureAwait(false);
         }
         catch (Exception e)
         {
             Log.Error($"conn {_ctx.ConnSeq}: unexpected {e.GetType().Name}: {e.Message}");
             detail ??= e.Message;
+            await StopPumpsAsync(c2sTask, s2cTask).ConfigureAwait(false);
         }
         finally
         {
+            // a pump still running here (an unexpected fault after the sockets were set up) is stopped by the disposals below
             if (upStream != null) await SafeDisposeAsync(upStream).ConfigureAwait(false);
             upSocket?.Dispose();
             if (clientStream != null) await SafeDisposeAsync(clientStream).ConfigureAwait(false);
             _client.Dispose();
+            _cts = null;
+            cts?.Dispose();
             if (opened)
             {
                 _member.OpenConnections.Dec();
@@ -149,9 +163,20 @@ internal sealed class ProxyConnection
         }
     }
 
+    /// <summary>Stops and awaits both pumps (bounded) so the close record is posted after the last frame either one publishes.</summary>
+    private async Task StopPumpsAsync(Task<PumpEnd>? c2sTask, Task<PumpEnd>? s2cTask)
+    {
+        Reset();
+        if (c2sTask == null || s2cTask == null) return;
+        try { await Task.WhenAll(c2sTask, s2cTask).WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false); }
+        catch { /* a faulted or stuck pump must not keep the connection from closing */ }
+    }
+
     private static (CloseReason, string?) Classify(PumpEnd end, bool clientSide, Pump pump) => end switch
     {
         PumpEnd.InvalidFrame => (CloseReason.InvalidFrame, pump.InvalidFrameHeaderHex),
+        PumpEnd.HelloTimeout => (CloseReason.HelloTimeout, pump.Failure?.Message),
+        PumpEnd.ProcessingFault => (CloseReason.ProcessingFault, pump.Failure?.Message),
         PumpEnd.Cancelled => (CloseReason.ProxyShutdown, null),
         PumpEnd.SourceClosed or PumpEnd.SourceFailed => (clientSide ? CloseReason.ClientClosed : CloseReason.UpstreamClosed, pump.Failure?.Message),
         // a write failure is the *other* side going away

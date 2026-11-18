@@ -13,9 +13,34 @@
       return d;
     },
     isDark: () => root.classList.contains("dark"),
-    copy: (text) => navigator.clipboard ? navigator.clipboard.writeText(text) : Promise.resolve(),
-    // live feed: paused while the user is scrolled away from the top
-    scrollTop: (el) => el ? el.scrollTop : 0,
+    // true when the text is on the clipboard; navigator.clipboard needs a secure context, the collector is often plain http on a LAN
+    copy: async (text) => {
+      try {
+        if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(text); return true; }
+      } catch { }
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "");
+      ta.style.cssText = "position:fixed;top:0;left:0;opacity:0";
+      document.body.appendChild(ta);
+      ta.select();
+      try { return document.execCommand("copy"); } catch { return false; } finally { ta.remove(); }
+    },
+    // live feed: pause while the user is scrolled away from the top. A passive listener that calls back into .NET only when the
+    // at-top state flips, never once per scroll event.
+    watchTop(el, ref) {
+      if (!el) return;
+      let atTop = true;
+      const h = () => {
+        const now = el.scrollTop <= 4;
+        if (now !== atTop) { atTop = now; ref.invokeMethodAsync("SetAtTop", now); }
+      };
+      el.addEventListener("scroll", h, { passive: true });
+      el.__spyglassTop = h;
+    },
+    unwatchTop(el) {
+      if (el && el.__spyglassTop) { el.removeEventListener("scroll", el.__spyglassTop); el.__spyglassTop = null; }
+    },
   };
 
   // Tables: rows with data-href are focusable; ↑/↓ move, Enter opens, c copies the focused cell's row text.

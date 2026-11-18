@@ -40,6 +40,8 @@ internal sealed class Partition
         public string? LastShape;
         public long LastRespLastAbs;
         public int Run;
+        /// <summary>Partition clock of the last op: idle state is swept (a closed connection never sends another).</summary>
+        public long LastUs;
         public readonly Dictionary<string, (long FirstTs, int Count)> Values = [];
         /// <summary>Values in first-seen order: expiry pops from the front, O(1) per op.</summary>
         public readonly Queue<(string Hash, long FirstTs)> ValueOrder = new();
@@ -67,11 +69,13 @@ internal sealed class Partition
     /// <summary>The command BSON of the op being enriched, decoded here (reused).</summary>
     private byte[] _cmdBuffer = new byte[4096];
     private readonly Dictionary<(string, long), ConnState> _state = [];
-    private readonly Queue<(string, long)> _stateOrder = new();
-    private const int MaxConnState = 100_000, MaxValues = 256;
+    private const int MaxConnState = 50_000, MaxValues = 256;
+    /// <summary>State older than this has nothing left to say: the rules look back 1 s and a few ms of gap.</summary>
+    private const long StateIdleUs = 60_000_000, StateSweepUs = 10_000_000;
+    private long _nextStateSweepUs, _clockUs, _knownShapesClearUs;
     private Thread? _thread;
 
-    public long Duplicates, DecodeFailures, Processed;
+    public long Duplicates, DecodeFailures, Processed, Faults;
     /// <summary>Stopwatch ticks spent on work (dequeue to hand-off), not waiting.</summary>
     public long BusyTicks;
     /// <summary>Environment.TickCount64 at the loop's last turn (at least every 100 ms when healthy).</summary>
@@ -125,7 +129,8 @@ internal sealed class Partition
             Volatile.Write(ref LastBeat, Environment.TickCount64);
             var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
             var output = new PartitionOutput((item as List<Record>)?.Count ?? 0);
-            var now = _nowUs();
+            var now = _clockUs = _nowUs();
+            if (now >= _nextStateSweepUs) { SweepState(now); _nextStateSweepUs = now + StateSweepUs; }
             // expiry first: whatever ran out by now is final before records arriving now are matched against it
             _join.Expire(now, output);
             if (item is List<Record> batch)
@@ -145,17 +150,21 @@ internal sealed class Partition
                                 OnCmd(c, now, output);
                                 break;
                             case StreamRecord s:
-                                if (!_dedup.Seen(Dedup.Key(s.Src, "stream", s.Member, s.ServerConnectionId ?? -1, s.RequestId, s.Ts)))
+                                // every stream record of one exhaust cursor has the same requestId and, off one socket read, the same ts: seq tells them apart
+                                if (!_dedup.Seen(Dedup.Key(s.Src, "stream", s.Member, s.RouteSid, s.RequestId, s.DedupTs, s.Seq)))
                                 {
                                     (output.Streams ??= []).Add(s);
                                     forwarded = true;
                                 }
+                                else Interlocked.Increment(ref Duplicates);
                                 break;
                         }
                     }
                     catch (Exception e)
                     {
-                        Console.Error.WriteLine($"partition: {e.GetType().Name}: {e.Message}");
+                        // FC-21: the first few, then every thousandth: a hostile input must not flood stderr
+                        var n = Interlocked.Increment(ref Faults);
+                        if (n <= 10 || n % 1000 == 0) Console.Error.WriteLine($"partition: {e.GetType().Name}: {e.Message} ({n} so far)");
                     }
                     finally
                     {
@@ -178,7 +187,7 @@ internal sealed class Partition
     private void OnCmd(CmdRecord c, long now, PartitionOutput output)
     {
         var key = c.Key!.Value; // keyless cmds are orphans at ingest and never routed here
-        if (_dedup.Seen(Dedup.Key(c.Src, "cmd", key.Member, key.ServerConnectionId, key.RequestId, c.Ts)))
+        if (_dedup.Seen(Dedup.Key(c.Src, "cmd", key.Member, key.ServerConnectionId, key.RequestId, c.DedupTs)))
         {
             Interlocked.Increment(ref _joinCounters.Duplicates);
             return;
@@ -210,7 +219,7 @@ internal sealed class Partition
 
     private (Operation, List<RuleHit>?)? Enrich(OpRecord r)
     {
-        if (_dedup.Seen(Dedup.Key(r.Src, "op", r.Member, r.ServerConnectionId ?? -r.ConnSeq, r.RequestId, r.Ts)))
+        if (_dedup.Seen(Dedup.Key(r.Src, "op", r.Member, r.RouteSid, r.RequestId, r.DedupTs)))
         {
             Interlocked.Increment(ref Duplicates);
             return null;
@@ -242,7 +251,13 @@ internal sealed class Partition
         }
 
         var valuesPreserved = _producers.Get(r.Src)?.ValuesPreserved ?? true;
-        if (_knownShapes.Count > 100_000) _knownShapes.Clear(); // a bound; clearing only means JSON is sent again
+        // a bound, and hourly: the analysis stage expires shapes unused for 30 d (and caps its catalog), and a shape it no longer
+        // has must arrive with its JSON again; clearing only means JSON is sent again
+        if (_knownShapes.Count > 100_000 || _clockUs - _knownShapesClearUs > 3_600_000_000)
+        {
+            _knownShapes.Clear();
+            _knownShapesClearUs = _clockUs;
+        }
         // a getMore's own shape is replaced by its cursor's in the analysis stage, so its JSON may be used up on an op that
         // never registers it: getMores always carry theirs (a few bytes: the command name and namespace)
         var shape = ShapeNormalizer.Normalize(r.Command, r.Db, r.Coll, cmd, r.CmdTruncated, valuesPreserved, r.Command == "getMore" ? null : _knownShapes);
@@ -268,6 +283,8 @@ internal sealed class Partition
     {
         if (command is "hello" or "isMaster" or "ismaster") return true;
         if (cmd.IsEmpty) return false;
+        // drivers send maxTimeMS on a getMore only for awaitData cursors: one of a cursor the collector never saw open (restart, eviction) still waits by design
+        if (command == "getMore" && BsonSpan.TryGet(cmd, "maxTimeMS"u8, out _)) return true;
         if (BsonSpan.TryGet(cmd, "tailable"u8, out var t) && BsonSpan.ToBoolean(t) || BsonSpan.TryGet(cmd, "awaitData"u8, out var a) && BsonSpan.ToBoolean(a)) return true;
         return command == "aggregate" && BsonSpan.TryGet(cmd, "pipeline"u8, out var p) && p.IsArray && BsonSpan.First(p.Value, out var stage0) &&
                stage0.IsDocument && BsonSpan.First(stage0.Value, out var first) && first.NameIs("$changeStream"u8);
@@ -290,6 +307,19 @@ internal sealed class Partition
         }
     }
 
+    /// <summary>Drops the rule state of closed connections and of connections idle for a minute (CI-18).</summary>
+    private void SweepState(long now)
+    {
+        if (_state.Count == 0) return;
+        List<(string, long)>? drop = null;
+        foreach (var (k, st) in _state)
+            if (now - st.LastUs > StateIdleUs || _conns.Get(k.Item1, k.Item2)?.ClosedTs != null)
+                (drop ??= []).Add(k);
+        if (drop != null)
+            foreach (var k in drop) _state.Remove(k);
+        if (_state.Count == 0) _state.TrimExcess();
+    }
+
     /// <summary>n-plus-one-suspected and repeated-query (suspected) on one connection (03 §5.2).</summary>
     private List<RuleHit>? ConnectionRules(Operation op)
     {
@@ -298,10 +328,13 @@ internal sealed class Partition
         if (!_state.TryGetValue(key, out var st))
         {
             if (_state.Count >= MaxConnState)
-                _state.Remove(_stateOrder.Dequeue());
+            {
+                SweepState(_clockUs);
+                if (_state.Count >= MaxConnState) _state.Clear(); // a bound: only the rules' short memory is lost
+            }
             _state[key] = st = new ConnState();
-            _stateOrder.Enqueue(key);
         }
+        st.LastUs = _clockUs;
         List<RuleHit>? hits = null;
 
         // tight loop: same shape, each starting within G of the previous reply's last byte
@@ -347,13 +380,14 @@ internal sealed class Dedup(int capacity)
     private int _next;
     private bool _full;
 
-    public static ulong Key(string src, string type, string member, long sid, int requestId, long ts)
+    /// <param name="seq">stream records only: the position in the exhaust stream (02 §4.2 <c>seq</c>); 0 otherwise.</param>
+    public static ulong Key(string src, string type, string member, long sid, int requestId, long ts, int seq = 0)
     {
         var h = new HashCode();
-        h.Add(src); h.Add(type); h.Add(member); h.Add(sid); h.Add(requestId); h.Add(ts);
+        h.Add(src); h.Add(type); h.Add(member); h.Add(sid); h.Add(requestId); h.Add(ts); h.Add(seq);
         var lo = (uint)h.ToHashCode();
         var h2 = new HashCode();
-        h2.Add(ts); h2.Add(requestId); h2.Add(sid); h2.Add(member); h2.Add(type); h2.Add(src);
+        h2.Add(seq); h2.Add(ts); h2.Add(requestId); h2.Add(sid); h2.Add(member); h2.Add(type); h2.Add(src);
         return ((ulong)(uint)h2.ToHashCode() << 32) | lo;
     }
 

@@ -17,13 +17,13 @@ public sealed class DownstreamTls
 
     public DownstreamTls(DownstreamTlsConfig config, string advertiseHost)
     {
+        SslStreamCertificateContext? context = null;
         if (config.CertFile != null)
         {
-            if (!File.Exists(config.CertFile)) throw new ConfigException($"'listen.tls.certFile' {config.CertFile} not found");
-            if (!File.Exists(config.KeyFile)) throw new ConfigException($"'listen.tls.keyFile' {config.KeyFile} not found");
-            using var pem = X509Certificate2.CreateFromPemFile(config.CertFile, config.KeyFile);
-            // Re-import so the private key is usable by SslStream on every platform.
-            Certificate = X509CertificateLoader.LoadPkcs12(pem.Export(X509ContentType.Pkcs12), null);
+            var loaded = TlsMaterial.Load(config.CertFile, config.KeyFile, config.KeyPassword, "listen.tls.certFile", "listen.tls.keyFile");
+            Certificate = loaded.Leaf;
+            // Intermediates in the file are sent to clients, so they only need to trust the root.
+            context = SslStreamCertificateContext.Create(loaded.Leaf, loaded.Extras, offline: true);
         }
         else
         {
@@ -31,13 +31,17 @@ public sealed class DownstreamTls
             SelfSigned = true;
         }
         Sha256Fingerprint = Convert.ToHexString(SHA256.HashData(Certificate.RawData));
+        Summary = CertSummary.From(Certificate);
         _options = new SslServerAuthenticationOptions
         {
-            ServerCertificate = Certificate,
+            ServerCertificate = context == null ? Certificate : null,
+            ServerCertificateContext = context,
             EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
             ClientCertificateRequired = false,
         };
     }
+
+    internal CertSummary Summary { get; }
 
     public async Task<SslStream> AuthenticateAsync(Stream inner, CancellationToken ct)
     {

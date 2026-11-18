@@ -162,4 +162,20 @@ public sealed class StoreTests : IDisposable
         Assert.Contains(buckets, b => b.Minute == oldHour * 60 && b.Count == 7 && b.Latency.Count == 2); // hourly row
         Assert.Contains(buckets, b => b.Minute == nowMinute - 5 && b.Count == 3);
     }
+
+    /// <summary>CI-5: alerts and shapes had no delete at all; 03 §7 keeps alerts 30 d after resolve.</summary>
+    [Fact]
+    public void Alerts_are_deleted_and_unused_shapes_pruned()
+    {
+        using var store = new SqliteStore(_dir);
+        Alert A(string id) => new() { Id = id, Rule = "slow-shape", ScopeKey = id, Scope = new Dictionary<string, string?> { ["shapeHash"] = id } };
+        store.Upsert([A("a1"), A("a2"), A("a3")]);
+        store.Delete(["a1", "a3", "missing"]);
+        Assert.Equal("a2", Assert.Single(store.All()).Id);
+
+        ShapeInfo S(string h, long lastSeen) => new() { ShapeHash = h, ShapeJson = "{}", Command = "find", LastSeen = lastSeen };
+        store.UpsertShapes([S("old", 100), S("new", 5000)]);
+        Assert.Equal(1, store.PruneShapes(1000));
+        Assert.Equal("new", Assert.Single(store.Shapes()).ShapeHash);
+    }
 }

@@ -58,8 +58,12 @@ spyglass-proxy --upstream.uri "mongodb://db1:27017,db2:27017,db3:27017/?replicaS
 * A replica set gets one listener per member (`basePort`, `basePort+1`, …) and the proxy rewrites the hosts in
   hello replies to those listeners, so drivers discover the set only through the proxy. `advertiseHost` must be
   the name clients reach the proxy by. Members added later get listeners from `listen.portRange`.
-* TLS to the upstream follows the URI (`tls=true`, `mongodb+srv://`); TLS to clients is `listen.tls.mode=tls`
-  with your certificate, or a self-signed one whose fingerprint is logged.
+* TLS to the upstream follows the URI (`tls=true`, `mongodb+srv://`, and the driver options `tlsCAFile=`,
+  `tlsCertificateKeyFile=`, `tlsInsecure=`); `upstream.tls.caFile` trusts an internal CA. TLS to clients is
+  `listen.tls.mode=tls` with your certificate (PEM, PEM + key, encrypted key or .pfx; intermediates are sent), or a
+  self-signed one whose fingerprint is logged. The UI's Topology & producers page shows each proxy's TLS setup
+  and certificate expiry. **Dev laptop and corporate-CA staging recipes: [docs/deployment.md](docs/deployment.md)**,
+  with ready-to-edit files in [`deploy/examples/`](deploy/examples).
 * `capture.values` decides what leaves the proxy: `full`, `truncated` (default: strings cut at 64 characters)
   or `shape` (types only, no values). Authentication payloads and fields matching
   `capture.redactFieldPattern` are redacted in the proxy before anything is queued.
@@ -69,7 +73,10 @@ spyglass-proxy --upstream.uri "mongodb://db1:27017,db2:27017,db3:27017/?replicaS
 **Collector** (`src/Spyglass.Collector` + `src/Spyglass.Collector.Ui`). SQLite in `SPYGLASS_DATA`, 24 h of
 operations by default, aggregates kept 30 days. `SPYGLASS_TOKEN` authenticates ingest; the UI uses
 `SPYGLASS_ADMIN_PASSWORD`, or `SPYGLASS_AUTH_HEADER=X-Forwarded-User` behind an authenticating reverse proxy.
-It speaks plain HTTP: terminate TLS in front of it.
+The header is believed only from `SPYGLASS_TRUSTED_PROXIES` (CIDRs or addresses, default loopback), so in a
+container network set it to the proxy's network (for example `SPYGLASS_TRUSTED_PROXIES=172.18.0.0/16`); the same
+list lets an `X-Forwarded-Proto: https` mark the session cookie `Secure`. An empty `SPYGLASS_TOKEN` is refused,
+and unknown `SPYGLASS_*` names (the proxy's and exporters') only warn. It speaks plain HTTP, or HTTPS with `SPYGLASS_TLS_CERT` (PEM or .pfx; `SPYGLASS_TLS_KEY`, `SPYGLASS_TLS_KEY_PASSWORD`).
 
 ```sh
 docker build -f src/Spyglass.Collector/Dockerfile -t spyglass-collector .

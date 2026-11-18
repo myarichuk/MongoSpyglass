@@ -23,20 +23,27 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
     private readonly SqliteConnection _write;
     private readonly object _writeLock = new();
     private long _count, _bytes;
-    /// <summary>Per-row overhead beyond the raw line: columns and the five index entries.</summary>
+    /// <summary>Per-row overhead beyond the raw line: columns and the secondary index entries.</summary>
     private const int RowOverhead = 256;
+    /// <summary>03 §7: the WAL is truncated back to this after a checkpoint; and past it, retention truncates it explicitly and counts it toward the size bound.</summary>
+    private const long WalLimit = 64L * 1024 * 1024;
+    private readonly string _walFile;
+    /// <summary>Inside <see cref="Transact"/>: Append/Update/callsites join the outer transaction, and their counters apply when it commits.</summary>
+    private bool _inTx;
+    private long _txCount, _txBytes;
 
     public SqliteStore(string directory)
     {
         Directory.CreateDirectory(directory);
         var file = Path.Combine(directory, "spyglass.db");
+        _walFile = file + "-wal";
         var cs = new SqliteConnectionStringBuilder { DataSource = file, Mode = SqliteOpenMode.ReadWriteCreate, Pooling = true }.ToString();
         _readCs = new SqliteConnectionStringBuilder(cs) { Mode = SqliteOpenMode.ReadOnly }.ToString();
         _write = new SqliteConnection(cs);
         _write.Open();
-        // the ops table carries five secondary indexes: a 64 MiB page cache keeps their hot pages resident
+        // the ops table carries six secondary indexes: a 64 MiB page cache keeps their hot pages resident
         Exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=OFF; " +
-             "PRAGMA cache_size=-65536; PRAGMA mmap_size=268435456; PRAGMA temp_store=MEMORY;");
+             "PRAGMA cache_size=-65536; PRAGMA mmap_size=268435456; PRAGMA temp_store=MEMORY; PRAGMA journal_size_limit=67108864;");
         Exec("""
             CREATE TABLE IF NOT EXISTS ops (
               id TEXT PRIMARY KEY, ts INTEGER NOT NULL, command TEXT NOT NULL, coll TEXT, status TEXT NOT NULL,
@@ -47,6 +54,7 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
             CREATE INDEX IF NOT EXISTS ops_coll ON ops(coll, id);
             CREATE INDEX IF NOT EXISTS ops_command ON ops(command, id);
             CREATE INDEX IF NOT EXISTS ops_status ON ops(status, id) WHERE status <> 'ok';
+            CREATE INDEX IF NOT EXISTS ops_latency ON ops(latency, id) WHERE latency IS NOT NULL;
             CREATE TABLE IF NOT EXISTS agg_minute (shape TEXT NOT NULL, minute INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(shape, minute)) WITHOUT ROWID;
             CREATE INDEX IF NOT EXISTS agg_minute_t ON agg_minute(minute);
             CREATE TABLE IF NOT EXISTS agg_hour (shape TEXT NOT NULL, hour INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(shape, hour)) WITHOUT ROWID;
@@ -61,6 +69,42 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
         Exec("CREATE INDEX IF NOT EXISTS ops_uow ON ops(uow, id) WHERE uow IS NOT NULL;");
         _count = Scalar("SELECT count(*) FROM ops");
         _bytes = Scalar("SELECT coalesce(sum(size), 0) FROM ops");
+    }
+
+    /// <summary>A transaction scope that is a no-op inside <see cref="Transact"/> (SQLite has no nested ones; the outer one commits).</summary>
+    private sealed class Scope(SqliteTransaction? tx) : IDisposable
+    {
+        public void Commit() => tx?.Commit();
+        public void Dispose() => tx?.Dispose();
+    }
+
+    private Scope Begin() => new(_inTx ? null : _write.BeginTransaction());
+
+    /// <summary>Row and byte counters: held back while an outer transaction might still roll back.</summary>
+    private void Counted(long rows, long bytes)
+    {
+        if (_inTx) { _txCount += rows; _txBytes += bytes; return; }
+        Interlocked.Add(ref _count, rows);
+        Interlocked.Add(ref _bytes, bytes);
+    }
+
+    /// <summary>One atomic write of whatever Append/Update/Upsert/Touch calls <paramref name="work"/> makes (CI-3).</summary>
+    public void Transact(Action work)
+    {
+        lock (_writeLock)
+        {
+            using var tx = _write.BeginTransaction();
+            _inTx = true;
+            _txCount = _txBytes = 0;
+            try
+            {
+                work();
+                tx.Commit();
+                Interlocked.Add(ref _count, _txCount);
+                Interlocked.Add(ref _bytes, _txBytes);
+            }
+            finally { _inTx = false; }
+        }
     }
 
     private void Exec(string sql)
@@ -109,7 +153,7 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
             if (_insert == null)
                 Check(raw.sqlite3_prepare_v3(db, InsertSql, 1 /* SQLITE_PREPARE_PERSISTENT */, out _insert), db);
             var st = _insert;
-            using var tx = _write.BeginTransaction();
+            using var tx = Begin();
             long inserted = 0, bytes = 0;
             try
             {
@@ -147,8 +191,7 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
             {
                 raw.sqlite3_reset(st); // a failed step leaves it mid-execution: reset before the rollback
             }
-            Interlocked.Add(ref _count, inserted);
-            Interlocked.Add(ref _bytes, bytes);
+            Counted(inserted, bytes);
         }
     }
 
@@ -179,9 +222,29 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
         return rd.Read() ? Materialize(rd) : null;
     }
 
+    /// <summary>
+    /// Rows a min-latency query reads through the primary key, newest first, before it falls back to the latency index. A threshold
+    /// that most rows pass fills the page long before this; a rare one is cheap through the index (FC-9).
+    /// </summary>
+    private const int LatencyScanBudget = 50_000;
+
     public List<Operation> Query(OpQuery q)
     {
         using var c = Read();
+        var limit = Math.Clamp(q.Limit, 1, 1000);
+        if (q.MinLatencyUs != null)
+        {
+            // WHERE latency >= ? ORDER BY id DESC LIMIT n plans as a search of ops_latency plus a sort of every match: it reads
+            // millions of rows when the threshold is low. Walk the key backwards instead (the table is ordered by id) for a bounded
+            // number of rows; only when that does not fill the page is the threshold selective enough for the index.
+            var fast = Run(c, q, limit, latencyViaScan: true);
+            if (q.Scanned >= limit) return fast;
+        }
+        return Run(c, q, limit, latencyViaScan: false);
+    }
+
+    private List<Operation> Run(SqliteConnection c, OpQuery q, int limit, bool latencyViaScan)
+    {
         using var cmd = c.CreateCommand();
         var where = new List<string>();
         void Add(string clause, string name, object value) { where.Add(clause); cmd.Parameters.AddWithValue(name, value); }
@@ -193,28 +256,61 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
         if (q.Coll != null) Add("coll = $coll", "$coll", q.Coll);
         if (q.Command != null) Add("command = $command", "$command", q.Command);
         if (q.Shape != null) Add("shape = $shape", "$shape", q.Shape);
-        if (q.Status != null) Add("status = $status", "$status", q.Status);
+        if (q.Status != null)
+        {
+            Add("status = $status", "$status", q.Status);
+            // SQLite uses the partial index ops_status only when the query repeats its WHERE term (CI-4)
+            if (q.Status != "ok") where.Add("status <> 'ok'");
+        }
         if (q.Uow != null) Add("uow = $uow", "$uow", q.Uow);
-        if (q.MinLatencyUs != null) Add("latency >= $lat", "$lat", q.MinLatencyUs);
-        cmd.CommandText = $"SELECT {Columns} FROM ops" +
-                          (where.Count > 0 ? " WHERE " + string.Join(" AND ", where) : "") + " ORDER BY id DESC LIMIT $limit";
-        cmd.Parameters.AddWithValue("$limit", Math.Clamp(q.Limit, 1, 1000));
+        if (q.MinLatencyUs != null && !latencyViaScan) Add("latency >= $lat", "$lat", q.MinLatencyUs);
+        var filter = where.Count > 0 ? " WHERE " + string.Join(" AND ", where) : "";
+        if (q.MinLatencyUs != null && latencyViaScan)
+        {
+            cmd.Parameters.AddWithValue("$lat", q.MinLatencyUs);
+            cmd.CommandText = $"SELECT {Columns} FROM ops WHERE id IN (SELECT id FROM (SELECT id, latency FROM ops{filter} ORDER BY id DESC LIMIT {LatencyScanBudget}) " +
+                              "WHERE latency >= $lat ORDER BY id DESC LIMIT $limit) ORDER BY id DESC";
+        }
+        else cmd.CommandText = $"SELECT {Columns} FROM ops{filter} ORDER BY id DESC LIMIT $limit";
+        cmd.Parameters.AddWithValue("$limit", limit);
         var list = new List<Operation>();
+        var scanned = 0;
+        string? lastId = null;
         using var rd = cmd.ExecuteReader();
         while (rd.Read())
+        {
+            scanned++;
+            lastId = rd.GetString(0);
             if (Materialize(rd) is { } op) list.Add(op);
+        }
+        // a latency scan that came up short says so with Scanned < limit, even when the table was read to its end
+        q.Scanned = scanned;
+        q.LastId = lastId;
         return list;
     }
 
     private const string Columns = "id, ts, app, driver, shape, value_hash, reply_count, alerts, raw, ctx";
 
+    /// <summary>
+    /// A stored line through the ingest parser. A line an older build stored that the stricter parser now refuses for invalid UTF-8 is read
+    /// again with the bad bytes replaced (U+FFFD) rather than made to vanish from queries (FC-21).
+    /// </summary>
+    private static bool ParseStored(byte[] raw, out Record? rec)
+    {
+        if (RecordParser.Parse(raw, out rec, out _) == ParseResult.Ok) return true;
+        if (System.Text.Unicode.Utf8.IsValid(raw)) return false;
+        var fixedUp = Encoding.UTF8.GetBytes(Encoding.UTF8.GetString(raw));
+        if (RecordParser.Parse(fixedUp, out rec, out _) != ParseResult.Ok) return false;
+        return true;
+    }
+
     private static Operation? Materialize(SqliteDataReader rd)
     {
         var raw = (byte[])rd["raw"];
-        if (RecordParser.Parse(raw, out var rec, out _) != ParseResult.Ok || rec is not OpRecord op) return null;
+        if (!ParseStored(raw, out var rec) || rec is not OpRecord op) return null;
         op.Ts = rd.GetInt64(1); // the stored ts (clamped at ingest if it was in the future)
         CmdRecord? ctx = null;
-        if (!rd.IsDBNull(9) && RecordParser.Parse((byte[])rd[9], out var c, out _) == ParseResult.Ok) ctx = c as CmdRecord;
+        if (!rd.IsDBNull(9) && ParseStored((byte[])rd[9], out var c)) ctx = c as CmdRecord;
         return new Operation
         {
             Id = rd.GetString(0),
@@ -234,7 +330,7 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
         if (updates.Count == 0) return;
         lock (_writeLock)
         {
-            using var tx = _write.BeginTransaction();
+            using var tx = Begin();
             using var cmd = _write.CreateCommand();
             cmd.CommandText = """
                 UPDATE ops SET reply_count = coalesce($rc, reply_count), alerts = coalesce($alerts, alerts),
@@ -257,7 +353,7 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
                 bytes += cmd.ExecuteNonQuery() * grow;
             }
             tx.Commit();
-            Interlocked.Add(ref _bytes, bytes);
+            Counted(0, bytes);
         }
     }
 
@@ -275,12 +371,21 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
             removed += deleted;
             progress?.Invoke();
         } while (deleted == PruneChunk);
+        // the WAL is disk the 03 §7 bound must count. Up to WalLimit it is working space (journal_size_limit keeps it there);
+        // past that, truncate it, and charge what a busy reader kept us from reclaiming
+        var wal = WalBytes();
+        if (wal > WalLimit)
+        {
+            lock (_writeLock) Exec("PRAGMA wal_checkpoint(TRUNCATE);");
+            wal = Math.Max(0, WalBytes() - WalLimit);
+        }
+        else wal = 0;
         // size bound: oldest first, a proportional estimate at a time (rows differ in size), until it fits
-        while (Interlocked.Read(ref _bytes) > maxBytes && Interlocked.Read(ref _count) > 0)
+        while (Interlocked.Read(ref _bytes) + wal > maxBytes && Interlocked.Read(ref _count) > 0)
         {
             lock (_writeLock)
             {
-                var excess = (double)(_bytes - maxBytes) / _bytes;
+                var excess = (double)(_bytes + wal - maxBytes) / Math.Max(1, _bytes);
                 var n = (int)Math.Clamp(Math.Ceiling(_count * excess), 1, PruneChunk);
                 deleted = Delete("id IN (SELECT id FROM ops ORDER BY id LIMIT $n)", ("$n", n));
             }
@@ -293,21 +398,20 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
         return removed;
     }
 
+    private long WalBytes() => File.Exists(_walFile) ? new FileInfo(_walFile).Length : 0;
+
+    /// <summary>One statement per chunk: RETURNING gives the sizes of the rows it removed, so the subquery runs once (CI-20).</summary>
     private int Delete(string where, params (string Name, object Value)[] ps)
     {
-        using var size = _write.CreateCommand();
-        size.CommandText = $"SELECT count(*), coalesce(sum(size), 0) FROM ops WHERE {where}";
-        foreach (var p in ps) size.Parameters.AddWithValue(p.Name, p.Value);
-        long rows, bytes;
-        using (var rd = size.ExecuteReader()) { rd.Read(); rows = rd.GetInt64(0); bytes = rd.GetInt64(1); }
-        if (rows == 0) return 0;
         using var del = _write.CreateCommand();
-        del.CommandText = $"DELETE FROM ops WHERE {where}";
+        del.CommandText = $"DELETE FROM ops WHERE {where} RETURNING size";
         foreach (var p in ps) del.Parameters.AddWithValue(p.Name, p.Value);
-        var n = del.ExecuteNonQuery();
-        Interlocked.Add(ref _count, -n);
+        long rows = 0, bytes = 0;
+        using (var rd = del.ExecuteReader())
+            while (rd.Read()) { rows++; bytes += rd.GetInt64(0); }
+        Interlocked.Add(ref _count, -rows);
         Interlocked.Add(ref _bytes, -bytes);
-        return n;
+        return (int)rows;
     }
 
     /// <summary>
@@ -334,7 +438,17 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
         get.CommandText = $"SELECT data FROM {table} WHERE shape = $s AND {col} = $k";
         get.Parameters.AddWithValue("$s", shape);
         get.Parameters.AddWithValue("$k", key);
-        var b = get.ExecuteScalar() is byte[] existing ? Decode(existing, shape, key) : new MinuteBucket { ShapeHash = shape, Minute = key };
+        MinuteBucket? b = null;
+        if (get.ExecuteScalar() is byte[] existing)
+        {
+            // FC-7: one row that no longer decodes must not stop every later write: it is replaced by the delta and counted
+            try { b = Decode(existing, shape, key); }
+            catch (Exception)
+            {
+                Interlocked.Increment(ref _undecodable);
+            }
+        }
+        b ??= new MinuteBucket { ShapeHash = shape, Minute = key };
         b.Merge(delta);
         using var put = _write.CreateCommand();
         put.CommandText = $"INSERT OR REPLACE INTO {table} (shape, {col}, data) VALUES ($s, $k, $d)";
@@ -343,6 +457,10 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
         put.Parameters.AddWithValue("$d", Encode(b));
         put.ExecuteNonQuery();
     }
+
+    private long _undecodable;
+    /// <summary>Stored aggregate rows that could not be decoded and were replaced or skipped.</summary>
+    public long UndecodableRows => Interlocked.Read(ref _undecodable);
 
     private static byte[] Encode(MinuteBucket b)
     {
@@ -379,7 +497,10 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
             if (shape != null) cmd.Parameters.AddWithValue("$s", shape);
             using var rd = cmd.ExecuteReader();
             while (rd.Read())
-                list.Add(Decode((byte[])rd[2], rd.GetString(0), rd.GetInt64(1) * scale));
+            {
+                try { list.Add(Decode((byte[])rd[2], rd.GetString(0), rd.GetInt64(1) * scale)); }
+                catch (Exception) { Interlocked.Increment(ref _undecodable); }
+            }
         }
         return list;
     }
@@ -396,7 +517,11 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
                 cmd.CommandText = "SELECT shape, minute, data FROM agg_minute WHERE minute < $c";
                 cmd.Parameters.AddWithValue("$c", cutoff);
                 using var rd = cmd.ExecuteReader();
-                while (rd.Read()) old.Add(Decode((byte[])rd[2], rd.GetString(0), rd.GetInt64(1)));
+                while (rd.Read())
+                {
+                    try { old.Add(Decode((byte[])rd[2], rd.GetString(0), rd.GetInt64(1))); }
+                    catch (Exception) { Interlocked.Increment(ref _undecodable); } // dropped with the rows below
+                }
             }
             using var tx = _write.BeginTransaction();
             foreach (var g in old.GroupBy(b => (b.ShapeHash, Hour: b.Minute / 60)))
@@ -453,7 +578,32 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
         return list;
     }
 
+    public int PruneShapes(long lastSeenBeforeUs)
+    {
+        lock (_writeLock)
+        {
+            using var cmd = _write.CreateCommand();
+            cmd.CommandText = "DELETE FROM shapes WHERE coalesce(json_extract(data, '$.LastSeen'), 0) < $t";
+            cmd.Parameters.AddWithValue("$t", lastSeenBeforeUs);
+            return cmd.ExecuteNonQuery();
+        }
+    }
+
     // ---- alerts ----------------------------------------------------------------------------
+
+    public void Delete(IReadOnlyCollection<string> ids)
+    {
+        if (ids.Count == 0) return;
+        lock (_writeLock)
+        {
+            using var tx = _write.BeginTransaction();
+            using var cmd = _write.CreateCommand();
+            cmd.CommandText = "DELETE FROM alerts WHERE id = $id";
+            var p = cmd.Parameters.Add("$id", SqliteType.Text);
+            foreach (var id in ids) { p.Value = id; cmd.ExecuteNonQuery(); }
+            tx.Commit();
+        }
+    }
 
     public void Upsert(IReadOnlyList<Alert> alerts)
     {
@@ -490,7 +640,7 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
         if (callsites.Count == 0) return;
         lock (_writeLock)
         {
-            using var tx = _write.BeginTransaction();
+            using var tx = Begin();
             foreach (var c in callsites)
             {
                 using var cmd = _write.CreateCommand();
@@ -509,7 +659,7 @@ public sealed class SqliteStore : IOperationStore, IAggregateStore, IAlertStore,
         if (hashes.Count == 0) return;
         lock (_writeLock)
         {
-            using var tx = _write.BeginTransaction();
+            using var tx = Begin();
             using var cmd = _write.CreateCommand();
             cmd.CommandText = "UPDATE callsites SET last_used = $t WHERE hash = $h";
             var h = cmd.Parameters.Add("$h", SqliteType.Text);

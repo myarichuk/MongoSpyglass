@@ -1,5 +1,5 @@
 @page "/shapes"
-@inject Api Api
+@inherits LoadPage
 @inject NavigationManager Nav
 
 <PageTitle>Shapes · Spyglass</PageTitle>
@@ -7,7 +7,7 @@
     <header class="flex flex-wrap items-end gap-2 p-container-padding border-b border-line">
         <h1 class="h mr-4">Shapes</h1>
         <Field Label="range">
-            <select class="input" value="@(Range ?? "1h")" @onchange="e => Go(range: e.Value?.ToString())">
+            <select class="input" value="@TimeRange.Normalize(Range)" @onchange="e => Go(range: e.Value?.ToString())">
                 @foreach (var o in TimeRange.Options) { <option value="@o.Key">@o.Label</option> }
             </select>
         </Field>
@@ -22,6 +22,7 @@
             <button class="btn" type="submit">Apply</button>
         </form>
     </header>
+    <ErrorBanner Error="@Error" OnRetry="Reload" />
     <div class="flex-1 overflow-auto">
         <table class="tbl" aria-label="Shapes">
             <thead><tr>
@@ -33,7 +34,7 @@
                 {
                     <tr data-href="shapes/@s.ShapeHash" tabindex="0" @key="s.ShapeHash" @onclick="() => Open(s.ShapeHash)">
                         <td class="max-w-[38rem] truncate">
-                            <a class="mono" href="shapes/@s.ShapeHash?range=@(Range ?? "1h")" @onclick:stopPropagation>@s.Command @s.Ns</a>
+                            <a class="mono" href="shapes/@s.ShapeHash?range=@TimeRange.Normalize(Range)" @onclick:stopPropagation>@s.Command @s.Ns</a>
                             <span class="mono text-muted ml-2">@Preview(s.Shape)</span>
                         </td>
                         <td class="num">@s.Count</td>
@@ -49,7 +50,8 @@
                 }
             </tbody>
         </table>
-        @if (_loaded && _rows.Length == 0) { <p class="p-container-padding text-muted">No operations in this range.</p> }
+        @if (Loaded && Error == null && _rows.Length == 0) { <p class="p-container-padding text-muted">No operations in this range.</p> }
+        @if (_rows.Length >= Limit) { <p class="p-container-padding text-ui-label-sm text-muted">Showing the top @Limit shapes by this sort; narrow with app or collection to see others.</p> }
     </div>
 </div>
 
@@ -60,16 +62,20 @@
     [SupplyParameterFromQuery] public string? Coll { get; set; }
     private string? _app, _coll;
     private ShapeRow[] _rows = [];
-    private bool _loaded;
+    private const int Limit = 200;
 
-    protected override async Task OnParametersSetAsync()
+    protected override TimeSpan? RefreshEvery => TimeSpan.FromSeconds(15);
+
+    protected override void OnParametersSet() => (_app, _coll) = (App, Coll); // not in LoadAsync: a refresh must not wipe what is being typed
+
+    protected override async Task LoadAsync(CancellationToken ct)
     {
-        (_app, _coll) = (App, Coll);
-        var q = $"{TimeRange.Query(Range)}&sort={Sort ?? "totalTime"}";
+        var q = $"{TimeRange.Query(Range)}&sort={Sort ?? "totalTime"}&limit={Limit}";
         if (!string.IsNullOrWhiteSpace(App)) q += "&app=" + Uri.EscapeDataString(App);
         if (!string.IsNullOrWhiteSpace(Coll)) q += "&coll=" + Uri.EscapeDataString(Coll);
-        _rows = (await Api.Shapes(q))?.Items ?? [];
-        _loaded = true;
+        var page = await Api.Shapes(q, ct);
+        ct.ThrowIfCancellationRequested();
+        _rows = page?.Items ?? [];
     }
 
     /// <summary>The shape minus cmd/db/coll, compact: what makes this shape this shape.</summary>
@@ -87,5 +93,5 @@
         ["app"] = string.IsNullOrWhiteSpace(_app) ? null : _app, ["coll"] = string.IsNullOrWhiteSpace(_coll) ? null : _coll,
     }));
 
-    private void Open(string hash) => Nav.NavigateTo($"shapes/{hash}?range={Range ?? "1h"}");
+    private void Open(string hash) => Nav.NavigateTo($"shapes/{hash}?range={TimeRange.Normalize(Range)}");
 }

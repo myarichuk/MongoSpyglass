@@ -1,0 +1,22 @@
+# Dev laptop: a local mongod (or a docker one) on 27017, the proxy on 27018, the collector from `docker compose up`.
+#
+#   spyglass-proxy --config deploy/examples/proxy.local.yaml
+#   mongosh "mongodb://localhost:27018/?appName=me"
+#
+# No TLS anywhere: everything is on loopback. SPYGLASS_TOKEN must match the collector's.
+
+upstream:
+  uri: "mongodb://localhost:27017/?directConnection=true"
+
+listen:
+  bindAddress: 127.0.0.1
+  advertiseHost: localhost
+  basePort: 27018
+  portRange: [27018, 27040]
+
+capture:
+  values: full              # your own data on your own machine; use truncated or shape anywhere shared
+
+collector:
+  endpoint: "http://localhost:8080/ingest/v0"
+  token: "${SPYGLASS_TOKEN}"

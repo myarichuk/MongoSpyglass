@@ -20,7 +20,13 @@ public static class SrvResolver
     /// <summary>Test hook: nameservers to use instead of /etc/resolv.conf.</summary>
     public static IReadOnlyList<IPEndPoint>? NameserversOverride { get; set; }
 
-    public static async Task<IReadOnlyList<HostPort>> ResolveSeedsAsync(MongoUri uri, CancellationToken ct)
+    /// <summary>Seeds plus the TXT options (lower-case keys) to merge under the URI's own options (01 §5.1 step 1).</summary>
+    public sealed record SrvResult(IReadOnlyList<HostPort> Seeds, IReadOnlyDictionary<string, string> TxtOptions);
+
+    public static async Task<IReadOnlyList<HostPort>> ResolveSeedsAsync(MongoUri uri, CancellationToken ct) =>
+        (await ResolveAsync(uri, ct).ConfigureAwait(false)).Seeds;
+
+    public static async Task<SrvResult> ResolveAsync(MongoUri uri, CancellationToken ct)
     {
         var host = uri.Hosts[0].Host;
         if (host.Count(c => c == '.') < 2)
@@ -41,6 +47,7 @@ public static class SrvResolver
             throw new ConfigException($"no SRV records for _mongodb._tcp.{host}");
 
         var txt = await QueryAsync(host, TypeTxt, ct).ConfigureAwait(false);
+        var options = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var txtRecords = txt.Where(r => r.Type == TypeTxt).ToList();
         if (txtRecords.Count > 1)
             throw new ConfigException($"{host} has more than one TXT record (seedlist spec forbids it)");
@@ -48,7 +55,9 @@ public static class SrvResolver
         {
             foreach (var kv in txtRecords[0].Txt!.Split('&', StringSplitOptions.RemoveEmptyEntries))
             {
-                var key = kv.Split('=')[0].ToLowerInvariant();
+                var eq = kv.IndexOf('=');
+                var key = (eq < 0 ? kv : kv[..eq]).ToLowerInvariant();
+                if (eq >= 0) options[key] = kv[(eq + 1)..];
                 if (key is not ("replicaset" or "authsource" or "loadbalanced"))
                     throw new ConfigException($"TXT option '{key}' for {host} is not allowed (seedlist spec)");
                 if (key == "loadbalanced" && kv.EndsWith("=true", StringComparison.OrdinalIgnoreCase))
@@ -57,7 +66,7 @@ public static class SrvResolver
         }
 
         Log.Info($"SRV {host}: {string.Join(", ", seeds)}");
-        return seeds;
+        return new SrvResult(seeds, options);
     }
 
     internal sealed record Rr(ushort Type, string? SrvTarget, ushort SrvPort, string? Txt);
@@ -79,7 +88,7 @@ public static class SrvResolver
                         response = await TcpAsync(ns, query, ct).ConfigureAwait(false);
                     return Parse(response, id);
                 }
-                catch (Exception e) when (e is SocketException or TimeoutException or FormatException or IOException)
+                catch (Exception e) when (e is SocketException or TimeoutException or FormatException or IOException or ArgumentException)
                 {
                     last = e;
                 }
@@ -192,9 +201,12 @@ public static class SrvResolver
             var rd = p;
             if (type == TypeSrv)
             {
+                if (rdlen < 7) throw new FormatException("short SRV RDATA"); // priority, weight, port, then a name
                 var port = BinaryPrimitives.ReadUInt16BigEndian(m.AsSpan(rd + 4));
                 var q = rd + 6;
-                result.Add(new Rr(type, ReadName(m, ref q), port, null));
+                var target = ReadName(m, ref q);
+                if (q > rd + rdlen) throw new FormatException("SRV target past RDATA");
+                result.Add(new Rr(type, target, port, null));
             }
             else if (type == TypeTxt)
             {

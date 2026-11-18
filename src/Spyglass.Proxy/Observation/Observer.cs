@@ -27,7 +27,12 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
     private readonly string _src;
 
     internal readonly CommandMetrics Commands;
-    private readonly Counter _noSlot, _pendingEvicted, _exportDropped, _tapFault, _observerFault, _uncorrelated;
+    private readonly Counter _noSlot, _queueFull, _pendingEvicted, _exportDropped, _tapFault, _observerFault, _uncorrelated;
+
+    /// <summary>A request (or exhaust stream) with no reply for this long is dropped from the pending table and counted
+    /// <c>pending_evicted</c>: 01 §13's bound on observer memory holds only if nothing waits forever. Set by
+    /// <c>limits.pendingMaxAgeSeconds</c> (default 6 h: index builds, <c>$out</c>, <c>compact</c> and dump-style scans can run for hours).</summary>
+    internal TimeSpan PendingMaxAge { get; set; }
 
     /// <summary>Test hook: every record line, after serialization (headless mode included).</summary>
     internal RecordSink? RecordTap { get; set; }
@@ -36,6 +41,7 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
     {
         _server = server;
         _config = server.Config;
+        PendingMaxAge = TimeSpan.FromSeconds(_config.Limits.PendingMaxAgeSeconds);
         _src = server.ProxyId.ToString();
         var m = server.Metrics;
         _noSlot = m.ObservationDropped.WithLabels("no_slot");
@@ -44,13 +50,19 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
         _tapFault = m.ObservationDropped.WithLabels("tap_fault");
         _observerFault = m.ObservationDropped.WithLabels("observer_fault");
         _uncorrelated = m.UncorrelatedReplies.WithLabels();
-        m.ObservationDropped.WithLabels("queue_full"); // pre-create: the pool bound covers the queue (01 §4)
+        _queueFull = m.ObservationDropped.WithLabels("queue_full");
 
-        _pool = new CapturePool(_config.Capture.CommandBytes, _config.Capture.ReplyBytes, _config.Limits.ObserveQueueBytes);
+        // Replies are scanned, not copied (01 §10); only compression=observe keeps the head of a compressed reply to inflate it.
+        _pool = new CapturePool(_config.Capture.CommandBytes,
+            _config.Compression == CompressionMode.Observe ? _config.Capture.CommandBytes : 0, _config.Limits.ObserveQueueBytes);
         var queueGauge = m.ObserveQueueBytes.WithLabels();
-        m.BeforeScrape += () => queueGauge.Set(_pool.ChargedBytes);
         Commands = new CommandMetrics(m.Registry, _config.Metrics.MaxSeries);
         _cursors = new CursorRegistry(Commands);
+        m.BeforeScrape += () =>
+        {
+            queueGauge.Set(_pool.ChargedBytes);
+            _cursors.SweepMaybe();
+        };
 
         if (_config.Collector.Endpoint != null)
         {
@@ -70,6 +82,7 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
     internal CapturePool Pool => _pool;
     internal CollectorSender? Sender => _sender;
     internal CursorRegistry Cursors => _cursors;
+    internal int WorkerCount => _workers.Length;
 
     public void Start()
     {
@@ -82,12 +95,17 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
     public IFrameTap CreateTap(ConnectionContext conn, bool isRequest) =>
         _pool.Disabled // limits.observeQueueBytes=0: forwarding only, no per-frame work at all
             ? NullTap.Instance
-            : new CaptureTap(conn, isRequest, _pool, this, _noSlot, _tapFault);
+            : new CaptureTap(conn, isRequest, _pool, this, _noSlot, _queueFull, _tapFault);
 
-    public void Opened(ConnectionContext conn) => WorkerFor(conn).Post(new ObserverItem(null, conn, ObserverEvent.Opened));
+    // the event's own time, not the worker's: a conn record's ts is when the connection opened / closed (02 §4.1)
+    public void Opened(ConnectionContext conn) => WorkerFor(conn).Post(new ObserverItem(null, conn, ObserverEvent.Opened, Tick: Stopwatch.GetTimestamp()));
 
     public void Closed(ConnectionContext conn, CloseReason reason, string? detail) =>
-        WorkerFor(conn).Post(new ObserverItem(null, conn, ObserverEvent.Closed, reason, detail));
+        WorkerFor(conn).Post(new ObserverItem(null, conn, ObserverEvent.Closed, reason, detail, Stopwatch.GetTimestamp()));
+
+    /// <summary>A reply that got no capture slot: its header says which pending request it answers (see <see cref="CaptureTap"/>).</summary>
+    internal void PublishUnobservedReply(ConnectionContext conn, int responseTo, int requestId, int opCode, MsgFlags flags) =>
+        WorkerFor(conn).Post(new ObserverItem(null, conn, ObserverEvent.UnobservedReply, ResponseTo: responseTo, RequestId: requestId, Flags: flags, OpCode: opCode));
 
     public void Publish(FrameCapture slot) => WorkerFor(slot.Conn).Post(new ObserverItem(slot, slot.Conn, ObserverEvent.Frame));
 
@@ -95,7 +113,7 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
 
     // ---- records ---------------------------------------------------------------------------
 
-    private byte[] ProxyRecord()
+    internal byte[] ProxyRecord()
     {
         var rw = new RecordWriter();
         var j = rw.Begin("proxy", Clock.NowUnixMicros(), _src);
@@ -115,6 +133,11 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
             j.WriteStartObject();
             j.WriteString("member", mem.Advertised);
             j.WriteString("upstream", mem.Upstream.ToString());
+            if (_server.Upstream.ServerCert(mem.Upstream) is { } sc)
+            {
+                j.WritePropertyName("cert");
+                sc.Write(j);
+            }
             j.WriteEndObject();
         }
         j.WriteEndArray();
@@ -122,8 +145,46 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
         j.WriteString("compression", _config.Compression.ToString().ToLowerInvariant());
         j.WriteString("values", _config.Capture.Values.ToString().ToLowerInvariant());
         j.WriteNumber("commandBytes", _config.Capture.CommandBytes);
+        WriteTlsConfig(j);
         j.WriteEndObject();
         return rw.End().ToArray();
+    }
+
+    /// <summary>config.tls of the proxy record (02 §4.2): the effective TLS setup, never keys or passwords.</summary>
+    private void WriteTlsConfig(System.Text.Json.Utf8JsonWriter j)
+    {
+        var up = _config.Upstream.Tls;
+        var conn = _server.Upstream;
+        j.WriteStartObject("tls");
+        j.WriteStartObject("upstream");
+        j.WriteBoolean("enabled", conn.UsesTls);
+        j.WriteString("trust", conn.TrustMode);
+        if (up.CaFile != null) j.WriteString("caFile", up.CaFile);
+        j.WriteBoolean("allowInvalidHostnames", up.AllowInvalidHostnames);
+        j.WriteString("revocation", up.Revocation.ToString().ToLowerInvariant());
+        if (conn.ClientCert is { } cc)
+        {
+            j.WritePropertyName("clientCert");
+            cc.Write(j);
+        }
+        j.WriteEndObject();
+        j.WriteStartObject("listen");
+        var dtls = _server.DownstreamTls;
+        j.WriteString("mode", dtls != null ? "tls" : "none");
+        if (dtls != null)
+        {
+            j.WriteString("source", dtls.SelfSigned ? "selfSigned" : "file");
+            j.WritePropertyName("cert");
+            dtls.Summary.Write(j);
+        }
+        j.WriteEndObject();
+        var col = _config.Collector;
+        j.WriteStartObject("collector");
+        j.WriteBoolean("https", col.Endpoint?.StartsWith("https://", StringComparison.OrdinalIgnoreCase) == true);
+        j.WriteString("trust", col.AllowInvalidCertificates ? "insecure" : col.CaFile != null ? "caFile" : "system");
+        if (col.CaFile != null) j.WriteString("caFile", col.CaFile);
+        j.WriteEndObject();
+        j.WriteEndObject();
     }
 
     private byte[] StatsRecord()
@@ -132,8 +193,10 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
         var j = rw.Begin("stats", Clock.NowUnixMicros(), _src);
         j.WriteStartObject("dropped");
         j.WriteNumber("no_slot", _noSlot.Value);
-        j.WriteNumber("queue_full", 0);
+        j.WriteNumber("queue_full", _queueFull.Value);
         j.WriteNumber("pending_evicted", _pendingEvicted.Value);
+        j.WriteNumber("tap_fault", _tapFault.Value);
+        j.WriteNumber("observer_fault", _observerFault.Value);
         j.WriteNumber("export", _exportDropped.Value);
         j.WriteEndObject();
         j.WriteStartObject("sent");
@@ -159,6 +222,7 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
         /// <summary>moreToCome streams: next expected responseTo → stream state.</summary>
         public readonly Dictionary<int, StreamState> Streams = new();
         public ClientMetadata? Client;
+        public long OpenedTick;
         public bool OpenEmitted;
         public string App => Client?.Application ?? Client?.Driver ?? "";
     }
@@ -167,6 +231,8 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
     {
         public required RequestInfo Request;
         public int Seq;
+        public long CursorId;  // the cursor this stream reads (0 = none): closed with the connection
+        public long LastTick;  // Stopwatch timestamp of the last reply
     }
 
     private sealed class Worker
@@ -188,11 +254,14 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
         private readonly Dictionary<long, ObservedConnection> _conns = new();
         private readonly RecordWriter _rw = new();
         private readonly RecordBuffer? _out;
+        private readonly RecordBuffer? _connOut; // conn records: a reserved slice that a 429 pause doesn't drop (PLAN 1.2)
         // Per worker: a Regex shared between threads re-creates its runner (and its backtracking stacks)
         // whenever two matches overlap; a private instance reuses one runner forever.
         private readonly RequestParser _parser;
         // Metric children resolved once per label set; the families' params-array/string.Join lookup is not
         // something to pay per op.
+        // Bounded: the keys are raw client-supplied names, and past metrics.maxSeries many of them share one series.
+        private const int MaxCached = 8192;
         private readonly Dictionary<(string, string, string?, string, string), Histogram> _duration = new();
         private readonly Dictionary<(string, string, string?, string), (Histogram Bytes, Histogram Docs)> _sizes = new();
         private readonly Dictionary<(string, string, string?, string, string), Counter> _errors = new();
@@ -202,7 +271,8 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
         {
             _o = o;
             _busy = busy;
-            _out = o._sender?.CreateBuffer();
+            _connOut = o._sender?.CreateBuffer(reserved: true);
+            _out = o._sender?.CreateBuffer(before: _connOut); // conn records ahead of the ops they attribute
             _parser = new RequestParser(new Redactor(o._config.Capture), o._config.Compression);
         }
 
@@ -210,7 +280,8 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
         {
             if (_duration.TryGetValue((cmd, db, coll, app, status), out var h)) return h;
             var cm = _o.Commands;
-            h = cm.Duration.WithLabels(cmd, db, cm.Collection(cm.Duration, cmd, db, coll, app, status), app, status);
+            h = cm.Series(cm.Duration, cmd, db, coll ?? "", app, status);
+            if (_duration.Count >= MaxCached) _duration.Clear();
             return _duration[(cmd, db, coll, app, status)] = h;
         }
 
@@ -218,8 +289,8 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
         {
             if (_sizes.TryGetValue((cmd, db, coll, app), out var s)) return s;
             var cm = _o.Commands;
-            s = (cm.ReplyBytes.WithLabels(cmd, db, cm.Collection(cm.ReplyBytes, cmd, db, coll, app), app),
-                 cm.ReturnedDocuments.WithLabels(cmd, db, cm.Collection(cm.ReturnedDocuments, cmd, db, coll, app), app));
+            s = (cm.Series(cm.ReplyBytes, cmd, db, coll ?? "", app), cm.Series(cm.ReturnedDocuments, cmd, db, coll ?? "", app));
+            if (_sizes.Count >= MaxCached) _sizes.Clear();
             return _sizes[(cmd, db, coll, app)] = s;
         }
 
@@ -227,17 +298,18 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
         {
             if (_errors.TryGetValue((cmd, db, coll, app, codeName), out var c)) return c;
             var cm = _o.Commands;
-            c = cm.Errors.WithLabels(cmd, db, cm.Collection(cm.Errors, cmd, db, coll, app, codeName), app, codeName);
+            c = cm.Series(cm.Errors, cmd, db, coll ?? "", app, codeName);
+            if (_errors.Count >= MaxCached) _errors.Clear();
             return _errors[(cmd, db, coll, app, codeName)] = c;
         }
 
         public Task Completion => _done.Task;
 
-        private void Emit()
+        private void Emit(bool conn = false)
         {
             var line = _rw.End();
             _o.RecordTap?.Invoke(line);
-            _out?.Append(line);
+            (conn ? _connOut : _out)?.Append(line);
         }
 
         public void Start() => new Thread(Loop) { IsBackground = true, Name = "spyglass-observer" }.Start();
@@ -292,6 +364,7 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
                 while (true)
                 {
                     var hadWork = Drain();
+                    SweepStale();
                     if (_completed)
                     {
                         Drain(); // posts that raced with Complete
@@ -304,6 +377,55 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
             {
                 _done.TrySetResult();
             }
+        }
+
+        private long _lastSweep = Stopwatch.GetTimestamp();
+
+        /// <summary>Drops pending requests and exhaust streams that have waited longer than <see cref="PendingMaxAge"/> for a reply.</summary>
+        private void SweepStale()
+        {
+            var now = Stopwatch.GetTimestamp();
+            var maxAge = _o.PendingMaxAge;
+            var every = (long)(Math.Clamp(maxAge.TotalSeconds / 4, 0.01, 30) * Stopwatch.Frequency);
+            if (now - _lastSweep < every) return;
+            _lastSweep = now;
+            var cutoff = now - (long)(maxAge.TotalSeconds * Stopwatch.Frequency);
+            List<int>? stale = null;
+            foreach (var conn in _conns.Values)
+            {
+                if (conn.Pending.Count > 0)
+                {
+                    stale?.Clear();
+                    foreach (var (id, r) in conn.Pending)
+                        if (r.TFirst < cutoff) (stale ??= []).Add(id);
+                    if (stale is { Count: > 0 })
+                        foreach (var id in stale)
+                            if (conn.Pending.Remove(id, out var r))
+                            {
+                                _parser.Return(r);
+                                _o._pendingEvicted.Inc();
+                            }
+                }
+                if (conn.Streams.Count > 0)
+                {
+                    stale?.Clear();
+                    foreach (var (id, st) in conn.Streams)
+                        if (st.LastTick < cutoff) (stale ??= []).Add(id);
+                    if (stale is { Count: > 0 })
+                        foreach (var id in stale)
+                            if (conn.Streams.Remove(id, out var st))
+                            {
+                                CloseStreamCursor(conn, st);
+                                _parser.Return(st.Request);
+                                _o._pendingEvicted.Inc();
+                            }
+                }
+            }
+        }
+
+        private void CloseStreamCursor(ObservedConnection conn, StreamState st)
+        {
+            if (st.CursorId != 0) _o._cursors.Closed(conn.Ctx.Member.Advertised, st.CursorId);
         }
 
         private bool Drain()
@@ -343,10 +465,15 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
             switch (item.Event)
             {
                 case ObserverEvent.Opened:
-                    _conns[item.Conn.ConnSeq] = new ObservedConnection(item.Conn);
+                    _conns[item.Conn.ConnSeq] = new ObservedConnection(item.Conn) { OpenedTick = item.Tick };
                     return;
                 case ObserverEvent.Closed:
-                    OnClosed(item.Conn, item.Reason, item.Detail);
+                    OnClosed(item.Conn, item.Reason, item.Detail, item.Tick);
+                    return;
+                case ObserverEvent.UnobservedReply:
+                    Interlocked.Decrement(ref item.Conn.UnobservedInflight);
+                    if (_conns.TryGetValue(item.Conn.ConnSeq, out var lost))
+                        OnUnobservedReply(lost, item.ResponseTo, item.RequestId, item.Flags, item.OpCode);
                     return;
             }
 
@@ -382,22 +509,58 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
                 _o._pendingEvicted.Inc();
             }
             if (conn.Pending.Remove(req.RequestId, out var reused)) // a client reusing an id it never got a reply for
+            {
                 _parser.Return(reused);
+                _o._pendingEvicted.Inc();
+            }
             conn.Pending[req.RequestId] = req;
+        }
+
+        /// <summary>A reply the tap had no slot for: release what it answers; its facts are lost (counted by the tap).</summary>
+        private void OnUnobservedReply(ObservedConnection conn, int responseTo, int requestId, MsgFlags flags, int opCode)
+        {
+            var moreToCome = (flags & MsgFlags.MoreToCome) != 0 && opCode == OpCodes.Msg;
+            if (conn.Streams.Remove(responseTo, out var stream))
+            {
+                if (moreToCome)
+                {
+                    stream.LastTick = Stopwatch.GetTimestamp();
+                    conn.Streams[requestId] = stream;
+                }
+                else
+                {
+                    CloseStreamCursor(conn, stream);
+                    _parser.Return(stream.Request);
+                }
+                return;
+            }
+            if (!conn.Pending.Remove(responseTo, out var req))
+                return;
+            if (moreToCome)
+                conn.Streams[requestId] = new StreamState { Request = req, Seq = 1, LastTick = Stopwatch.GetTimestamp() };
+            else
+                _parser.Return(req);
         }
 
         private void OnReply(ObservedConnection conn, FrameCapture f)
         {
-            var moreToCome = (f.Flags & MsgFlags.MoreToCome) != 0 && f.OpCode == OpCodes.Msg;
+            if (f.OpCode == OpCodes.Compressed)
+                _parser.ScanCompressedReply(f); // compression=observe: facts and flags from the inflated head
+            var moreToCome = (f.Flags & MsgFlags.MoreToCome) != 0 && f.OpCode is OpCodes.Msg or OpCodes.Compressed;
 
             if (conn.Streams.Remove(f.ResponseTo, out var stream))
             {
                 stream.Seq++;
+                stream.LastTick = f.TLast;
+                if (f.Facts.CursorId is { } sc and not 0) stream.CursorId = sc;
                 if (moreToCome)
                     conn.Streams[f.RequestId] = stream;
                 OnStreamReply(conn, stream, f);
                 if (!moreToCome)
+                {
+                    CloseStreamCursor(conn, stream);
                     _parser.Return(stream.Request); // the stream ended
+                }
                 return;
             }
 
@@ -408,7 +571,7 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
             }
 
             if (moreToCome)
-                conn.Streams[f.RequestId] = new StreamState { Request = req, Seq = 1 };
+                conn.Streams[f.RequestId] = new StreamState { Request = req, Seq = 1, CursorId = f.Facts.CursorId ?? 0, LastTick = f.TLast };
 
             EmitOpenIfNeeded(conn);
             CompleteOp(conn, req, f, status: null, stream: moreToCome);
@@ -416,12 +579,12 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
                 _parser.Return(req); // else the stream holds it
         }
 
-        private void OnClosed(ConnectionContext ctx, CloseReason reason, string? detail)
+        private void OnClosed(ConnectionContext ctx, CloseReason reason, string? detail, long tick)
         {
             if (!_conns.Remove(ctx.ConnSeq, out var conn))
             {
                 // upstream_connect_failed: the connection was never opened for observation
-                conn = new ObservedConnection(ctx);
+                conn = new ObservedConnection(ctx) { OpenedTick = tick };
             }
             EmitOpenIfNeeded(conn);
             foreach (var req in conn.Pending.Values.OrderBy(r => r.TFirst))
@@ -431,18 +594,21 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
             }
             conn.Pending.Clear();
             foreach (var st in conn.Streams.Values)
+            {
+                CloseStreamCursor(conn, st); // an exhaust cursor dies with its connection
                 _parser.Return(st.Request);
+            }
             conn.Streams.Clear();
 
             if (!_o.BuildsRecords) return;
-            var j = _rw.Begin("conn", Clock.NowUnixMicros(), _o._src);
+            var j = _rw.Begin("conn", Clock.ToUnixMicros(tick), _o._src);
             WriteConnFields(j, conn, "close");
             j.WriteString(J.closeReason, reason.Wire());
             if (detail != null && reason == CloseReason.InvalidFrame)
                 j.WriteString(J.invalidHeader, detail);
             j.WriteNumber(J.bytesIn, Volatile.Read(ref ctx.BytesFromClient));
             j.WriteNumber(J.bytesOut, Volatile.Read(ref ctx.BytesFromServer));
-            Emit();
+            Emit(conn: true);
         }
 
         private void EmitOpenIfNeeded(ObservedConnection conn)
@@ -450,9 +616,9 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
             if (conn.OpenEmitted) return;
             conn.OpenEmitted = true;
             if (!_o.BuildsRecords) return;
-            var j = _rw.Begin("conn", Clock.NowUnixMicros(), _o._src);
+            var j = _rw.Begin("conn", Clock.ToUnixMicros(conn.OpenedTick), _o._src);
             WriteConnFields(j, conn, "open");
-            Emit();
+            Emit(conn: true);
         }
 
         private void WriteConnFields(Utf8JsonWriter j, ObservedConnection conn, string ev)
@@ -475,7 +641,7 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
         private void CompleteOp(ObservedConnection conn, RequestInfo req, FrameCapture? reply, string? status, bool stream = false)
         {
             var facts = reply?.Facts;
-            status ??= facts?.Ok == 0 ? "error" : "ok";
+            status ??= IsError(facts) ? "error" : "ok";
             var db = req.Db ?? "";
             var app = conn.App;
             var member = conn.Ctx.Member.Advertised;
@@ -487,7 +653,7 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
                 Duration(req.Command, db, req.Coll, app, status).Observe(Math.Max(0, seconds));
                 var sizes = Sizes(req.Command, db, req.Coll, app);
                 sizes.Bytes.Observe(reply.FrameLength);
-                if (facts!.NReturned is { } nr)
+                if (facts!.NReturned is { } nr && (facts.Parsed || !reply.Truncated)) // a cut-off compressed reply counted only part of its batch
                     sizes.Docs.Observe(nr);
                 if (status == "error")
                 {
@@ -525,7 +691,7 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
             j.WriteEndObject();
 
             if (facts != null)
-                WriteReply(j, facts, req.IsRedactedCommand);
+                WriteReply(j, facts, req.IsRedactedCommand, _parser.Redactor);
 
             j.WriteIfNotNull(J.lsid, req.Lsid);
             j.WriteIfNotNull(J.txnNumber, req.TxnNumber);
@@ -549,7 +715,15 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
             var member = conn.Ctx.Member.Advertised;
             var req = s.Request;
             var app = conn.App;
-            Sizes(req.Command, req.Db ?? "", req.Coll, app).Bytes.Observe(f.FrameLength);
+            var sizes = Sizes(req.Command, req.Db ?? "", req.Coll, app);
+            sizes.Bytes.Observe(f.FrameLength);
+            if (f.Facts.NReturned is { } nr && (f.Facts.Parsed || !f.Truncated))
+                sizes.Docs.Observe(nr);
+            if (IsError(f.Facts))
+            {
+                var codeName = f.Facts.CodeNameLength >= 0 ? _parser.Names.Get(f.Facts.CodeName.AsSpan(0, f.Facts.CodeNameLength)) : f.Facts.Code?.ToString() ?? "";
+                Error(req.Command, req.Db ?? "", req.Coll, app, codeName).Inc();
+            }
             TrackCursors(member, req, f.Facts);
 
             if (!_o.BuildsRecords) return;
@@ -574,8 +748,8 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
             {
                 case "getMore":
                     if (req.GetMoreCursorId is not { } gm) return;
-                    if (facts.Ok == 0 && facts.Code == 43) reg.Closed(member, gm);       // CursorNotFound
-                    else if (facts.CursorId == 0) reg.Closed(member, gm);
+                    // a failed getMore (CursorNotFound, CursorKilled, Interrupted, MaxTimeMSExpired, ...) has killed the cursor
+                    if (IsError(facts) || facts.CursorId == 0) reg.Closed(member, gm);
                     else reg.Touched(member, gm);
                     return;
                 case "killCursors":
@@ -605,7 +779,10 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
             j.WriteString(name, digits[..n]);
         }
 
-        private static void WriteReply(Utf8JsonWriter j, ReplyFacts f, bool authCommand)
+        /// <summary><c>ok</c> is 1 on success; 0, anything else, and a non-number (NaN from a broken upstream) is a failure.</summary>
+        private static bool IsError(ReplyFacts? f) => f?.Ok is { } ok && !(ok >= 1);
+
+        private static void WriteReply(Utf8JsonWriter j, ReplyFacts f, bool authCommand, Redactor redactor)
         {
             j.WriteStartObject(J.reply);
             j.WriteIfNotNull(J.ok, f.Ok);
@@ -617,7 +794,9 @@ internal sealed class Observer : IConnectionObserver, IAsyncDisposable
                 j.WriteEndObject();
                 return;
             }
-            if (f.ErrmsgLength >= 0) j.WriteString(J.errmsg, f.Errmsg.AsSpan(0, f.ErrmsgLength));
+            // server messages embed client values (E11000 dup key: { apiKey: "…" }): same policy as the command body
+            if (f.ErrmsgLength >= 0 && redactor.Mode != ValueMode.Shape)
+                j.WriteString(J.errmsg, redactor.ScrubErrmsg(f.Errmsg.AsSpan(0, f.ErrmsgLength)));
             if (f.CursorId is { } id) WriteInt64String(j, J.cursorId, id);
             j.WriteIfNotNull(J.nReturned, f.NReturned);
             j.WriteIfNotNull(J.n, f.N);

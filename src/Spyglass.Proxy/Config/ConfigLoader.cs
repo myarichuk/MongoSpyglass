@@ -22,6 +22,13 @@ public static class ConfigLoader
         configPath ??= environment.TryGetValue("SPYGLASS_CONFIG", out var p) ? p : null;
 
         var values = new Dictionary<string, (string? Value, string Source)>(StringComparer.OrdinalIgnoreCase);
+        var overrides = new List<string>();
+        void Set(string key, string? value, string source)
+        {
+            if (values.TryGetValue(key, out var old) && old.Value != value && !old.Source.StartsWith("--", StringComparison.Ordinal))
+                overrides.Add($"'{key}' set in {old.Source} is overridden by {source}");
+            values[key] = (value, source);
+        }
 
         if (configPath != null)
         {
@@ -32,18 +39,25 @@ public static class ConfigLoader
                 ? FlattenJson(text)
                 : MiniYaml.Parse(text);
             foreach (var (k, v) in flat)
-                values[k] = (v, configPath);
+                Set(k, v, configPath);
         }
+
+        // A SPYGLASS_* variable the file or a flag references as ${NAME} is a value, not a key (e.g. a keyPassword)
+        var referenced = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var (_, (v, _)) in values)
+            if (v != null) foreach (Match m in Variable.Matches(v)) referenced.Add(m.Groups[1].Value);
+        foreach (var (_, v) in cli)
+            if (v != null) foreach (Match m in Variable.Matches(v)) referenced.Add(m.Groups[1].Value);
 
         foreach (var (k, v) in environment)
         {
-            if (!k.StartsWith("SPYGLASS_", StringComparison.Ordinal) || ExporterOrVariableEnv.Contains(k))
+            if (!k.StartsWith("SPYGLASS_", StringComparison.Ordinal) || ExporterOrVariableEnv.Contains(k) || referenced.Contains(k))
                 continue;
-            values[k["SPYGLASS_".Length..].Replace("__", ".")] = (v, "environment " + k);
+            Set(k["SPYGLASS_".Length..].Replace("__", "."), v, "environment " + k);
         }
 
         foreach (var (k, v) in cli)
-            values[k] = (v, "--" + k);
+            Set(k, v, "--" + k);
 
         var config = new ProxyConfig();
         foreach (var (key, (raw, source)) in values)
@@ -61,7 +75,9 @@ public static class ConfigLoader
             }
         }
 
-        Validate(config);
+        var explicitKeys = new HashSet<string>(values.Where(kv => kv.Value.Value != null).Select(kv => kv.Key), StringComparer.OrdinalIgnoreCase);
+        Validate(config, explicitKeys);
+        config.Overrides.AddRange(overrides);
         return config;
     }
 
@@ -165,6 +181,10 @@ public static class ConfigLoader
             ["upstream.tls.caFile"] = (c, v) => c.Upstream.Tls.CaFile = v,
             ["upstream.tls.allowInvalidCertificates"] = (c, v) => c.Upstream.Tls.AllowInvalidCertificates = Bool(v),
             ["upstream.tls.allowInvalidHostnames"] = (c, v) => c.Upstream.Tls.AllowInvalidHostnames = Bool(v),
+            ["upstream.tls.certFile"] = (c, v) => c.Upstream.Tls.CertFile = v,
+            ["upstream.tls.keyFile"] = (c, v) => c.Upstream.Tls.KeyFile = v,
+            ["upstream.tls.keyPassword"] = (c, v) => c.Upstream.Tls.KeyPassword = v, // ${ENV} expanded like every value; never echoed
+            ["upstream.tls.revocation"] = (c, v) => c.Upstream.Tls.Revocation = Enum<RevocationCheck>(v),
 
             ["listen.bindAddress"] = (c, v) => c.Listen.BindAddress = Required(v),
             ["listen.advertiseHost"] = (c, v) => c.Listen.AdvertiseHost = Required(v),
@@ -179,6 +199,7 @@ public static class ConfigLoader
             ["listen.tls.mode"] = (c, v) => c.Listen.Tls.Mode = Enum<DownstreamTlsMode>(v),
             ["listen.tls.certFile"] = (c, v) => c.Listen.Tls.CertFile = v,
             ["listen.tls.keyFile"] = (c, v) => c.Listen.Tls.KeyFile = v,
+            ["listen.tls.keyPassword"] = (c, v) => c.Listen.Tls.KeyPassword = v,
 
             ["compression"] = (c, v) => c.Compression = Enum<CompressionMode>(v),
 
@@ -197,11 +218,16 @@ public static class ConfigLoader
             ["limits.maxClientConnections"] = (c, v) => c.Limits.MaxClientConnections = Int(v, 1, 1 << 20),
             ["limits.observeQueueBytes"] = (c, v) => c.Limits.ObserveQueueBytes = Long(v, 0), // 0 = observe nothing (forwarding-only A/B runs)
             ["limits.maxPendingPerConnection"] = (c, v) => c.Limits.MaxPendingPerConnection = Int(v, 1, 1 << 20),
+            ["limits.pendingMaxAgeSeconds"] = (c, v) => c.Limits.PendingMaxAgeSeconds = Int(v, 1, 7 * 24 * 3600),
             ["limits.helloRewriteMaxBytes"] = (c, v) => c.Limits.HelloRewriteMaxBytes = Int(v, 4096, 48_000_000),
+            ["limits.helloBufferBytes"] = (c, v) => c.Limits.HelloBufferBytes = Long(v, 4096),
+            ["limits.helloBufferTimeoutMs"] = (c, v) => c.Limits.HelloBufferTimeoutMs = Int(v, 50, 3_600_000),
             ["limits.readBufferBytes"] = (c, v) => c.Limits.ReadBufferBytes = Int(v, 4096, 16 * 1024 * 1024),
 
             ["collector.endpoint"] = (c, v) => c.Collector.Endpoint = HttpUrl(v),
             ["collector.token"] = (c, v) => c.Collector.Token = v,
+            ["collector.caFile"] = (c, v) => c.Collector.CaFile = v,
+            ["collector.allowInvalidCertificates"] = (c, v) => c.Collector.AllowInvalidCertificates = Bool(v),
             ["collector.batchMaxRecords"] = (c, v) => c.Collector.BatchMaxRecords = Int(v, 1, 2000),
             ["collector.batchMaxBytes"] = (c, v) => c.Collector.BatchMaxBytes = Int(v, 4096, 1024 * 1024),
             ["collector.flushIntervalMs"] = (c, v) => c.Collector.FlushIntervalMs = Int(v, 10, 60_000),
@@ -267,7 +293,7 @@ public static class ConfigLoader
 
     // ---- validation ------------------------------------------------------------------------
 
-    private static void Validate(ProxyConfig c)
+    private static void Validate(ProxyConfig c, HashSet<string> explicitKeys)
     {
         if (string.IsNullOrWhiteSpace(c.Upstream.Uri))
             throw new ConfigException("'upstream.uri' is required");
@@ -279,6 +305,9 @@ public static class ConfigLoader
         if (parsed.IsSrv && c.Upstream.Tls.Enabled == TriState.False)
             throw new ConfigException("'upstream.tls.enabled' is false but 'upstream.uri' is mongodb+srv:// (SRV implies TLS)");
 
+        if (parsed.IsSrv && parsed.Tls == false)
+            throw new ConfigException("'upstream.uri' is mongodb+srv:// with tls=false (SRV implies TLS)");
+
         if (!IPAddress.TryParse(c.Listen.BindAddress, out _))
             throw new ConfigException($"'listen.bindAddress' must be an IP address, got '{c.Listen.BindAddress}'");
 
@@ -287,8 +316,13 @@ public static class ConfigLoader
         if (c.Listen.BasePort < c.Listen.PortRangeStart || c.Listen.BasePort > c.Listen.PortRangeEnd)
             throw new ConfigException("'listen.basePort' must lie inside 'listen.portRange'");
 
-        if ((c.Listen.Tls.CertFile == null) != (c.Listen.Tls.KeyFile == null))
-            throw new ConfigException("'listen.tls.certFile' and 'listen.tls.keyFile' must be set together");
+        // keyFile is optional: combined PEM, .pfx/.p12 (01 §2).
+        if (c.Listen.Tls.CertFile == null && (c.Listen.Tls.KeyFile != null || c.Listen.Tls.KeyPassword != null))
+            throw new ConfigException("'listen.tls.keyFile'/'listen.tls.keyPassword' need 'listen.tls.certFile'");
+        if (c.Upstream.Tls.CertFile == null && (c.Upstream.Tls.KeyFile != null || c.Upstream.Tls.KeyPassword != null) && parsed.Option("tlscertificatekeyfile") == null)
+            throw new ConfigException("'upstream.tls.keyFile'/'upstream.tls.keyPassword' need 'upstream.tls.certFile'");
+
+        ApplyUriTlsOptions(c, parsed, explicitKeys);
 
         if (c.Metrics.Bind != null && !IPEndPoint.TryParse(c.Metrics.Bind, out _))
             throw new ConfigException($"'metrics.bind' must be ip:port, got '{c.Metrics.Bind}'");
@@ -297,14 +331,57 @@ public static class ConfigLoader
             throw new ConfigException("'collector.batchMaxBytes' must not exceed 'collector.bufferBytes'");
     }
 
+    /// <summary>
+    /// Driver TLS options in the URI fill unset <c>upstream.tls.*</c> keys (01 §2); an explicit key wins and a
+    /// different URI value is reported as a startup warning.
+    /// </summary>
+    private static void ApplyUriTlsOptions(ProxyConfig c, MongoUri uri, HashSet<string> explicitKeys)
+    {
+        var t = c.Upstream.Tls;
+        void Str(string opt, string key, Func<string?> get, Action<string> set)
+        {
+            if (uri.Option(opt) is not { Length: > 0 } v) return;
+            if (!explicitKeys.Contains(key)) set(v);
+            else if (get() != v)
+                c.LoadWarnings.Add($"upstream.uri option {opt} conflicts with '{key}': using '{key}'");
+        }
+        void Flag(string opt, string key, Func<bool> get, Action<bool> set)
+        {
+            if (uri.Option(opt) is not { } raw) return;
+            var v = raw.Equals("true", StringComparison.OrdinalIgnoreCase);
+            if (!explicitKeys.Contains(key)) set(v);
+            else if (get() != v)
+                c.LoadWarnings.Add($"upstream.uri option {opt}={raw} conflicts with '{key}': using '{key}'");
+        }
+        Str("tlscafile", "upstream.tls.caFile", () => t.CaFile, v => t.CaFile = v);
+        Str("tlscertificatekeyfile", "upstream.tls.certFile", () => t.CertFile, v => t.CertFile = v);
+        Str("tlscertificatekeyfilepassword", "upstream.tls.keyPassword", () => t.KeyPassword, v => t.KeyPassword = v);
+        Flag("tlsallowinvalidcertificates", "upstream.tls.allowInvalidCertificates", () => t.AllowInvalidCertificates, v => t.AllowInvalidCertificates = v);
+        Flag("tlsallowinvalidhostnames", "upstream.tls.allowInvalidHostnames", () => t.AllowInvalidHostnames, v => t.AllowInvalidHostnames = v);
+        if (uri.Option("tlsinsecure") != null)
+        {
+            Flag("tlsinsecure", "upstream.tls.allowInvalidCertificates", () => t.AllowInvalidCertificates, v => t.AllowInvalidCertificates = v);
+            Flag("tlsinsecure", "upstream.tls.allowInvalidHostnames", () => t.AllowInvalidHostnames, v => t.AllowInvalidHostnames = v);
+        }
+        // tlsDisableOCSPEndpointCheck / tlsDisableCertificateRevocationCheck: accepted; revocation defaults to none.
+    }
+
     /// <summary>Warnings that do not stop startup (01 §2).</summary>
     public static IEnumerable<string> Warnings(ProxyConfig c)
     {
         if (IPAddress.TryParse(c.Listen.BindAddress, out var ip) && !IPAddress.IsLoopback(ip) && c.Listen.Tls.Mode == DownstreamTlsMode.None)
             yield return $"listen.bindAddress={c.Listen.BindAddress} with listen.tls.mode=none: client traffic, including credentials exchanged during authentication, is plaintext on the network";
+        foreach (var o in c.Overrides)
+            yield return o;
+        if (c.Limits.HelloBufferBytes < c.Limits.HelloRewriteMaxBytes)
+            yield return $"limits.helloBufferBytes ({c.Limits.HelloBufferBytes}) is below limits.helloRewriteMaxBytes ({c.Limits.HelloRewriteMaxBytes}): large hello replies are passed through unrewritten";
         if (c.Upstream.Tls.AllowInvalidCertificates)
             yield return "upstream.tls.allowInvalidCertificates=true: upstream certificates are not validated";
         if (c.Upstream.Tls.AllowInvalidHostnames)
             yield return "upstream.tls.allowInvalidHostnames=true: upstream certificate hostnames are not checked";
+        if (c.Collector.AllowInvalidCertificates)
+            yield return "collector.allowInvalidCertificates=true: the collector's certificate is not validated";
+        foreach (var w in c.LoadWarnings)
+            yield return w;
     }
 }

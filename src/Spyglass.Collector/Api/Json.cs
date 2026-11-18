@@ -106,7 +106,7 @@ public static class Json
     }
 
     /// <summary><c>/ops/{id}</c>: everything, the command as shell-syntax EJSON, the timing waterfall.</summary>
-    public static void OpDetail(Utf8JsonWriter w, Operation o, CursorInfo? cursor, CallsiteRecord? callsite = null)
+    public static void OpDetail(Utf8JsonWriter w, Operation o, CursorInfo? cursor, CallsiteRecord? callsite = null, string? shapeJson = null)
     {
         var r = o.Op;
         w.WriteStartObject();
@@ -158,7 +158,7 @@ public static class Json
         Opt(w, "comment", r.Comment);
         w.WriteString("shapeHash", o.ShapeHash);
         Opt(w, "valueHash", o.ValueHash);
-        if (o.ShapeJson != null) { w.WritePropertyName("shape"); w.WriteRawValue(o.ShapeJson); }
+        if ((shapeJson ?? o.ShapeJson) is { } sj) { w.WritePropertyName("shape"); w.WriteRawValue(sj); }
         if (r.Cmd != null)
         {
             string ejson;

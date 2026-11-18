@@ -1,0 +1,17 @@
+@* A certificate's validity as a badge: ok, warn under 14 days or not yet valid, bad once expired (the proxy's CERT, 02 §4.2). *@
+@if (Cert.ValueKind == JsonValueKind.Object && Cert.TryGetProperty("notAfter", out var na) && na.TryGetInt64(out var after))
+{
+    var now = Fmt.NowUs();
+    var left = after - now;
+    var notYet = Cert.TryGetProperty("notBefore", out var nb) && nb.TryGetInt64(out var before) && before > now;
+    var (css, text) = left < 0 ? ("bg-bad/15 text-bad", $"expired {Fmt.Ago(after, now)} ago")
+        : notYet ? ("bg-warn/15 text-warn", "not yet valid")
+        : left < WarnUs ? ("bg-warn/15 text-warn", $"expires in {Fmt.Ago(now - left, now)}")
+        : ("bg-ok/15 text-ok", $"valid until {Fmt.Time(after):yyyy-MM-dd}");
+    <span class="badge @css" title="@Fmt.Stamp(after)">@text</span>
+}
+@code {
+    /// <summary>Warn under 14 days (the proxy's and collector's own startup warning).</summary>
+    private const long WarnUs = 14L * 86_400_000_000;
+    [Parameter] public JsonElement Cert { get; set; }
+}

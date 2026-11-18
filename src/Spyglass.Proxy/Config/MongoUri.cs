@@ -16,10 +16,18 @@ public sealed record MongoUri(
 {
     public string? ReplicaSet => Options.GetValueOrDefault("replicaset");
 
+    /// <summary>tls/ssl; absent, any other TLS option (tlsCAFile, ...) implies true, as in the drivers' connection-string spec.</summary>
     public bool? Tls =>
         Options.TryGetValue("tls", out var t) || Options.TryGetValue("ssl", out t)
             ? t.Equals("true", StringComparison.OrdinalIgnoreCase)
-            : null;
+            : ImpliesTls ? true : null;
+
+    private bool ImpliesTls =>
+        Options.ContainsKey("tlscafile") || Options.ContainsKey("tlscertificatekeyfile") ||
+        Options.ContainsKey("tlsallowinvalidcertificates") || Options.ContainsKey("tlsallowinvalidhostnames") ||
+        Options.ContainsKey("tlsinsecure");
+
+    public string? Option(string lowerName) => Options.GetValueOrDefault(lowerName);
 
     public bool DirectConnection => Options.GetValueOrDefault("directconnection") is { } d && d.Equals("true", StringComparison.OrdinalIgnoreCase);
 

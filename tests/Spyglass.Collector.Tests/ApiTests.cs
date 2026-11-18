@@ -140,7 +140,7 @@ public sealed class ApiTests : IAsyncLifetime
         await Ingest(Op(100, "find", new BsonDocument { ["find"] = "orders", ["filter"] = new BsonDocument("customerId", 1) }, latencyUs: 400_000));
         var after = (await Get("/api/v1/alerts")).GetProperty("items").EnumerateArray().Single(a => a.GetProperty("id").GetString() == id);
         Assert.True(after.GetProperty("muted").GetBoolean());
-        Assert.Equal(1, after.GetProperty("occurrences").GetInt64());
+        Assert.Equal(2, after.GetProperty("occurrences").GetInt64()); // a muted alert is silent, not frozen
     }
 
     [Fact]

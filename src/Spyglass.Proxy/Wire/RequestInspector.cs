@@ -38,19 +38,11 @@ public static class RequestInspector
     /// <summary>First element name of the first kind-0 section, if it lies within <paramref name="frame"/>.</summary>
     public static ReadOnlySpan<byte> MsgCommandName(ReadOnlySpan<byte> frame)
     {
-        // header(16) flags(4) kind(1) docLen(4) type(1) name\0
-        var p = FrameHeader.Size + 4;
-        while (p < frame.Length)
-        {
-            var kind = frame[p];
-            if (kind == 0)
-                return FirstElementName(frame[(p + 1)..], out _);
-            if (kind != 1 || p + 5 > frame.Length)
-                return default;
-            var size = BinaryPrimitives.ReadInt32LittleEndian(frame[(p + 1)..]);
-            if (size < 4) return default;
-            p += 1 + size;
-        }
+        // header(16) flags(4) kind(1) docLen(4) type(1) name\0 — the first kind-0 section, skipping kind-1 ones (overflow-safe)
+        var sections = MsgSections.Of(frame, complete: false);
+        while (sections.MoveNext())
+            if (sections.Kind == 0)
+                return FirstElementName(sections.Payload, out _);
         return default;
     }
 

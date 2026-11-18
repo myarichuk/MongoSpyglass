@@ -15,8 +15,19 @@ catch (ArgumentException e)
     return 2;
 }
 
+foreach (var w in options.Warnings) Console.Error.WriteLine($"spyglass-collector: warning: {w}");
 var ui = Path.Combine(AppContext.BaseDirectory, "wwwroot");
-await using var server = await Server.StartAsync(options, Directory.Exists(ui) ? ui : null);
+Server server;
+try
+{
+    server = await Server.StartAsync(options, Directory.Exists(ui) ? ui : null); // a bad TLS file is reported here
+}
+catch (ArgumentException e)
+{
+    Console.Error.WriteLine($"spyglass-collector: {e.Message}");
+    return 2;
+}
+await using var serverScope = server;
 Console.WriteLine($"spyglass-collector {typeof(Server).Assembly.GetName().Version?.ToString(3)} listening on {server.BaseAddress} " +
                   $"(auth={options.Auth.ToString().ToLowerInvariant()}, data={options.Data ?? ":memory:"}, workers={options.Workers})");
 

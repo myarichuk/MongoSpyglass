@@ -44,6 +44,11 @@ public sealed class Collector : IAsyncDisposable
     public IAggregateStore Aggregates { get; }
     public IAlertStore AlertStore { get; }
     public Func<long> NowUs { get; }
+    /// <summary>
+    /// The join's clock (02 §6.2: windows are durations): monotonic, so an NTP step or a VM resume neither stalls nor fires
+    /// expiry. An injected <c>nowUs</c> (tests) drives both clocks.
+    /// </summary>
+    public Func<long> MonoUs { get; }
 
     // self-telemetry (03 §8 /metrics)
     public long RecordsAccepted, RecordsRejected, RecordsIgnored, RedactionRejected, ClockSkewed, ContextRecords;
@@ -64,13 +69,26 @@ public sealed class Collector : IAsyncDisposable
         AlertStore = alerts;
         Callsites = callsites ?? ops as ICallsiteStore ?? new MemoryStore();
         NowUs = nowUs ?? (() => (DateTime.UtcNow - DateTime.UnixEpoch).Ticks / 10);
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        MonoUs = nowUs ?? (() => 1_000_000_000L + System.Diagnostics.Stopwatch.GetElapsedTime(started).Ticks / 10);
         Live = new LiveHub(options.LiveBuffer);
         _writer = new StorageWriter(ops, aggregates, Callsites, options, NowUs, Live);
         _analysis = new AnalysisStage(options, _writer, aggregates, alerts, ops, Live, Producers, Release, NowUs);
         _partitions = new Partition[options.Workers];
         for (var i = 0; i < _partitions.Length; i++)
-            _partitions[i] = new Partition(options, Connections, Producers, Join, _analysis.Post, Release, NowUs, ExportersActive);
-        _sweep = new Timer(_ => Connections.Sweep(), null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
+            _partitions[i] = new Partition(options, Connections, Producers, Join, _analysis.Post, Release, MonoUs, ExportersActive);
+        _sweep = new Timer(_ => Sweep(), null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
+    }
+
+    /// <summary>Every 30 s: closed and idle connections (PLAN 1.2), idle producers and what hangs off them.</summary>
+    private void Sweep()
+    {
+        try
+        {
+            foreach (var src in Producers.Sweep(NowUs())) Connections.DropProxy(src);
+            Connections.Sweep();
+        }
+        catch (Exception e) { Console.Error.WriteLine($"sweep: {e.GetType().Name}: {e.Message}"); }
     }
 
     internal AnalysisStage Analysis => _analysis;
@@ -80,9 +98,22 @@ public sealed class Collector : IAsyncDisposable
 
     public void Start()
     {
+        Console.Error.WriteLine(WorstCase());
         _writer.Start();
         _analysis.Start();
         for (var i = 0; i < _partitions.Length; i++) _partitions[i].Start(i);
+    }
+
+    /// <summary>03 §11: the memory the configured bounds allow, logged at startup. Op lines are bounded by the command size cap plus the envelope.</summary>
+    internal string WorstCase()
+    {
+        const long OpLine = 24 * 1024; // 16 KiB command default + reply, context and envelope
+        var waiting = ((long)Options.JoinMaxWaitingOps + Options.JoinMaxWaitingCmds) * OpLine;
+        var backlog = (long)StorageWriter.HardCapacity * OpLine;
+        var total = Options.QueueBytes + waiting + backlog;
+        return $"memory worst case ~{total / 1048576} MiB: ingest queue {Options.QueueBytes / 1048576} MiB + join waiting " +
+               $"{waiting / 1048576} MiB ({Options.JoinMaxWaitingOps} ops, {Options.JoinMaxWaitingCmds} cmds) + storage backlog {backlog / 1048576} MiB " +
+               $"({StorageWriter.HardCapacity} ops) at ~{OpLine / 1024} KiB per op; typical ops are far smaller";
     }
 
     private void Release(long bytes) => Interlocked.Add(ref _charged, -bytes);
@@ -95,19 +126,17 @@ public sealed class Collector : IAsyncDisposable
         if (contentEncoding is not { } enc || !enc.Contains("gzip", StringComparison.OrdinalIgnoreCase))
             return IngestPlain(body, producerHeader);
         var pool = System.Buffers.ArrayPool<byte>.Shared;
-        byte[] compressed = pool.Rent(body.Length), inflated = pool.Rent(MaxBatchBytes + 1); // pooled: Ingest copies what it keeps
+        var inflated = pool.Rent(MaxBatchBytes + 1); // pooled: Ingest copies what it keeps
         try
         {
-            body.CopyTo(compressed);
             int n;
-            try { n = Gunzip(compressed.AsSpan(0, body.Length), inflated); }
+            try { n = Gunzip(body, inflated); }
             catch (InvalidDataException) { Interlocked.Increment(ref Batches400); return new IngestResult(400, 0, 0, 0, "bad gzip"); }
             if (n > MaxBatchBytes) { Interlocked.Increment(ref Batches413); return new IngestResult(413, 0, 0, 0, "batch over 1 MiB uncompressed"); }
             return IngestPlain(inflated.AsSpan(0, n), producerHeader);
         }
         finally
         {
-            pool.Return(compressed);
             pool.Return(inflated);
         }
     }
@@ -119,7 +148,9 @@ public sealed class Collector : IAsyncDisposable
         if (Volatile.Read(ref _charged) > Options.QueueBytes * 9 / 10) { Interlocked.Increment(ref Batches429); return new IngestResult(429, 0, 0, 0, "ingest queue above 90%"); }
 
         var now = NowUs();
+        var mono = MonoUs();
         var maxTs = now + (long)Options.MaxFutureSkew.TotalMicroseconds;
+        var minTs = now - (long)Options.OpRetention.TotalMicroseconds; // older would be pruned at once; a negative ts would sort last in ids (CI-9)
         int accepted = 0, rejected = 0, ignored = 0, syntax = 0;
         var perPartition = new List<Record>?[_partitions.Length]; // one hand-off per partition per POST
         // Shared counters are written once per POST, not per record: the ingest thread writing a line per record that
@@ -150,8 +181,9 @@ public sealed class Collector : IAsyncDisposable
                 producerRecords = 0;
             }
             producerRecords++;
-            if (r.Ts > maxTs) // 03 §2: clamp, count per src
+            if (r.Ts > maxTs || r.Ts < minTs) // 03 §2: clamp, count per src
             {
+                r.OriginalTs = r.Ts; // a resend carries the same ts: dedup keys on it, not on the clamped value (FC-8)
                 r.Ts = now;
                 Interlocked.Increment(ref producer!.ClockSkewed);
                 Interlocked.Increment(ref ClockSkewed);
@@ -163,7 +195,7 @@ public sealed class Collector : IAsyncDisposable
                 Interlocked.Increment(ref RedactionRejected);
                 continue;
             }
-            charged += Route(r, perPartition, now);
+            charged += Route(r, perPartition, mono);
             accepted++;
         }
         if (producer != null) Interlocked.Add(ref producer.Records, producerRecords);
@@ -189,7 +221,10 @@ public sealed class Collector : IAsyncDisposable
         {
             case ConnRecord c: Connections.Apply(c); return 0;
             case ProxyRecord p: Producers.Apply(p); return 0;
-            case StatsRecord s: Producers.Apply(s); return 0;
+            case StatsRecord s:
+                Producers.Apply(s);
+                if (Producers.Get(s.Src) is { Kind: not "proxy" }) ContextSeen(now); // 02 §6.2: any exporter record shows it is alive
+                return 0;
             case CmdRecord c:
             {
                 ContextSeen(now);
@@ -212,12 +247,15 @@ public sealed class Collector : IAsyncDisposable
                 ContextSeen(now);
                 _writer.Enqueue(cs);
                 return 0;
-            case ContextRecord: Interlocked.Increment(ref ContextRecords); return 0; // uow, pool: M3 (03 §5.3)
+            case ContextRecord:
+                ContextSeen(now);
+                Interlocked.Increment(ref ContextRecords); // uow, pool: M3 (03 §5.3)
+                return 0;
             case OpRecord op:
-                (perPartition[PartitionFor(op.Src, op.Member, op.ServerConnectionId ?? -op.ConnSeq)] ??= []).Add(op);
+                (perPartition[PartitionFor(op.Src, op.Member, op.RouteSid)] ??= []).Add(op);
                 return op.Size;
             case StreamRecord s:
-                (perPartition[PartitionFor(s.Src, s.Member, s.ServerConnectionId ?? -1)] ??= []).Add(s);
+                (perPartition[PartitionFor(s.Src, s.Member, s.RouteSid)] ??= []).Add(s);
                 return s.Size;
             default: return 0;
         }
@@ -270,7 +308,8 @@ public sealed class Collector : IAsyncDisposable
         await _writer.Barrier().ConfigureAwait(false);
     }
 
-    public HealthReport Health()
+    /// <param name="detail">Include exception text (file paths, keys, SQLite messages): only for an authenticated caller; <c>/healthz</c> is served without auth (03 §8, FC-18).</param>
+    public HealthReport Health(bool detail = true)
     {
         var now = Environment.TickCount64;
         var checks = new List<HealthCheck>();
@@ -282,8 +321,13 @@ public sealed class Collector : IAsyncDisposable
         Stage("analysis", _analysis.Alive, _analysis.LastBeat, Options.HealthStageStall);
         Stage("storage-writer", _writer.Alive, _writer.LastBeat, Options.HealthWriterStall);
         var failing = Volatile.Read(ref _writer.FailingSince);
+        var lastError = _writer.LastError;
+        var aFailing = Volatile.Read(ref _analysis.StoreFailingSince); // aggregate/alert flushes run on the analysis thread
+        if (aFailing != 0 && (failing == 0 || aFailing < failing)) { failing = aFailing; lastError = _analysis.LastStoreError; }
         checks.Add(new HealthCheck("storage", failing == 0 || now - failing < Options.HealthStorageFailing.TotalMilliseconds, true,
-            failing == 0 ? "writes succeeding" : $"writes failing for {(now - failing) / 1000.0:F0} s: {_writer.LastError}"));
+            failing == 0 ? "writes succeeding" : $"writes failing for {(now - failing) / 1000.0:F0} s" + (detail ? $": {lastError}" : "")));
+        checks.Add(new HealthCheck("analysis-errors", true, false,
+            $"{Volatile.Read(ref _analysis.Errors)} exceptions isolated" + (detail && _analysis.LastError is { } le ? $", last: {le}" : "")));
         var queued = QueuedBytes;
         checks.Add(new HealthCheck("ingest-queue", queued <= Options.QueueBytes * 9 / 10, false,
             $"{queued * 100.0 / Options.QueueBytes:F1} % of {Options.QueueBytes / 1048576} MiB (429 above 90 %)"));
@@ -309,7 +353,7 @@ public sealed class Collector : IAsyncDisposable
         M("spyglass_collector_ingest_batches_total", "counter", "Ingest POSTs by response.",
             ("status=\"204\"", Batches2xx), ("status=\"400\"", Batches400), ("status=\"413\"", Batches413), ("status=\"429\"", Batches429));
         M("spyglass_collector_ingest_queue_bytes", "gauge", "Records ingested and not yet analysed (03 §1 bound).", ("", QueuedBytes));
-        M("spyglass_collector_clock_skew_total", "counter", "Records whose ts was more than 5 min ahead and was clamped.", ("", ClockSkewed));
+        M("spyglass_collector_clock_skew_total", "counter", "Records whose ts was more than 5 min ahead (or older than the op retention) and was clamped.", ("", ClockSkewed));
         M("spyglass_collector_duplicates_total", "counter", "Records suppressed as duplicates (02 §6.4).", ("", _partitions.Sum(p => p.Duplicates)));
         M("spyglass_collector_decode_failures_total", "counter", "op records whose cmd was not decodable BSON.", ("", _partitions.Sum(p => p.DecodeFailures)));
         var j = Join;
@@ -325,8 +369,20 @@ public sealed class Collector : IAsyncDisposable
         M("spyglass_collector_ops_analysed_total", "counter", "Operations through the analysis stage.", ("", _analysis.Processed));
         M("spyglass_collector_ops_stored_total", "counter", "Operations written to the store.", ("", _writer.Written));
         M("spyglass_collector_ops_sampled_out_total", "counter", "Operations not stored under write backpressure (03 §7).", ("", _writer.Sampled));
+        M("spyglass_collector_storage_dropped_total", "counter", "Records lost before storage: failed writes after retries, or over the backlog or pending-update bounds (late context included).",
+            ("kind=\"op\"", _writer.WriteDropped), ("kind=\"op_overflow\"", _writer.Overflowed), ("kind=\"update\"", _writer.UpdatesDropped),
+            ("kind=\"callsite\"", _writer.CallsitesDropped));
+        M("spyglass_collector_storage_write_retries_total", "counter", "Failed storage writes that were retried.", ("", _writer.Retries));
+        M("spyglass_collector_connections", "gauge", "Connections held in the registry.", ("", Connections.Count));
+        M("spyglass_collector_connections_evicted_total", "counter", "Connections dropped as idle or over the cap, without a close record.", ("", Connections.Evicted));
+        M("spyglass_collector_producers", "gauge", "Producers held in the registry.", ("", Producers.Count));
+        M("spyglass_collector_producers_expired_total", "counter", "Producers dropped as idle or over the cap.", ("", Producers.Expired));
         M("spyglass_collector_ops_pruned_total", "counter", "Operations removed by retention.", ("", _writer.Pruned));
         M("spyglass_collector_storage_backlog", "gauge", "Operations waiting to be written.", ("", _writer.Backlog));
+        M("spyglass_collector_aggregate_deltas_dropped_total", "counter", "Aggregate minute deltas dropped (oldest first) while the store kept failing.", ("", _analysis.Aggregates.DeltasDropped));
+        M("spyglass_collector_analysis_errors_total", "counter", "Exceptions caught and isolated in the analysis stage.", ("", Volatile.Read(ref _analysis.Errors)));
+        M("spyglass_collector_shapes", "gauge", "Shapes in the analysis catalog (03 §5: bounded).", ("", Volatile.Read(ref _analysis.ShapesTracked)));
+        M("spyglass_collector_shapes_evicted_total", "counter", "Shapes dropped from the catalog (retention or the cap).", ("", Volatile.Read(ref _analysis.ShapesEvicted)));
         M("spyglass_collector_cursors_open", "gauge", "Server cursors tracked as open (03 §5.4).", ("", _analysis.OpenCursors.Length));
         M("spyglass_collector_alerts_open", "gauge", "Open alerts.", ("", _analysis.Alerts.Snapshot().Count(a => a.Open)));
         M("spyglass_collector_live_subscribers", "gauge", "SSE subscribers.", ("", Live.Subscribers));

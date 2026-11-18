@@ -121,7 +121,7 @@ internal static class JsonExtensions
 
     public static void WriteIfNotNull(this Utf8JsonWriter w, JsonEncodedText name, double? value)
     {
-        if (value is { } v) w.WriteNumber(name, v);
+        if (value is { } v && double.IsFinite(v)) w.WriteNumber(name, v); // JSON has no NaN/Infinity: the writer throws
     }
 
     public static void WriteIfNonZero(this Utf8JsonWriter w, JsonEncodedText name, long value)

@@ -17,7 +17,18 @@ public sealed class CollectorOptions
     public bool IngestInsecure { get; set; }
     public AuthMode Auth { get; set; } = AuthMode.Password;
     public string? AdminPassword { get; set; }
+    /// <summary>HTTPS on <see cref="Bind"/> (03 §9): a PEM certificate (+ key), or a .pfx/.p12. Null serves plain HTTP.</summary>
+    public string? TlsCert { get; set; }
+    public string? TlsKey { get; set; }
+    public string? TlsKeyPassword { get; set; }
     public string AuthHeader { get; set; } = "X-Forwarded-User";
+    /// <summary>
+    /// Peers (CIDRs or single addresses) whose <c>X-Forwarded-User</c> (header auth) and <c>X-Forwarded-Proto</c> (session
+    /// cookie <c>Secure</c>) are believed (03 §9). Loopback by default: the reverse proxy on the same host.
+    /// </summary>
+    public IReadOnlyList<IPNetwork> TrustedProxies { get; set; } = [new(IPAddress.Loopback, 8), new(IPAddress.IPv6Loopback, 128)];
+    /// <summary>Non-fatal findings from <see cref="Load"/> (unknown settings), for the caller to print.</summary>
+    public List<string> Warnings { get; } = [];
     /// <summary>SQLite file directory; null keeps everything in memory (tests).</summary>
     public string? Data { get; set; } = "/data";
 
@@ -69,6 +80,8 @@ public sealed class CollectorOptions
         }
 
         var o = new CollectorOptions();
+        AuthMode? auth = null;
+        string? authHeader = null;
         foreach (var (k, v) in values)
         {
             switch (k.ToLowerInvariant())
@@ -76,7 +89,7 @@ public sealed class CollectorOptions
                 case "bind": o.Bind = IPEndPoint.Parse(v); break;
                 case "token": o.Token = v; break;
                 case "ingestinsecure": o.IngestInsecure = v is "1" or "true"; break;
-                case "auth": o.Auth = v.ToLowerInvariant() switch
+                case "auth": auth = v.ToLowerInvariant() switch
                 {
                     "password" => AuthMode.Password,
                     "header" => AuthMode.Header,
@@ -85,7 +98,11 @@ public sealed class CollectorOptions
                 };
                     break;
                 case "adminpassword": o.AdminPassword = v; break;
-                case "authheader": o.AuthHeader = v; o.Auth = AuthMode.Header; break;
+                case "tlscert": o.TlsCert = v is "" ? null : v; break;
+                case "tlskey": o.TlsKey = v is "" ? null : v; break;
+                case "tlskeypassword": o.TlsKeyPassword = v is "" ? null : v; break;
+                case "authheader": authHeader = v; break;
+                case "trustedproxies" or "authheadertrustedproxies": o.TrustedProxies = ParseNetworks(v); break;
                 case "data": o.Data = v is "" or ":memory:" ? null : v; break;
                 case "queuebytes": o.QueueBytes = long.Parse(v, CultureInfo.InvariantCulture); break;
                 case "maxbodybytes": o.MaxBodyBytes = int.Parse(v, CultureInfo.InvariantCulture); break;
@@ -94,21 +111,50 @@ public sealed class CollectorOptions
                 case "opstorebytes": o.OpStoreBytes = long.Parse(v, CultureInfo.InvariantCulture); break;
                 case "cursortimeoutseconds": o.CursorTimeout = TimeSpan.FromSeconds(double.Parse(v, CultureInfo.InvariantCulture)); break;
                 case "slowshapems": o.SlowShapeUs = (long)(double.Parse(v, CultureInfo.InvariantCulture) * 1000); break;
-                default: throw new ArgumentException($"unknown setting '{k}'");
+                // the proxy and the exporters read SPYGLASS_* from the same env file (SPYGLASS_UPSTREAM__URI, SPYGLASS_INGEST…)
+                default: o.Warnings.Add($"ignoring unknown setting '{k}'"); break;
             }
         }
+        // 03 §9: SPYGLASS_AUTH_HEADER alone selects header auth; with SPYGLASS_AUTH it must agree (no order-dependent result)
+        if (authHeader != null)
+        {
+            if (auth is { } a && a != AuthMode.Header)
+                throw new ArgumentException($"SPYGLASS_AUTH_HEADER is set, which means SPYGLASS_AUTH=header, but SPYGLASS_AUTH={a.ToString().ToLowerInvariant()}");
+            o.AuthHeader = authHeader;
+            auth = AuthMode.Header;
+        }
+        if (auth is { } mode) o.Auth = mode;
         Validate(o);
         return o;
     }
 
+    /// <summary>Comma-separated CIDRs or single addresses.</summary>
+    private static IPNetwork[] ParseNetworks(string v)
+    {
+        var list = new List<IPNetwork>();
+        foreach (var part in v.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (IPNetwork.TryParse(part, out var net)) list.Add(net);
+            else if (IPAddress.TryParse(part, out var ip)) list.Add(new IPNetwork(ip, ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork ? 32 : 128));
+            else throw new ArgumentException($"SPYGLASS_TRUSTED_PROXIES: '{part}' is not a CIDR or an address");
+        }
+        return [.. list];
+    }
+
     public static void Validate(CollectorOptions o)
     {
+        if (o.Token is { Length: 0 })
+            throw new ArgumentException("SPYGLASS_TOKEN is empty; set a token or unset it (and SPYGLASS_INGEST_INSECURE=1 to run without), 03 §9");
+        if (o.Auth == AuthMode.Header && string.IsNullOrWhiteSpace(o.AuthHeader))
+            throw new ArgumentException("SPYGLASS_AUTH_HEADER is empty");
         if (o.Token is null && !o.IngestInsecure)
             throw new ArgumentException("SPYGLASS_TOKEN is required for ingest (or SPYGLASS_INGEST_INSECURE=1), 03 §9");
         if (o.Auth == AuthMode.Password && string.IsNullOrEmpty(o.AdminPassword))
             throw new ArgumentException("SPYGLASS_ADMIN_PASSWORD is required with SPYGLASS_AUTH=password, 03 §9");
         if (o.Auth == AuthMode.None && !IPAddress.IsLoopback(o.Bind.Address))
             throw new ArgumentException("SPYGLASS_AUTH=none is allowed only on a loopback bind, 03 §9");
+        if (o.TlsCert is null && o.TlsKey is not null)
+            throw new ArgumentException("SPYGLASS_TLS_KEY needs SPYGLASS_TLS_CERT, 03 §9");
         if (o.Workers < 1) throw new ArgumentException("workers must be >= 1");
     }
 }

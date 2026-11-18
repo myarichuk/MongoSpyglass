@@ -36,12 +36,13 @@ public static class FastBson
         var len = Int32(s, p);
         if (len < 5 || start + len > s.Length || s[start + len - 1] != 0) throw new FormatException("bad document length");
         p += 4;
+        var body = s[..(start + len - 1)]; // CA-4: nothing inside may run past this document's own end
         var doc = new BsonDocument(allowDuplicateNames: true);
-        while (p < start + len - 1)
+        while (p < body.Length)
         {
-            var type = s[p++];
-            var name = CString(s, ref p);
-            doc.Add(name, ReadValue(s, type, ref p, depth));
+            var type = body[p++];
+            var name = CString(body, ref p);
+            doc.Add(name, ReadValue(body, type, ref p, depth));
         }
         p = start + len;
         return doc;
@@ -53,12 +54,13 @@ public static class FastBson
         var len = Int32(s, p);
         if (len < 5 || start + len > s.Length || s[start + len - 1] != 0) throw new FormatException("bad array length");
         p += 4;
+        var body = s[..(start + len - 1)];
         var arr = new BsonArray();
-        while (p < start + len - 1)
+        while (p < body.Length)
         {
-            var type = s[p++];
-            SkipCString(s, ref p); // "0", "1", …
-            arr.Add(ReadValue(s, type, ref p, depth));
+            var type = body[p++];
+            SkipCString(body, ref p); // "0", "1", …
+            arr.Add(ReadValue(body, type, ref p, depth));
         }
         p = start + len;
         return arr;

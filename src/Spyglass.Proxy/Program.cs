@@ -3,7 +3,8 @@ using Spyglass.Proxy.Config;
 using Spyglass.Proxy.Diagnostics;
 
 // Run socket continuations on the epoll threads instead of hopping to the thread pool. Measured on the
-// mongod A/B bench (tools/ProxyBench): added p50 latency 70–104 µs → 16–22 µs, proxy CPU/op −30%.
+// mongod A/B bench (tools/ProxyBench): added p50 latency 70–104 µs → 16–46 µs, proxy CPU/op −30–45%
+// (01 §14).
 // Safe because nothing on the forwarding path blocks (01 §3, I1). Must be set before the first socket
 // is created; an explicit value in the environment wins.
 if (Environment.GetEnvironmentVariable("DOTNET_SYSTEM_NET_SOCKETS_INLINE_COMPLETIONS") == null)
@@ -41,27 +42,51 @@ catch (ConfigException e)
 
 Log.Level = Log.Parse(config.LogLevel);
 
-await using var server = new ProxyServer(config);
-using var stop = new CancellationTokenSource();
+// Not `using`: signal and exit callbacks can still fire after Main returns, and Cancel() on a disposed source would abort the process.
+var stop = new CancellationTokenSource();
+void Stop()
+{
+    try { stop.Cancel(); }
+    catch (ObjectDisposedException) { }
+}
+
 Console.CancelKeyPress += (_, e) =>
 {
     e.Cancel = true;
-    stop.Cancel();
+    Stop();
 };
-AppDomain.CurrentDomain.ProcessExit += (_, _) => stop.Cancel();
+// `docker stop` sends SIGTERM: take the graceful path (close connections with proxy_shutdown, flush the sender) instead of dying with 143.
+// Declared before the server so they are disposed after it: a second TERM during the graceful shutdown (up to ~13 s) must not kill the flush.
+using var sigterm = System.Runtime.InteropServices.PosixSignalRegistration.Create(System.Runtime.InteropServices.PosixSignal.SIGTERM, c => { c.Cancel = true; Stop(); });
+using var sigquit = System.Runtime.InteropServices.PosixSignalRegistration.Create(System.Runtime.InteropServices.PosixSignal.SIGQUIT, c => { c.Cancel = true; Stop(); });
+
+ProxyServer server;
+try
+{
+    server = new ProxyServer(config);
+}
+catch (Exception e) when (e is ConfigException or System.Security.Cryptography.CryptographicException or FormatException)
+{
+    Log.Error($"startup failed: {e.Message}");
+    return 3;
+}
+await using var disposeServer = server;
 
 try
 {
     await server.StartAsync(stop.Token);
 }
-catch (ConfigException e)
-{
-    Log.Error($"startup failed: {e.Message}");
-    return 3;
-}
 catch (OperationCanceledException)
 {
     return 0;
+}
+catch (Exception e) when (e is ConfigException or System.IO.IOException or System.Net.Sockets.SocketException or TimeoutException
+                              or System.Security.Authentication.AuthenticationException or System.Security.Cryptography.CryptographicException
+                              or System.Net.Http.HttpRequestException or FormatException)
+{
+    // 01 §2: startup errors name the cause and exit 3, never a stack trace (SRV resolution, upstream TLS during discovery, ...)
+    Log.Error($"startup failed: {e.Message}");
+    return 3;
 }
 
 try

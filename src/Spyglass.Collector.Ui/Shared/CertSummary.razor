@@ -1,0 +1,30 @@
+@inject IJSRuntime JS
+@* One certificate of the proxy's TLS summary: subject, issuer, SANs, validity, copyable SHA-256 fingerprint. *@
+@if (Cert.ValueKind == JsonValueKind.Object)
+{
+    <span class="inline-flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+        <span class="mono">@Str("subject")</span>
+        <CertExpiry Cert="Cert" />
+        @if (Str("issuer") is { Length: > 0 } issuer && issuer != Str("subject")) { <span class="text-muted">issued by @issuer</span> }
+        @if (Cert.TryGetProperty("dns", out var dns) && dns.ValueKind == JsonValueKind.Array && dns.GetArrayLength() > 0)
+        {
+            <span class="text-muted">SAN @string.Join(", ", dns.EnumerateArray().Select(d => d.GetString()))</span>
+        }
+        @if (Str("sha256") is { Length: > 0 } fp)
+        {
+            <button class="btn" title="@fp" aria-label="copy SHA-256 fingerprint" @onclick="() => Copy(fp)"><span class="mono">@(_copied ? "copied" : "sha256 " + fp[..Math.Min(16, fp.Length)] + "…")</span></button>
+        }
+    </span>
+}
+@code {
+    [Parameter] public JsonElement Cert { get; set; }
+    private bool _copied;
+
+    private string? Str(string name) => Cert.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+
+    private async Task Copy(string fingerprint)
+    {
+        await JS.InvokeVoidAsync("spyglass.copy", fingerprint);
+        _copied = true;
+    }
+}

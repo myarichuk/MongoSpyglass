@@ -17,23 +17,37 @@ public sealed class ProxyHost : IAsyncDisposable
 
     public static async Task<ProxyHost> StartAsync(string upstreamUri, int listeners = 3, Action<Dictionary<string, string>>? configure = null)
     {
-        var basePort = Ports.FreeRange(listeners + 4); // room for members added later
-        var args = new Dictionary<string, string>
+        // Ports.FreeRange probes, then the proxy binds: a mongod started by a parallel test can take a port in between.
+        // That is the harness's race, not the proxy's: pick another range and try again.
+        for (var attempt = 0; ; attempt++)
         {
-            ["upstream.uri"] = upstreamUri,
-            ["listen.basePort"] = basePort.ToString(),
-            ["listen.portRange"] = $"{basePort},{basePort + listeners + 3}",
-            ["metrics.bind"] = "127.0.0.1:0",
-            ["logLevel"] = Environment.GetEnvironmentVariable("SPYGLASS_TEST_LOG") ?? "warn",
-        };
-        configure?.Invoke(args);
-        var config = ConfigLoader.Load(args.SelectMany(kv => new[] { "--" + kv.Key, kv.Value }).ToArray(), new Dictionary<string, string?>());
-        Diagnostics.Log.Level = Diagnostics.Log.Parse(config.LogLevel);
-        var server = new ProxyServer(config);
-        await server.StartAsync();
-        var host = new ProxyHost { Server = server, BasePort = basePort };
-        server.Observation!.RecordTap = line => host.Records.Enqueue(JsonDocument.Parse(line.ToArray()).RootElement.Clone());
-        return host;
+            var basePort = Ports.FreeRange(listeners + 4); // room for members added later
+            var args = new Dictionary<string, string>
+            {
+                ["upstream.uri"] = upstreamUri,
+                ["listen.basePort"] = basePort.ToString(),
+                ["listen.portRange"] = $"{basePort},{basePort + listeners + 3}",
+                ["metrics.bind"] = "127.0.0.1:0",
+                ["logLevel"] = Environment.GetEnvironmentVariable("SPYGLASS_TEST_LOG") ?? "warn",
+            };
+            configure?.Invoke(args);
+            var config = ConfigLoader.Load(args.SelectMany(kv => new[] { "--" + kv.Key, kv.Value }).ToArray(), new Dictionary<string, string?>());
+            Diagnostics.Log.Level = Diagnostics.Log.Parse(config.LogLevel);
+            ProxyServer? server = null;
+            try
+            {
+                server = new ProxyServer(config);
+                await server.StartAsync();
+            }
+            catch (ConfigException e) when (attempt < 4 && e.Message.Contains("already in use", StringComparison.OrdinalIgnoreCase))
+            {
+                if (server != null) await server.DisposeAsync();
+                continue;
+            }
+            var host = new ProxyHost { Server = server, BasePort = basePort };
+            server.Observation!.RecordTap = line => host.Records.Enqueue(JsonDocument.Parse(line.ToArray()).RootElement.Clone());
+            return host;
+        }
     }
 
     public string Uri(string? setName = null, string? extra = null)

@@ -113,7 +113,7 @@ public abstract class MetricFamily<T> : IMetricFamily where T : class
     }
 
     protected static string Num(double d) =>
-        double.IsPositiveInfinity(d) ? "+Inf" : d.ToString("G17", CultureInfo.InvariantCulture);
+        double.IsPositiveInfinity(d) ? "+Inf" : d.ToString("R", CultureInfo.InvariantCulture);
 }
 
 public sealed class Counter
@@ -181,12 +181,7 @@ public sealed class Histogram
         var i = Array.BinarySearch(_bounds, v);
         if (i < 0) i = ~i; // first bound >= v (le semantics)
         Interlocked.Increment(ref _counts[i]);
-        long seen, next;
-        do
-        {
-            seen = Volatile.Read(ref _sumBits);
-            next = BitConverter.DoubleToInt64Bits(BitConverter.Int64BitsToDouble(seen) + v);
-        } while (Interlocked.CompareExchange(ref _sumBits, next, seen) != seen);
+        AddSum(v);
     }
 
     internal (double[] Bounds, long[] Cumulative, long Count, double Sum) Snapshot()

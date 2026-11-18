@@ -4,6 +4,10 @@ namespace Spyglass.Collector.Model;
 public abstract class Record
 {
     public long Ts;
+    /// <summary>The producer's own <c>ts</c> when the collector clamped <see cref="Ts"/> (clock skew): duplicate suppression keys on it (02 §6.4, FC-8).</summary>
+    public long OriginalTs = long.MinValue;
+    /// <summary>The <c>ts</c> a resend of this record carries: what duplicate suppression keys on.</summary>
+    public long DedupTs => OriginalTs == long.MinValue ? Ts : OriginalTs;
     public string Src = "";
     /// <summary>Unknown fields, verbatim, as a JSON object; null if there were none (03 §2).</summary>
     public string? Extra;
@@ -89,6 +93,11 @@ public sealed class OpRecord : Record
 
     // 02 §4.2 derivations
     public string ProxyId => Src;
+    /// <summary>
+    /// The connection-id slot of routing and dedup (02 §6.4): the server connection id, else a placeholder. One rule for ops and
+    /// their stream records: a stream op without an id uses -1 (its stream records carry no connSeq), any other op -connSeq.
+    /// </summary>
+    public long RouteSid => ServerConnectionId ?? (Stream ? -1 : -ConnSeq);
     public bool Ack => Status != "unacknowledged";
     public long? ServerLatencyUs => RespFirstUs is { } rf ? Math.Max(0, rf - ReqLastUs) : null;
     public bool HasReply => Status is not ("unacknowledged" or "connection_closed");
@@ -118,6 +127,8 @@ public sealed class StreamRecord : Record
     public long? ServerConnectionId;
     public int RequestId;
     public int Seq;
+    /// <summary>See <see cref="OpRecord.RouteSid"/>.</summary>
+    public long RouteSid => ServerConnectionId ?? -1;
     public int RespBytes;
     public long? CursorId;
     public int? NReturned;
@@ -130,9 +141,11 @@ public sealed class ProxyRecord : Record
     public int Schema;
     public string Topology = "";
     public string? SetName;
-    public List<(string Member, string Upstream)> Members = [];
+    public List<(string Member, string Upstream, string? Cert)> Members = [];
     public string? Compression;
     public string? Values;
+    /// <summary><c>config.tls</c> as raw JSON (02 §4.2); null when absent, not an object or over 8 KiB.</summary>
+    public string? Tls;
 }
 
 public sealed class StatsRecord : Record

@@ -429,6 +429,256 @@
         "$db": "shop"
       },
       "command": "update"
+    },
+    {
+      "name": "find-projection-operand-values",
+      "rule": "CA-14: $elemMatch / $slice / $meta operands in a find projection are values, not shape",
+      "same": true,
+      "a": {
+        "find": "orders",
+        "filter": {
+          "a": 1
+        },
+        "projection": {
+          "arr": {
+            "$elemMatch": {
+              "status": "A"
+            }
+          },
+          "items": {
+            "$slice": [
+              20,
+              10
+            ]
+          },
+          "s": {
+            "$meta": "textScore"
+          }
+        },
+        "$db": "shop"
+      },
+      "b": {
+        "find": "orders",
+        "filter": {
+          "a": 1
+        },
+        "projection": {
+          "arr": {
+            "$elemMatch": {
+              "status": "B"
+            }
+          },
+          "items": {
+            "$slice": [
+              5,
+              3
+            ]
+          },
+          "s": {
+            "$meta": "textScore"
+          }
+        },
+        "$db": "shop"
+      }
+    },
+    {
+      "name": "addfields-literal-array-length",
+      "rule": "CA-14: an array of literals is one tag whatever its length",
+      "same": true,
+      "a": {
+        "aggregate": "orders",
+        "pipeline": [
+          {
+            "$addFields": {
+              "x": {
+                "$in": [
+                  "$s",
+                  [
+                    "a",
+                    "b"
+                  ]
+                ]
+              }
+            }
+          }
+        ],
+        "cursor": {},
+        "$db": "shop"
+      },
+      "b": {
+        "aggregate": "orders",
+        "pipeline": [
+          {
+            "$addFields": {
+              "x": {
+                "$in": [
+                  "$s",
+                  [
+                    "a",
+                    "b",
+                    "c",
+                    "d",
+                    "e"
+                  ]
+                ]
+              }
+            }
+          }
+        ],
+        "cursor": {},
+        "$db": "shop"
+      },
+      "command": "aggregate"
+    },
+    {
+      "name": "facet-match-values",
+      "rule": "CA-14: $facet values are pipelines, normalized like $lookup's",
+      "same": true,
+      "a": {
+        "aggregate": "orders",
+        "pipeline": [
+          {
+            "$facet": {
+              "p": [
+                {
+                  "$match": {
+                    "a": {
+                      "$in": [
+                        1,
+                        2
+                      ]
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "cursor": {},
+        "$db": "shop"
+      },
+      "b": {
+        "aggregate": "orders",
+        "pipeline": [
+          {
+            "$facet": {
+              "p": [
+                {
+                  "$match": {
+                    "a": {
+                      "$in": [
+                        1,
+                        2,
+                        3,
+                        4
+                      ]
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "cursor": {},
+        "$db": "shop"
+      },
+      "command": "aggregate"
+    },
+    {
+      "name": "unionwith-match-values",
+      "rule": "CA-14: $unionWith.pipeline is normalized like $lookup's",
+      "same": true,
+      "a": {
+        "aggregate": "orders",
+        "pipeline": [
+          {
+            "$unionWith": {
+              "coll": "old",
+              "pipeline": [
+                {
+                  "$match": {
+                    "a": {
+                      "$in": [
+                        1
+                      ]
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "cursor": {},
+        "$db": "shop"
+      },
+      "b": {
+        "aggregate": "orders",
+        "pipeline": [
+          {
+            "$unionWith": {
+              "coll": "old",
+              "pipeline": [
+                {
+                  "$match": {
+                    "a": {
+                      "$in": [
+                        1,
+                        2,
+                        3
+                      ]
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "cursor": {},
+        "$db": "shop"
+      },
+      "command": "aggregate"
+    },
+    {
+      "name": "facet-structure-differs",
+      "rule": "CA-14: $facet keeps its structure (names, stage names)",
+      "same": false,
+      "a": {
+        "aggregate": "orders",
+        "pipeline": [
+          {
+            "$facet": {
+              "p": [
+                {
+                  "$match": {
+                    "a": 1
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "cursor": {},
+        "$db": "shop"
+      },
+      "b": {
+        "aggregate": "orders",
+        "pipeline": [
+          {
+            "$facet": {
+              "q": [
+                {
+                  "$match": {
+                    "a": 1
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "cursor": {},
+        "$db": "shop"
+      },
+      "command": "aggregate"
     }
   ]
 }

@@ -1,7 +1,9 @@
 @page "/shapes/{Hash}"
-@inject Api Api
+@inherits LoadPage
+@inject NavigationManager Nav
 
 <PageTitle>Shape @Hash · Spyglass</PageTitle>
+<ErrorBanner Error="@Error" OnRetry="Reload" />
 @if (_s is { } s)
 {
     <div class="p-container-padding flex flex-col gap-4 max-w-6xl">
@@ -9,6 +11,7 @@
             <h1 class="h mono">@s.Command <span class="text-muted">@s.Ns</span></h1>
             <span class="mono text-ui-label-sm text-muted">@s.ShapeHash</span>
             <span class="text-muted">@string.Join(", ", s.Apps)</span>
+            <a class="text-ui-label-sm ml-auto" href="@(Nav.BaseUri + "?shape=" + Uri.EscapeDataString(s.ShapeHash))">all operations of this shape →</a>
         </header>
         <div class="grid grid-cols-2 md:grid-cols-7 gap-2">
             @foreach (var (k, v) in new[] { ("count", s.Count.ToString()), ("errors", s.Errors.ToString()), ("total", Fmt.Us(s.TotalTimeUs)), ("p50", Fmt.Us(s.P50Us)), ("p95", Fmt.Us(s.P95Us)), ("p99", Fmt.Us(s.P99Us)), ("max", Fmt.Us(s.MaxUs)) })
@@ -19,21 +22,28 @@
         <section class="card p-container-padding" aria-label="Latency over time">
             <h2 class="text-ui-label-sm uppercase text-muted mb-2">p95 server latency (line) and ops per minute (bars)</h2>
             <svg viewBox="0 0 1000 160" class="w-full h-40" role="img" aria-label="latency series">
-                @if (s.Series.Length > 0)
+                @foreach (var col in _layout.Columns)
                 {
-                    var maxC = Math.Max(1, s.Series.Max(p => p.Count));
-                    var maxL = Math.Max(1, s.Series.Max(p => p.P95Us));
-                    var w = Math.Min(40.0, 1000.0 / s.Series.Length); // a few minutes of data must not become one wall-wide bar
-                    for (var i = 0; i < s.Series.Length; i++)
+                    var h = 150.0 * col.Count / _maxC;
+                    <rect class="fill-surface-3" x="@F(_layout.X(col.Minute))" y="@F(160 - h)" width="@F(Math.Max(1, _layout.Width - 1))" height="@F(h)"><title>@Fmt.Stamp(col.Minute * 60_000_000) @(_layout.Step > 1 ? $"(+{_layout.Step} min) " : "")· @col.Count ops · p95 @Fmt.Us(col.P95Us)</title></rect>
+                }
+                @foreach (var run in _layout.Runs())
+                {
+                    if (run.Length == 1)
                     {
-                        var p = s.Series[i];
-                        var h = 150.0 * p.Count / maxC;
-                        <rect class="fill-surface-3" x="@F(i * w)" y="@F(160 - h)" width="@F(Math.Max(1, w - 1))" height="@F(h)"><title>@Fmt.Stamp(p.Minute * 60_000_000) · @p.Count ops · p95 @Fmt.Us(p.P95Us)</title></rect>
+                        <circle class="fill-accent" cx="@F(_layout.X(run[0].Minute) + _layout.Width / 2)" cy="@F(155 - 145 * run[0].P95Us / _maxL)" r="2.5" />
                     }
-                    <polyline class="stroke-accent" fill="none" stroke-width="2"
-                              points="@string.Join(' ', s.Series.Select((p, i) => $"{F(i * w + w / 2)},{F(155 - 145 * p.P95Us / maxL)}"))" />
+                    else
+                    {
+                        <polyline class="stroke-accent" fill="none" stroke-width="2"
+                                  points="@string.Join(' ', run.Select(q => $"{F(_layout.X(q.Minute) + _layout.Width / 2)},{F(155 - 145 * q.P95Us / _maxL)}"))" />
+                    }
                 }
             </svg>
+            @if (_layout.Columns.Length > 0)
+            {
+                <div class="flex justify-between text-ui-label-sm text-muted"><span>@Fmt.Stamp(_layout.FirstMinute * 60_000_000)</span><span>@Fmt.Stamp((_layout.FirstMinute + _layout.TotalMinutes) * 60_000_000)</span></div>
+            }
         </section>
         <section class="card p-container-padding" aria-label="Normalized shape">
             <h2 class="text-ui-label-sm uppercase text-muted mb-2">Normalized shape</h2>
@@ -65,18 +75,25 @@
         }
     </div>
 }
-else if (_loaded) { <p class="p-container-padding text-muted">Unknown shape.</p> }
+else if (Loaded && Error == null) { <p class="p-container-padding text-muted">Unknown shape.</p> }
 
 @code {
     [Parameter] public string Hash { get; set; } = "";
     [SupplyParameterFromQuery] public string? Range { get; set; }
     private ShapeDetail? _s;
-    private bool _loaded;
+    private SeriesLayout _layout = SeriesLayout.Empty;
+    private double _maxC = 1, _maxL = 1;
 
-    protected override async Task OnParametersSetAsync()
+    protected override TimeSpan? RefreshEvery => TimeSpan.FromSeconds(15);
+
+    protected override async Task LoadAsync(CancellationToken ct)
     {
-        _s = await Api.Shape(Hash, TimeRange.Query(Range));
-        _loaded = true;
+        var s = await Api.Shape(Hash, TimeRange.Query(Range), ct);
+        ct.ThrowIfCancellationRequested();
+        _s = s;
+        _layout = SeriesLayout.Of(s?.Series ?? []);
+        _maxC = Math.Max(1, _layout.Columns.Select(c => c.Count).DefaultIfEmpty().Max());
+        _maxL = Math.Max(1, _layout.Columns.Select(c => c.P95Us).DefaultIfEmpty().Max());
     }
 
     private static string F(double v) => v.ToString("F1", System.Globalization.CultureInfo.InvariantCulture);

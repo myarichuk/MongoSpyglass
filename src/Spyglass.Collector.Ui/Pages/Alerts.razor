@@ -1,5 +1,5 @@
 @page "/alerts"
-@inject Api Api
+@inherits LoadPage
 @inject NavigationManager Nav
 
 <PageTitle>Alerts · Spyglass</PageTitle>
@@ -12,13 +12,14 @@
             </select>
         </Field>
     </header>
-    @if (_loaded && _alerts.Length == 0) { <p class="text-muted">No @(State ?? "open") alerts.</p> }
+    <ErrorBanner Error="@Error" OnRetry="Reload" />
+    @if (Loaded && Error == null && _alerts.Length == 0) { <p class="text-muted">No @(State ?? "open") alerts.</p> }
     @foreach (var g in _alerts.GroupBy(a => a.Rule).OrderBy(g => g.Key))
     {
         <section class="card" aria-label="@g.Key">
             <h2 class="flex items-center gap-2 px-container-padding py-2 border-b border-line">
                 <span class="mono">@g.Key</span><span class="badge bg-surface-3 text-muted">@g.Count()</span>
-                <span class="text-ui-label-sm text-muted ml-2">@Explain(g.Key)</span>
+                <span class="text-ui-label-sm text-muted ml-2">@AlertRules.Explain(g.Key)</span>
             </h2>
             @foreach (var a in g.OrderByDescending(a => a.LastSeen))
             {
@@ -50,35 +51,29 @@
 @code {
     [SupplyParameterFromQuery] public string? State { get; set; }
     private AlertDto[] _alerts = [];
-    private bool _loaded;
 
-    protected override async Task OnParametersSetAsync()
+    protected override TimeSpan? RefreshEvery => TimeSpan.FromSeconds(10);
+
+    private string AlertQuery => State is "all" ? "" : "state=" + (State ?? "open");
+
+    protected override async Task LoadAsync(CancellationToken ct)
     {
-        _alerts = await Api.Alerts(State is "all" ? "" : "state=" + (State ?? "open"));
-        _loaded = true;
+        var alerts = await Api.Alerts(AlertQuery, ct);
+        ct.ThrowIfCancellationRequested();
+        _alerts = alerts;
     }
 
     private void SetState(ChangeEventArgs e) => Nav.NavigateTo(Nav.GetUriWithQueryParameter("state", e.Value?.ToString()));
 
     private async Task Toggle(AlertDto a)
     {
-        if (await Api.Mute(a.Id, !a.Muted))
-            _alerts = await Api.Alerts(State is "all" ? "" : "state=" + (State ?? "open"));
+        try
+        {
+            if (!await Api.Mute(a.Id, !a.Muted)) Error = "That alert no longer exists.";
+        }
+        catch (HttpRequestException ex) { Error = $"Could not {(a.Muted ? "unmute" : "mute")} the alert ({ex.Message})"; return; }
+        await Reload();
     }
 
     private static string Sev(string s) => s switch { "critical" => "bg-bad/15 text-bad", "warning" => "bg-warn/15 text-warn", _ => "bg-surface-3 text-muted" };
-
-    private static string Explain(string rule) => rule switch
-    {
-        "slow-shape" => "server latency over the threshold, or p95 at ≥ 3× the previous hour",
-        "n-plus-one-suspected" => "the same shape back to back on one connection: a query in a loop (no unit-of-work context)",
-        "repeated-query" => "the same query with the same values, repeatedly, within a second",
-        "unbounded-scan" => "no filter and no limit on a collection known to be large",
-        "large-result" => "> 1 MiB or > 1000 documents in one reply",
-        "unbounded-in" => "$in with more than 1000 values",
-        "cursor-abandoned" => "a cursor the client stopped reading: the server expired it",
-        "error-burst" => "> 5% of a command's ops failing in a minute",
-        "unacknowledged-writes" => "w:0 writes: failures never reach the application",
-        _ => "",
-    };
 }

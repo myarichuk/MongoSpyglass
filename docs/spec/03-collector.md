@@ -21,9 +21,21 @@ POST /ingest/v0 ─▶ validate ─▶ dedup ─▶ join (02 §6) ─▶ enrich 
 * Unknown `type`s are ignored. Unknown fields are kept in the raw record and otherwise
   ignored.
 * Records missing required fields (02 §4) are rejected individually, and the count is
-  returned in `X-Spyglass-Rejected`.
-* `ts` more than 5 minutes in the future (relative to collector time) is clamped and counted
-  as clock skew per `src`. It's shown on the Proxies/Exporters page.
+  returned in `X-Spyglass-Rejected`. So are malformed ones: a line that is not valid UTF-8 (checked
+  once per line, so every string field is treated alike), has bytes after its closing brace, holds a
+  value of the wrong JSON type (including a nested value where a boolean is expected, and a
+  non-object element in `frames` or `members`), or has an int32 field (`code`, `nReturned`,
+  `reqBytes`, `requestId`, `seq`, `respBytes`, `attempt`, `schema`, a frame's `line`, …) outside
+  the int32 range. Values are rejected, never wrapped or clamped.
+* Any record from an exporter (`cmd`, `hello`, `callsite`, `stats`, `uow`, `pool`) shows it is alive
+  for the 10-minute exporter-idle rule of 02 §6.2. `uow` and `pool` are only counted (M3); their fields are
+  not kept.
+* `ts` more than 5 minutes in the future (relative to collector time), or older than the op
+  retention (a negative or ancient `ts` would give the op an id that sorts last and is pruned
+  at once), is clamped to collector time and counted as clock skew per `src`. It's shown on the
+  Proxies/Exporters page. A producer clock that merely lags is not corrected: everything that
+  runs on a lifetime (an alert's quiet period, a cursor's idle timeout, closing a minute
+  bucket) uses the collector's own clock, never `ts`.
 
 ## 3. Join engine
 
@@ -132,8 +144,8 @@ The shape always includes `cmd` (command name), `db`, `coll`.
 
 | Command | Shape adds |
 |---|---|
-| `find` | `filter: normFilter`, `sort` (keys, order and directions kept, as `[[key, dir], …]`), `projection` (keys and inclusion kept), `limit`/`skip`/`batchSize` presence as `"?"`, `hint` (kept; a key pattern as `[[key, dir], …]`), `collation.locale` (kept) |
-| `aggregate` | `pipeline`: per stage, `{<stageName>: normStage}`. `$match` → normFilter. `$sort` as `[[key, dir], …]`. `$project`: inclusion flags kept, expressions with leaves tagged. `$group._id` structure kept with leaves tagged. Accumulator operators kept. `$lookup` keeps `from`/`localField`/`foreignField`/`as` and normalizes its sub-pipeline. `$limit`/`$skip` → `"?"`. Unknown stages: leaves tagged. |
+| `find` | `filter: normFilter`, `sort` (keys, order and directions kept, as `[[key, dir], …]`), `projection` (keys and inclusion flags kept; operator operands such as `$elemMatch`, `$slice` and `$meta` tagged as in `$project`), `limit`/`skip`/`batchSize` presence as `"?"`, `hint` (kept; a key pattern as `[[key, dir], …]`), `collation.locale` (kept) |
+| `aggregate` | `pipeline`: per stage, `{<stageName>: normStage}`. `$match` → normFilter. `$sort` as `[[key, dir], …]`. `$project`: inclusion flags kept, expressions with leaves tagged. `$group._id` structure kept with leaves tagged. Accumulator operators kept. `$lookup` keeps `from`/`localField`/`foreignField`/`as` and normalizes its sub-pipeline; `$unionWith` keeps `coll` and normalizes its `pipeline` the same way; each value of `$facet` is a pipeline. `$limit`/`$skip` → `"?"`. Unknown stages: leaves tagged, except that an array of literals of one kind (`$addFields: {x: {$in: ["$s", [1, 2, 3]]}}`) is the one tag, whatever its length, and counts toward `inCardinality` like `$in`. |
 | `update` | `updates[]` → per statement `{q: normFilter, u: <operator names → field names → tag>, upsert, multi}`. Pipeline-style `u` is normalized like an aggregate pipeline. Statements deduplicated by canonical form. |
 | `delete` | `deletes[]` → per statement `{q: normFilter, limit}` |
 | `findAndModify` | `query`, `sort`, `update` (as above), `remove`/`new`/`upsert` flags |
@@ -177,8 +189,10 @@ Alert { id, rule, scope{shapeHash?, coll?, app?, member?, uowName?, callsite?}, 
 * One alert per `(rule, scope)`. New occurrences bump `occurrences` and `lastSeen`, and keep
   up to 10 sample op ids.
 * An alert is **resolved** automatically after `quietPeriod` (rule-specific) with no
-  occurrences. A later occurrence reopens it.
-* Users can mute a `(rule, scope)`.
+  occurrences, measured on the collector's clock. A later occurrence reopens it.
+* Users can mute a `(rule, scope)`. A muted alert keeps tracking occurrences silently (its count and times are
+  published and stored like any other's, but it raises no `alert.*` event and builds no new summary), and is never
+  deleted by retention while muted. The mute itself is written to the store when it is set, so it survives restarts.
 
 ### 5.2 Rules
 
@@ -249,7 +263,7 @@ Per `(shapeHash, minute)` bucket:
 
 * `count`, `errors`;
 * `serverLatency` as a DDSketch (relative accuracy 1%) or an HDR histogram
-  (1 µs – 60 s, 2 significant digits);
+  (1 µs – 1 h, 2 significant digits; a quantile is never reported above the maximum seen);
 * `sum(respBytes)`, `sum(reqBytes)`, `sum(nReturned)`, `max(nReturned)`;
 * `sum(poolWait_us)` and `sum(client_us)` when present.
 
@@ -269,18 +283,33 @@ Buckets roll up to hourly after 48 h.
 | Operations (joined, including redacted command) | 24 h | 5 GiB, oldest deleted first |
 | Aggregates, minute | 48 h | — |
 | Aggregates, hour | 30 d | — |
-| Alerts | 30 d after resolve | — |
+| Alerts | 30 d after resolve (muted ones kept) | — |
+| Shapes | until unused for 30 d (the in-memory catalog is also capped at 100,000, least recently seen first; the slowest-10 examples cover the op retention) | — |
 | UoW summaries | 7 d | — |
 | Callsites | until unused for 30 d (used = a joined op referenced it; refreshed hourly) | — |
 
 Writes are batched (≥ 500 rows or 250 ms per transaction). Under write backpressure, raw
 operations are sampled (keep every slow, errored or alerted op, plus 1/N of the rest)
-before aggregates are ever dropped.
+before aggregates are ever dropped. A batch (appends, updates, callsites) is one transaction: a failed
+write is retried with backoff (6 attempts, 250 ms to 4 s), then dropped and counted
+(`spyglass_collector_storage_dropped_total`); failed ops (`ok:0`, write errors, write-concern errors) are
+never sampled, but even they are not queued past 2× the backlog bound (200k ops), and updates and callsite
+records are bounded too (200k, 50k): over a bound they are dropped and counted. Aggregate and alert writes (the analysis stage's)
+back off the same way when the store fails (0.5 s doubling to 30 s) and keep at most 100k pending minute deltas, oldest minute first
+(`spyglass_collector_aggregate_deltas_dropped_total`); a stored aggregate row that no longer decodes is replaced by the
+delta and counted, never allowed to block later writes. The WAL is capped
+(`journal_size_limit` 64 MiB, truncated after retention) and any excess counts toward the 5 GiB bound.
+The collector logs its configured memory worst case at startup (§11). Connections are evicted only past
+200k (least recently seen first) or when their proxy expires: `conn` is sent once at open (02 §4.2), so an idle pool's
+connection must keep its app and driver however long it sleeps. Producers idle for 24 h (or past 10k) are evicted (`/metrics`). `--data :memory:` keeps ops by
+count and size, rolls minute buckets up to hours, and caps callsites.
 
 ## 8. API (REST + SSE, JSON)
 
-Base path `/api/v1`. All endpoints require auth (§9) except `/healthz` and `/readyz`, which report
-states and counts only.
+Base path `/api/v1`. All endpoints require auth (§9) except `/healthz`, `/readyz` (states and counts only: an
+unauthenticated caller gets no exception text; a signed-in one gets the last error in `detail`), `POST /login`
+and `GET /auth/mode` (`{auth: "none"|"password"|"header"}`: how the login page learns the mode without an attempt
+that the throttle would count).
 
 | Path | 200 when | 503 when |
 |---|---|---|
@@ -298,13 +327,14 @@ liveness one: restarting a collector that sheds load loses its in-memory state a
 | `GET /shapes/{hash}` | Shape detail: normalized shape, latency series, examples (slowest 10 plus latest 10), callsites |
 | `GET /uows?from&to&name&minOps&minTimeUs` | Units of work |
 | `GET /uows/{id}` | UoW detail: ordered op list (HR-profiler "statements in this request" view) |
-| `GET /alerts?state=open\|resolved&rule` · `POST /alerts/{id}/mute` | Alerts |
+| `GET /alerts?state=open\|resolved&rule&limit` (default 1000, at most 5000) · `POST /alerts/{id}/mute` | Alerts |
 | `GET /cursors?state=open\|closed&reason` | Cursors |
 | `GET /connections` · `GET /apps` | Live connections and apps (from `conn` records) |
 | `GET /producers` | Proxies and exporters: version, last seen, drops, skew; per exporter `join {cmds, joined, orphans, conflicts, rate, skew_us}` |
-| `GET /live?app&coll&command&status&minLatencyUs&uow` | SSE stream: `op.created`, `op.updated`, `alert.opened`, `alert.updated` |
-| `POST /export?from&to&…` | NDJSON download of ops and alerts for offline sharing |
+| `GET /live?app&coll&command&status&minLatencyUs&uow` | SSE stream: `op.created`, `op.updated`, `alert.opened`, `alert.updated`; `dropped` (`{dropped, total}`) when a slow reader's buffer overflowed and events were lost |
+| `POST /export?from&to&…` | NDJSON download of ops and alerts for offline sharing. At most 100 000 ops: a `{"type":"truncated","limit":100000}` line follows the last op when there may be more. Stops when the client disconnects |
 | `GET /metrics` | collector self-telemetry (Prometheus) |
+| `GET /producers` | Every producer (proxy or exporter) with its last record's facts and counters. A proxy's `tls` (its `config.tls`, 02 §4.2) and each member's `cert` are echoed as the proxy sent them, only when present: raw JSON objects kept as received, `tls` up to 8 KiB and a `cert` up to 2 KiB each. A larger value, or one that is not an object, is ignored and the rest of the record is accepted. Each proxy record replaces the previous summary; nothing is persisted (producers are rebuilt from the next records after a restart). The UI shows them read-only; no key or certificate file is ever received. |
 
 ## 9. Security
 
@@ -316,7 +346,42 @@ liveness one: restarting a collector that sheds load loses its in-memory state a
     oauth2-proxy and similar.
 
   There is no anonymous mode except `SPYGLASS_AUTH=none` *and* a loopback bind.
+* **Settings** (env `SPYGLASS_*` or `--name value`; an unknown `SPYGLASS_*` name is a warning on stderr, not an
+  error, because the proxy and the exporters read the same prefix from a shared env file):
+
+  | Setting | Meaning |
+  |---|---|
+  | `SPYGLASS_TOKEN` | ingest bearer token. Required (non-empty) unless `SPYGLASS_INGEST_INSECURE=1` |
+  | `SPYGLASS_AUTH` | `password` (default), `header` or `none` |
+  | `SPYGLASS_ADMIN_PASSWORD` | the password for `password` mode |
+  | `SPYGLASS_AUTH_HEADER` | the header name for `header` mode (`X-Forwarded-User`). Setting it selects `header` mode; with a different `SPYGLASS_AUTH` the collector refuses to start |
+  | `SPYGLASS_TRUSTED_PROXIES` (alias `SPYGLASS_AUTH_HEADER_TRUSTED_PROXIES`) | comma-separated CIDRs or addresses of the reverse proxies. Default: loopback (`127.0.0.0/8,::1/128`) |
+  | `SPYGLASS_BIND`, `SPYGLASS_DATA`, `SPYGLASS_QUEUE_BYTES`, `SPYGLASS_MAX_BODY_BYTES`, `SPYGLASS_WORKERS`, `SPYGLASS_OP_RETENTION_HOURS`, `SPYGLASS_OP_STORE_BYTES`, `SPYGLASS_CURSOR_TIMEOUT_SECONDS`, `SPYGLASS_SLOW_SHAPE_MS` | as named; see `CollectorOptions.cs` |
+
+* **Header auth is only as good as the peer check.** `X-Forwarded-User` is believed only on a connection whose
+  TCP peer is in `SPYGLASS_TRUSTED_PROXIES`; from anyone else the request is 401. With the default
+  (loopback) the proxy must run on the same host; behind a container network list the proxy's
+  address or network (`SPYGLASS_TRUSTED_PROXIES=172.18.0.0/16`). The same list decides whether
+  `X-Forwarded-Proto: https` is believed: the session cookie is `Secure` on a TLS connection, or when
+  a trusted proxy says the client used TLS.
+* **Login hardening.** `POST /api/v1/login` reads at most 4 KiB (413 beyond), answers 401 to a body that
+  is not `{"password": "<string>"}`, and backs off guessing: after 5 failures from one address that address
+  gets 429 with `Retry-After` for 2^(n-6) s (at most 15 min), and 10 quiet minutes forget its failures. "Address"
+  is the TCP peer, or, when the peer is in `SPYGLASS_TRUSTED_PROXIES`, the right-most `X-Forwarded-For` hop
+  that is not itself a trusted proxy (so one user behind the proxy cannot lock out another, and a client cannot
+  pick its own key); IPv6 clients count per /64. More than 60 failures a minute from anywhere only add a 2 s delay to
+  failed answers: no address is ever locked by another's failures. HTTP Basic failures count too (and a locked
+  Basic client sees `Retry-After`). A success clears the address. A body past 4 KiB is 413 whether its length
+  was declared or chunked.
 * **Binding:** API and UI bind to loopback by default.
+* **HTTPS:** `SPYGLASS_TLS_CERT` (`--tls-cert`) switches the listener to HTTPS: a PEM certificate (any
+  intermediates after the leaf in the same file are sent with it), the same PEM with the private key in it, or a
+  `.pfx`/`.p12`. `SPYGLASS_TLS_KEY` (`--tls-key`) names a separate PEM key (PKCS#8, PKCS#1 or SEC1; encrypted PKCS#8
+  with `SPYGLASS_TLS_KEY_PASSWORD`, `--tls-key-password`, which also opens a `.pfx`). The key is re-exported to PKCS#12
+  in memory so Linux can use it. A file that is missing, unreadable, without a key, or whose key matches no
+  certificate in it stops startup with exit 2 and a message that names the variable; a certificate that expires
+  within 14 days (or already has) is a startup warning on stderr. Proxies and exporters then use an `https://`
+  `collector.endpoint` (a private CA goes in the proxy's `collector.caFile`). The session cookie is `Secure` when the request arrived over HTTPS at the collector itself, or via a trusted proxy that sent `X-Forwarded-Proto: https`.
 * **Data:** stored data is already redacted by the proxy (I7). The collector MUST NOT accept
   `op` records whose `cmd` decodes to a redacted-command name with a non-redacted body
   (defence in depth: such records are rejected and counted).
@@ -331,7 +396,7 @@ circuit state.
 | Page | Content |
 |---|---|
 | **Live** | Streaming op table: time, app, command, ns, server latency, client latency (if joined), docs, bytes, status, UoW badge. Filters persist in the URL. Paused automatically when scrolled. |
-| **Operation** | Command (shell-syntax EJSON, copy-to-clipboard as a mongosh command), reply facts, **timing waterfall** (pool wait → client→proxy → proxy→server+server → server→client), alerts, cursor lifecycle, callsite frames, "other ops in this UoW" |
+| **Operation** | Command (relaxed EJSON as captured; the copy button converts it to mongosh syntax — `ObjectId("…")`, `ISODate("…")`, `NumberLong("…")` — client side, and copies unconvertible captures as they are), times in UTC, reply facts, **timing waterfall** (pool wait → client→proxy → proxy→server+server → server→client), alerts, cursor lifecycle, callsite frames, "other ops in this UoW" |
 | **Shapes** | Leaderboard by total time / p95 / count / errors. Sparkline per shape. Click through to shape detail with examples and callsites. |
 | **Units of work** | List by duration / op count. Detail is the HR-profiler view: numbered statements, duplicated shapes highlighted, N+1 groups collapsed with counts. |
 | **Alerts** | Grouped by rule, with occurrence counts and sample ops, mute/unmute |
@@ -372,7 +437,9 @@ circuit state.
   offer brotli only over HTTPS, so plain-HTTP deployments get gzip. The 3.0 MB runtime travels as 0.98 MB
   (brotli) or 1.2 MB (gzip).
 * **Configuration:** `SPYGLASS_*` environment variables. The image sets `SPYGLASS_BIND=0.0.0.0:8080` and
-  `SPYGLASS_DATA=/data` (a volume). A non-loopback bind needs password or header auth (§9), so a
+  `SPYGLASS_DATA=/data` (a volume). With `SPYGLASS_TLS_CERT` set (§9, mount the files into the container) the
+  HEALTHCHECK probe speaks TLS to the listener and accepts any certificate: it is a liveness check on localhost,
+  and a probe given `--tls-cert` instead of the variable does the same. A non-loopback bind needs password or header auth (§9), so a
   `docker run` passes `SPYGLASS_TOKEN` and `SPYGLASS_ADMIN_PASSWORD` (or `SPYGLASS_AUTH_HEADER`).
 * **Multi-arch:** the SDK stage runs on the build platform and publishes for `TARGETARCH`; crossgen2
   cross-compiles. The NuGet cache is a BuildKit cache mount, and restore sits on its own layer.

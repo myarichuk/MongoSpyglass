@@ -34,13 +34,27 @@ public sealed class CommandMetrics
             "database", "collection");
     }
 
-    /// <summary>Folds the collection label to <see cref="Other"/> once a family exceeds <c>metrics.maxSeries</c>.</summary>
-    public string Collection<T>(MetricFamily<T> family, string command, string db, string? coll, string app, string? extra = null) where T : class
+    /// <summary>
+    /// The series for <paramref name="labels"/> (in the family's label order), bounded by <c>metrics.maxSeries</c>
+    /// (01 §12): past it a new label set folds its collection to <see cref="Other"/>; if even that series would be new and the
+    /// family is at twice the bound, every label but <c>status</c> (a closed set) folds, into one overflow series.
+    /// <c>command</c>, <c>database</c>, <c>app</c> and <c>code_name</c> come from clients and servers, so they can't be left open.
+    /// </summary>
+    public T Series<T>(MetricFamily<T> family, params string[] labels) where T : class
     {
-        coll ??= "";
-        if (family.SeriesCount < _maxSeries)
-            return coll;
-        var key = extra == null ? new[] { command, db, coll, app } : [command, db, coll, app, extra];
-        return family.Contains(key) ? coll : Other;
+        if (family.SeriesCount < _maxSeries || family.Contains(labels))
+            return family.WithLabels(labels);
+        var ci = Array.IndexOf(family.LabelNames, "collection");
+        if (ci >= 0 && labels[ci] != Other)
+        {
+            var folded = (string[])labels.Clone();
+            folded[ci] = Other;
+            if (family.SeriesCount < 2L * _maxSeries || family.Contains(folded))
+                return family.WithLabels(folded);
+        }
+        var overflow = new string[labels.Length];
+        for (var i = 0; i < overflow.Length; i++)
+            overflow[i] = family.LabelNames[i] == "status" ? labels[i] : Other;
+        return family.WithLabels(overflow);
     }
 }

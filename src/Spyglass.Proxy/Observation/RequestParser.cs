@@ -85,7 +85,7 @@ internal sealed class ClientMetadata
 internal sealed class RequestParser
 {
     /// <summary>compression=observe never inflates more than this per frame (I4).</summary>
-    private const int MaxObservedInflate = 16 * 1024 * 1024;
+    internal const int MaxObservedInflate = 16 * 1024 * 1024;
     private const int MaxPooled = 1024;
 
     private readonly Redactor _redactor;
@@ -95,6 +95,9 @@ internal sealed class RequestParser
     private readonly BsonWriter _scratch = new(1024);
     private readonly List<(int IdStart, int IdLength, int DocStart, int DocLength)> _firstSeqDocs = [];
     private readonly Stack<RequestInfo> _pool = new();
+    /// <summary>Reusable inflate target for compressed request bodies (dropped again when a frame made it big).</summary>
+    private byte[] _inflate = [];
+    private readonly byte[] _replyChunk = new byte[16 * 1024];
 
     public RequestParser(Redactor redactor, CompressionMode compression)
     {
@@ -102,6 +105,7 @@ internal sealed class RequestParser
         _compression = compression;
     }
 
+    internal Redactor Redactor => _redactor;
     internal Utf8Interner Names => _names;
     internal LsidHasher Lsids => _lsids;
 
@@ -117,6 +121,15 @@ internal sealed class RequestParser
     /// <param name="records">false when headless: nothing that only records use is extracted or built (01 §11).</param>
     public RequestInfo Parse(FrameCapture c, bool records)
     {
+        try { return ParseCore(c, records); }
+        finally
+        {
+            if (_inflate.Length > 1 << 20) _inflate = [];
+        }
+    }
+
+    private RequestInfo ParseCore(FrameCapture c, bool records)
+    {
         var info = Rent();
         info.RequestId = c.RequestId;
         info.OpCode = c.OpCode;
@@ -130,7 +143,7 @@ internal sealed class RequestParser
         ReadOnlySpan<byte> body = c.Buffer.AsSpan(0, c.CapturedLength);
         var truncated = c.Truncated;
         var opCode = c.OpCode;
-        byte[]? inflated = null;
+        var wasInflated = false;
 
         if (opCode == OpCodes.Compressed)
         {
@@ -145,18 +158,32 @@ internal sealed class RequestParser
             var uncompressedSize = BinaryPrimitives.ReadInt32LittleEndian(body[4..]);
             if (uncompressedSize is < 0 or > MaxObservedInflate)
                 return info;
-            inflated = new byte[uncompressedSize];
-            if (compressorId == 0)
-                body[9..].CopyTo(inflated);
-            else
+            // The declared size is the client's word: deflate can't expand more than ~1032:1, so never size the target past that.
+            var target = (int)Math.Min(uncompressedSize, 1100L * (body.Length - 9) + 64);
+            if (_inflate.Length < target) _inflate = new byte[target];
+            int got;
+            try
             {
-                using var z = new ZLibStream(new MemoryStream(body[9..].ToArray()), System.IO.Compression.CompressionMode.Decompress);
-                z.ReadExactly(inflated);
+                using var src = new MemoryStream(c.Buffer, 9, c.CapturedLength - 9, writable: false);
+                using var z = compressorId == 0 ? null : new ZLibStream(src, System.IO.Compression.CompressionMode.Decompress);
+                got = (z ?? (Stream)src).ReadAtLeast(_inflate.AsSpan(0, target), target, throwOnEndOfStream: false);
             }
-            body = inflated;
+            catch (InvalidDataException)
+            {
+                return info; // corrupt: stays "(compressed)"
+            }
+            if (got != uncompressedSize)
+                return info;
+            wasInflated = true;
+            body = _inflate.AsSpan(0, got);
             opCode = info.OriginalOpCode;
             if (opCode == OpCodes.Msg && body.Length >= 4)
+            {
                 info.Flags = (MsgFlags)BinaryPrimitives.ReadUInt32LittleEndian(body);
+                // kind-1 counts and the trailing $db/lsid/txnNumber come from the streaming scanner, which only saw compressed bytes
+                c.Sequences.Begin(OpCodes.Msg, body.Length);
+                c.Sequences.Feed(body);
+            }
         }
 
         ReadOnlySpan<byte> doc;
@@ -208,7 +235,7 @@ internal sealed class RequestParser
         }
 
         ExtractCommandFields(doc, info, records);
-        if (inflated == null)
+        if (!wasInflated)
         {
             // Fields at the end of a body longer than the capture come from the streaming scanner.
             var fields = c.Sequences.Fields;
@@ -222,7 +249,7 @@ internal sealed class RequestParser
             info.Client = ParseClient(doc);
 
         // kind-1 sequences: counts come from the streaming scanner (all documents), the first document from the capture
-        if (c.Sequences.SectionCount > 0 && inflated == null)
+        if (c.Sequences.SectionCount > 0)
         {
             for (var i = 0; i < c.Sequences.SectionCount; i++)
                 info.SeqDocs.Add((_names.Get(c.Sequences.Identifiers[i].AsSpan(0, c.Sequences.IdentifierLengths[i])), c.Sequences.DocCounts[i]));
@@ -266,7 +293,7 @@ internal sealed class RequestParser
                     if (id.AsInt64() is { } v) info.KillCursorIds.Add(v);
             }
             else if (!records) continue; // below: only records use these
-            else if (e.NameIs("comment"u8) && e.Type == BsonType.String) info.Comment = Truncate(e.AsString()!, 256);
+            else if (e.NameIs("comment"u8) && e.Type == BsonType.String) info.Comment = ExportComment(e.StringBytes);
             else if (e.NameIs("lsid"u8) && e.Type == BsonType.Document) info.Lsid = _lsids.HashDocument(e.Value);
         }
     }
@@ -316,26 +343,80 @@ internal sealed class RequestParser
     }
 
     /// <summary>First document of each kind-1 section present in the capture, as offsets into <paramref name="sections"/>.</summary>
-    private static void FirstSequenceDocuments(ReadOnlySpan<byte> sections, List<(int IdStart, int IdLength, int DocStart, int DocLength)> result)
+    internal static void FirstSequenceDocuments(ReadOnlySpan<byte> sections, List<(int IdStart, int IdLength, int DocStart, int DocLength)> result)
     {
-        var p = 0;
-        while (p + 5 <= sections.Length && sections[p] == 1)
+        var it = new MsgSections(sections);
+        while (it.MoveNext() && it.Kind == 1)
         {
-            var size = BinaryPrimitives.ReadInt32LittleEndian(sections[(p + 1)..]);
-            if (size < 4) break;
+            var p = it.Offset;
             var idStart = p + 5;
             var nul = sections[idStart..].IndexOf((byte)0);
             if (nul < 0) break;
             var docStart = idStart + nul + 1;
-            if (docStart + 4 <= sections.Length && docStart < p + 1 + size)
+            // no `docStart + docLen`: docLen is untrusted (PO-9)
+            if (sections.Length - docStart >= 4 && docStart - p - 1 < it.Size)
             {
                 var docLen = BinaryPrimitives.ReadInt32LittleEndian(sections[docStart..]);
-                if (docLen >= 5 && docStart + docLen <= sections.Length)
+                if (docLen >= 5 && docLen <= sections.Length - docStart)
                     result.Add((idStart, nul, docStart, docLen));
             }
-            p += 1 + size;
+            if (it.Truncated) break;
         }
     }
 
-    private static string Truncate(string s, int max) => s.Length <= max ? s : s[..max];
+    /// <summary>
+    /// The <c>comment</c> as exported (02 §4.2): up to 256 chars, under the value mode like any other string
+    /// (cut at <c>truncateStringsAt</c> when <c>truncated</c>, absent when <c>shape</c>). Decodes only what it keeps.
+    /// </summary>
+    private string? ExportComment(ReadOnlySpan<byte> utf8)
+    {
+        var mode = _redactor.Mode;
+        if (mode == ValueMode.Shape) return null;
+        var max = mode == ValueMode.Truncated ? Math.Min(256, _redactor.TruncateAt) : 256;
+        if (utf8.Length > max * 4) // a char is at most 4 UTF-8 bytes
+        {
+            var cut = max * 4;
+            while (cut > 0 && (utf8[cut] & 0xC0) == 0x80) cut--;
+            utf8 = utf8[..cut];
+        }
+        var s = Encoding.UTF8.GetString(utf8);
+        return s.Length <= max ? s : s[..max];
+    }
+
+    /// <summary>
+    /// compression=observe, reply side (01 §8): runs the reply scanner over the inflated head of an OP_COMPRESSED reply
+    /// (the capture holds the first <c>commandBytes</c> of it) and takes <c>moreToCome</c> from the inflated flags.
+    /// A reply cut short by the capture leaves <c>facts.Parsed</c> false. Never throws on corrupt input.
+    /// </summary>
+    public void ScanCompressedReply(FrameCapture f)
+    {
+        if (_compression != CompressionMode.Observe || f.CapturedLength < 9) return;
+        var b = f.Buffer;
+        var original = BinaryPrimitives.ReadInt32LittleEndian(b);
+        var size = BinaryPrimitives.ReadInt32LittleEndian(b.AsSpan(4));
+        var compressorId = b[8];
+        if (compressorId is not (0 or 2) || original is not (OpCodes.Msg or OpCodes.Reply) || size < 0) return;
+        var limit = Math.Min(size, MaxObservedInflate);
+        f.Scanner.Begin(original, f.Facts);
+        try
+        {
+            using var src = new MemoryStream(b, 9, f.CapturedLength - 9, writable: false);
+            using var z = compressorId == 0 ? null : new ZLibStream(src, System.IO.Compression.CompressionMode.Decompress);
+            var stream = z ?? (Stream)src;
+            for (var total = 0; total < limit;)
+            {
+                var want = Math.Min(_replyChunk.Length, limit - total);
+                var n = stream.ReadAtLeast(_replyChunk.AsSpan(0, want), want, throwOnEndOfStream: false);
+                if (n <= 0) break;
+                if (total == 0 && original == OpCodes.Msg && n >= 4)
+                    f.Flags = (MsgFlags)BinaryPrimitives.ReadUInt32LittleEndian(_replyChunk);
+                f.Scanner.Feed(_replyChunk.AsSpan(0, n));
+                total += n;
+            }
+        }
+        catch (InvalidDataException)
+        {
+            // corrupt or cut-off deflate stream: the facts so far stand, Parsed stays false
+        }
+    }
 }

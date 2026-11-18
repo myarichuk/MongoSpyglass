@@ -15,16 +15,30 @@ internal sealed class CaptureTap : IFrameTap
     private readonly CapturePool _pool;
     private readonly Observer _observer;
     private readonly Counter _noSlot;
+    private readonly Counter _queueFull;
     private readonly Counter _tapFault;
     private FrameCapture? _slot;
 
-    public CaptureTap(ConnectionContext conn, bool isRequest, CapturePool pool, Observer observer, Counter noSlot, Counter tapFault)
+    /// <summary>01 §4's per-connection ring, per direction: a connection can't hold more than this many slots at once.</summary>
+    internal const int RingSlots = 512;
+    /// <summary>Slot-less reply notices outstanding per connection: a stalled observer cannot grow its queue without bound (FP-3).</summary>
+    internal const int UnobservedSlots = 64;
+    private readonly int[] _inflight = new int[1];
+
+    // A reply that got no slot still tells the observer which request it answers (and whether more replies follow),
+    // so the pending entry is released instead of lingering until the connection closes.
+    private bool _lost;
+    private int _lostRequestId, _lostResponseTo, _lostOpCode, _lostFlagsHave;
+    private readonly byte[] _lostFlags = new byte[4];
+
+    public CaptureTap(ConnectionContext conn, bool isRequest, CapturePool pool, Observer observer, Counter noSlot, Counter queueFull, Counter tapFault)
     {
         _conn = conn;
         _isRequest = isRequest;
         _pool = pool;
         _observer = observer;
         _noSlot = noSlot;
+        _queueFull = queueFull;
         _tapFault = tapFault;
     }
 
@@ -37,12 +51,26 @@ internal sealed class CaptureTap : IFrameTap
                 _pool.Return(_slot);
                 _slot = null;
             }
-            var slot = _pool.Rent(_isRequest);
+            _lost = false;
+            FrameCapture? slot = null;
+            if (Volatile.Read(ref _inflight[0]) >= RingSlots)
+                _noSlot.Inc();
+            else if ((slot = _pool.Rent(_isRequest)) == null)
+                _queueFull.Inc();
             if (slot == null)
             {
-                _noSlot.Inc();
+                if (!_isRequest)
+                {
+                    _lost = true;
+                    _lostRequestId = header.RequestId;
+                    _lostResponseTo = header.ResponseTo;
+                    _lostOpCode = header.OpCode;
+                    _lostFlagsHave = header.OpCode == OpCodes.Msg ? 0 : 4;
+                }
                 return;
             }
+            Interlocked.Increment(ref _inflight[0]);
+            slot.Inflight = _inflight;
             slot.Conn = _conn;
             slot.RequestId = header.RequestId;
             slot.ResponseTo = header.ResponseTo;
@@ -72,7 +100,16 @@ internal sealed class CaptureTap : IFrameTap
     public void Body(ReadOnlySpan<byte> chunk)
     {
         var slot = _slot;
-        if (slot == null) return;
+        if (slot == null)
+        {
+            if (_lost && _lostFlagsHave < 4)
+            {
+                var n = Math.Min(4 - _lostFlagsHave, chunk.Length);
+                chunk[..n].CopyTo(_lostFlags.AsSpan(_lostFlagsHave));
+                _lostFlagsHave += n;
+            }
+            return;
+        }
         try
         {
             if (slot.FlagsHave < 4)
@@ -84,16 +121,21 @@ internal sealed class CaptureTap : IFrameTap
                     slot.Flags = (MsgFlags)System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(slot.FlagBytes);
             }
 
-            var room = slot.Buffer.Length - slot.CapturedLength;
-            if (room > 0)
+            // Requests are copied up to the capture limit; replies are only scanned, except OP_COMPRESSED ones under
+            // compression=observe, whose head the observer inflates (01 §8, §10).
+            if (_isRequest || slot.OpCode == OpCodes.Compressed)
             {
-                var copy = Math.Min(room, chunk.Length);
-                chunk[..copy].CopyTo(slot.Buffer.AsSpan(slot.CapturedLength));
-                slot.CapturedLength += copy;
-                if (copy < chunk.Length) slot.Truncated = true;
+                var room = slot.Buffer.Length - slot.CapturedLength;
+                if (room > 0)
+                {
+                    var copy = Math.Min(room, chunk.Length);
+                    chunk[..copy].CopyTo(slot.Buffer.AsSpan(slot.CapturedLength));
+                    slot.CapturedLength += copy;
+                    if (copy < chunk.Length) slot.Truncated = true;
+                }
+                else if (chunk.Length > 0)
+                    slot.Truncated = true;
             }
-            else if (chunk.Length > 0)
-                slot.Truncated = true;
 
             if (_isRequest)
                 slot.Sequences.Feed(chunk);
@@ -111,7 +153,19 @@ internal sealed class CaptureTap : IFrameTap
     public void End(long tLast)
     {
         var slot = _slot;
-        if (slot == null) return;
+        if (slot == null)
+        {
+            if (_lost)
+            {
+                _lost = false;
+                if (Volatile.Read(ref _conn.UnobservedInflight) >= UnobservedSlots)
+                    return; // the observer is far behind: the pending request it answers is left to the age-out / close sweep
+                Interlocked.Increment(ref _conn.UnobservedInflight);
+                var flags = _lostFlagsHave == 4 ? (MsgFlags)System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(_lostFlags) : MsgFlags.None;
+                _observer.PublishUnobservedReply(_conn, _lostResponseTo, _lostRequestId, _lostOpCode, flags);
+            }
+            return;
+        }
         _slot = null;
         slot.TLast = tLast;
         _observer.Publish(slot);
@@ -119,6 +173,7 @@ internal sealed class CaptureTap : IFrameTap
 
     public void Abort()
     {
+        _lost = false;
         var slot = _slot;
         _slot = null;
         if (slot != null)

@@ -57,7 +57,7 @@ public static class ReferenceShapeNormalizer
             case "find":
                 if (Get(cmd, "filter") is BsonDocument f) s["filter"] = NormFilter(c, f);
                 if (Get(cmd, "sort") is BsonDocument sort) s["sort"] = Ordered(sort);
-                if (Get(cmd, "projection") is BsonDocument proj) s["projection"] = proj;
+                if (Get(cmd, "projection") is BsonDocument proj) s["projection"] = NormProjection(c, proj);
                 foreach (var k in (string[])["limit", "skip", "batchSize"])
                     if (cmd.Contains(k)) s[k] = c.Mode == Mode.Shape ? "?" : cmd[k];
                 if (Get(cmd, "hint") is { } hint) s["hint"] = hint is BsonDocument keys ? Ordered(keys) : hint; // a key pattern, or an index name
@@ -223,6 +223,8 @@ public static class ReferenceShapeNormalizer
                 "$lookup" when body is BsonDocument l => NormLookup(c, l),
                 "$group" when body is BsonDocument g => NormGroup(c, g),
                 "$project" when body is BsonDocument pd => NormProjection(c, pd),
+                "$facet" when body is BsonDocument fd => NormFacet(c, fd),
+                "$unionWith" when body is BsonDocument uw => NormUnionWith(c, uw),
                 "$addFields" or "$set" or "$unset" => TagTree(c, body),
                 _ => TagTree(c, body),
             };
@@ -253,6 +255,22 @@ public static class ReferenceShapeNormalizer
                 BsonDocument sub when sub.ElementCount > 0 && !sub.GetElement(0).Name.StartsWith('$') => NormProjection(c, sub),
                 _ => TagTree(c, e.Value),
             };
+        return r;
+    }
+
+    private static BsonDocument NormFacet(Ctx c, BsonDocument f)
+    {
+        var r = new BsonDocument();
+        foreach (var e in f)
+            r[e.Name] = e.Value is BsonArray p ? NormPipeline(c, p) : TagTree(c, e.Value);
+        return r;
+    }
+
+    private static BsonDocument NormUnionWith(Ctx c, BsonDocument u)
+    {
+        var r = new BsonDocument();
+        if (u.Contains("coll")) r["coll"] = u["coll"];
+        if (Get(u, "pipeline") is BsonArray p) r["pipeline"] = NormPipeline(c, p);
         return r;
     }
 
@@ -292,7 +310,15 @@ public static class ReferenceShapeNormalizer
             case BsonArray a:
             {
                 var r = new BsonArray();
-                foreach (var x in Elements(a)) r.Add(TagTree(c, x));
+                var items = Elements(a).ToList();
+                // CA-14: an array of literals of one tag is that tag once, whatever its length (its size counts toward inCardinality)
+                if (items.Count > 0 && items.All(IsLiteral) && items.Select(x => Leaf(c, x)).Distinct().Count() == 1)
+                {
+                    c.InCard = Math.Max(c.InCard, Length(a));
+                    r.Add(Leaf(c, items[0]));
+                    return r;
+                }
+                foreach (var x in items) r.Add(TagTree(c, x));
                 return r;
             }
             case BsonString s when s.Value.StartsWith('$') && !s.Value.StartsWith("$redacted", StringComparison.Ordinal):
@@ -324,6 +350,9 @@ public static class ReferenceShapeNormalizer
             _ => "?other",
         };
     }
+
+    private static bool IsLiteral(BsonValue v) =>
+        v is not (BsonDocument or BsonArray) && !(v is BsonString s && s.Value.StartsWith('$'));
 
     private static string StringTag(string s) =>
         s == "$redacted" ? "?redacted" : LeafTags.Contains(s) ? s : "?string"; // already shaped by the proxy

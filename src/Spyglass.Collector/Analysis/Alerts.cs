@@ -10,7 +10,14 @@ public sealed class Alert
     public required string ScopeKey;
     public required Dictionary<string, string?> Scope;
     public Severity Severity;
-    public long FirstSeen, LastSeen;      // µs since epoch (event time)
+    public long FirstSeen, LastSeen;      // µs since epoch (event time: what the UI shows)
+    /// <summary>
+    /// Collector clock at the last occurrence (muted ones included): what the quiet period runs on. Event time comes from the
+    /// producer's clock, which may lag by more than the quiet period (CA-5). 0 in rows from before: <see cref="LastSeen"/> stands in.
+    /// </summary>
+    public long LastHitUs;
+    /// <summary>Collector clock when <see cref="Summary"/> last changed: a hot alert's summary is rebuilt at most once a second (CA-18).</summary>
+    [System.Text.Json.Serialization.JsonIgnore] public long SummaryAtUs;
     public long Occurrences;
     public List<string> SampleOpIds = [];
     public string Summary = "";
@@ -55,26 +62,37 @@ public sealed class AlertBook
     };
 
     private readonly Dictionary<(string Rule, string Scope), Alert> _alerts = [];
-    private readonly HashSet<(string Rule, string Scope)> _muted = [];
     private volatile Alert[] _snapshot = [];
     private bool _dirty;
 
     public Alert[] Snapshot() => _snapshot;
 
-    public bool IsMuted(string rule, string scopeKey) => _muted.Contains((rule, scopeKey));
+    /// <summary>The alert of <c>(rule, scope)</c>, for the caller to skip building a scope and a summary it will not need.</summary>
+    public Alert? Find(string rule, string scopeKey) => _alerts.GetValueOrDefault((rule, scopeKey));
 
-    /// <summary>Records an occurrence; null when muted.</summary>
-    public AlertChange? Hit(string rule, string scopeKey, Dictionary<string, string?> scope, string summary, string? opId, long ts, string? details = null)
+    /// <summary>
+    /// Records an occurrence; null when muted. <paramref name="hitUs"/> is the collector's clock (the quiet period runs on it);
+    /// <paramref name="ts"/> the event time.
+    /// </summary>
+    public AlertChange? Hit(string rule, string scopeKey, Dictionary<string, string?> scope, string summary, string? opId, long ts, long hitUs = 0, string? details = null)
     {
+        if (hitUs == 0) hitUs = ts;
         if (_alerts.TryGetValue((rule, scopeKey), out var a))
         {
-            if (a.Muted) return null;
+            a.LastHitUs = hitUs;
+            a.LastSeen = Math.Max(a.LastSeen, ts);
+            if (a.Muted) // silent, but the problem is still there: it must not resolve or expire under the mute (CA-21)
+            {
+                a.Occurrences++;
+                if (!a.Open) { a.Open = true; a.ResolvedAt = null; }
+                _dirty = true; // the occurrence count and times reach readers (and, through the caller, the store) while muted (FC-5)
+                return null;
+            }
             var reopened = !a.Open;
             a.Open = true;
             a.ResolvedAt = null;
             a.Occurrences++;
-            a.LastSeen = Math.Max(a.LastSeen, ts);
-            a.Summary = summary;
+            if (!ReferenceEquals(a.Summary, summary)) { a.Summary = summary; a.SummaryAtUs = hitUs; }
             if (details != null) a.Details = details;
             if (opId != null && a.SampleOpIds.Count < MaxSamples) a.SampleOpIds.Add(opId);
             _dirty = true;
@@ -89,15 +107,16 @@ public sealed class AlertBook
             Severity = DefaultSeverity(rule),
             FirstSeen = ts,
             LastSeen = ts,
+            LastHitUs = hitUs,
+            SummaryAtUs = hitUs,
             Occurrences = 1,
             Summary = summary,
             Details = details,
-            Muted = _muted.Contains((rule, scopeKey)),
         };
         if (opId != null) a.SampleOpIds.Add(opId);
         _alerts[(rule, scopeKey)] = a;
         _dirty = true;
-        return a.Muted ? null : new AlertChange(a, true);
+        return new AlertChange(a, true);
     }
 
     /// <summary>Resolves alerts quiet for their rule's period; returns those resolved.</summary>
@@ -106,7 +125,7 @@ public sealed class AlertBook
         var resolved = new List<Alert>();
         foreach (var a in _alerts.Values)
         {
-            if (!a.Open || nowUs - a.LastSeen < (long)QuietPeriod(a.Rule).TotalMicroseconds) continue;
+            if (!a.Open || nowUs - (a.LastHitUs != 0 ? a.LastHitUs : a.LastSeen) < (long)QuietPeriod(a.Rule).TotalMicroseconds) continue;
             a.Open = false;
             a.ResolvedAt = nowUs;
             resolved.Add(a);
@@ -115,23 +134,36 @@ public sealed class AlertBook
         return resolved;
     }
 
-    public bool SetMuted(string id, bool muted)
+    public bool SetMuted(string id, bool muted) => SetMuted(id, muted, out _);
+
+    public bool SetMuted(string id, bool muted, out Alert? alert)
     {
-        var a = _alerts.Values.FirstOrDefault(x => x.Id == id);
+        var a = alert = _alerts.Values.FirstOrDefault(x => x.Id == id);
         if (a == null) return false;
         a.Muted = muted;
-        if (muted) _muted.Add((a.Rule, a.ScopeKey));
-        else _muted.Remove((a.Rule, a.ScopeKey));
         _dirty = true;
         return true;
     }
 
-    /// <summary>Drops resolved alerts older than the retention (03 §7: 30 d after resolve).</summary>
-    public void Expire(long nowUs, TimeSpan retention)
+    /// <summary>
+    /// Drops resolved alerts older than the retention (03 §7: 30 d after resolve); returns the ids, for the store to delete.
+    /// A muted alert is kept: dropping it would lose the mute (CA-21).
+    /// </summary>
+    public List<string>? Expire(long nowUs, TimeSpan retention)
     {
-        foreach (var k in _alerts.Where(kv => kv.Value.ResolvedAt is { } r && nowUs - r > (long)retention.TotalMicroseconds).Select(kv => kv.Key).ToList())
+        var limit = (long)retention.TotalMicroseconds;
+        List<(string, string)>? drop = null;
+        foreach (var (k, a) in _alerts)
+            if (!a.Muted && a.ResolvedAt is { } r && nowUs - r > limit) (drop ??= []).Add(k);
+        if (drop == null) return null;
+        var ids = new List<string>(drop.Count);
+        foreach (var k in drop)
+        {
+            ids.Add(_alerts[k].Id);
             _alerts.Remove(k);
+        }
         _dirty = true;
+        return ids;
     }
 
     public IEnumerable<Alert> All => _alerts.Values;
@@ -139,7 +171,6 @@ public sealed class AlertBook
     public void Restore(Alert a)
     {
         _alerts[(a.Rule, a.ScopeKey)] = a;
-        if (a.Muted) _muted.Add((a.Rule, a.ScopeKey));
         _dirty = true;
     }
 

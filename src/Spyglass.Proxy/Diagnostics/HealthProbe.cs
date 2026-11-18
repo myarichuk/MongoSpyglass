@@ -6,7 +6,8 @@ namespace Spyglass.Proxy.Diagnostics;
 
 /// <summary>
 /// <c>spyglass-proxy healthcheck [--path /readyz]</c>: GETs the metrics listener (01 §12) and exits 0 on 200, 1 otherwise.
-/// The listener comes from <c>SPYGLASS_METRICS__BIND</c> (what the container sets), else the default; a wildcard address is
+/// The listener is the effective <c>metrics.bind</c>: <c>--bind</c>, else the configuration the proxy itself loads
+/// (<c>--config</c>/<c>SPYGLASS_CONFIG</c>, <c>SPYGLASS_*</c> environment), else the default; a wildcard address is
 /// probed on loopback. The container image has no shell or curl, so the probe is the binary itself, over a raw socket:
 /// it runs every 30 s in a fresh process, and HttpClient's JIT alone would cost ~0.3 s of CPU each time.
 /// </summary>
@@ -14,11 +15,30 @@ internal static class HealthProbe
 {
     public static async Task<int> RunAsync(string[] args)
     {
-        string? bind = Environment.GetEnvironmentVariable("SPYGLASS_METRICS__BIND"), path = "/readyz";
+        string? bind = null, path = "/readyz", config = null;
         for (var i = 0; i + 1 < args.Length; i += 2)
         {
             if (args[i] == "--bind") bind = args[i + 1];
             else if (args[i] == "--path") path = args[i + 1];
+            else if (args[i] == "--config") config = args[i + 1];
+        }
+        if (bind == null)
+        {
+            try
+            {
+                // the same loader as the proxy: a file-configured metrics.bind is honoured
+                bind = Config.ConfigLoader.Load(config != null ? ["--config", config] : []).Metrics.Bind;
+                if (bind == null)
+                {
+                    Console.WriteLine("metrics endpoint disabled (metrics.bind is unset); nothing to probe");
+                    return 0;
+                }
+            }
+            catch (Config.ConfigException)
+            {
+                // e.g. no upstream.uri in this process's view of the config: fall back to what the container sets
+                bind = Environment.GetEnvironmentVariable("SPYGLASS_METRICS__BIND");
+            }
         }
         var ep = IPEndPoint.Parse(bind is { Length: > 0 } ? bind : new Config.MetricsConfig().Bind!);
         var host = ep.Address.Equals(IPAddress.Any) ? IPAddress.Loopback

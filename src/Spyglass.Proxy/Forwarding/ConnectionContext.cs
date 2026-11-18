@@ -33,6 +33,8 @@ internal sealed class ConnectionContext
 
     public long BytesFromClient;
     public long BytesFromServer;
+    /// <summary>Slot-less reply notices posted to the observer and not yet handled; bounded per connection (01 §4, FP-3).</summary>
+    public int UnobservedInflight;
 
     // ---- pending hello-family requests (written by the request pump, consumed by the reply pump) ----
     // Rare (handshake + heartbeats), so a lock is fine; the reply pump checks the volatile count first
@@ -41,6 +43,8 @@ internal sealed class ConnectionContext
     private readonly object _helloGate = new();
     private readonly int[] _pendingHello = new int[8];
     private int _pendingHelloCount;
+
+    public bool HasPendingHello => Volatile.Read(ref _pendingHelloCount) != 0;
 
     public void AddPendingHello(int requestId)
     {

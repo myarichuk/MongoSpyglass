@@ -13,15 +13,24 @@ internal sealed class WorkQueue<T>
     private readonly ConcurrentQueue<T> _queue = new();
     private readonly ManualResetEventSlim _signal = new(false, spinCount: 0);
     private volatile bool _completed;
+    /// <summary>Adds between their completed-check and their enqueue: the consumer must not finish while one is in flight.</summary>
+    private int _adding;
 
     public int Count => _queue.Count;
-    public bool IsCompleted => _completed && _queue.IsEmpty;
+    public bool IsCompleted => _completed && Volatile.Read(ref _adding) == 0 && _queue.IsEmpty;
 
     public void Add(T item)
     {
-        if (_completed) throw new InvalidOperationException("the queue is completed");
-        _queue.Enqueue(item);
-        _signal.Set();
+        // an Add that passed the check must not be stranded by a CompleteAdding plus the consumer's final empty check
+        // before its enqueue: IsCompleted stays false while one is between the two
+        Interlocked.Increment(ref _adding);
+        try
+        {
+            if (_completed) throw new InvalidOperationException("the queue is completed");
+            _queue.Enqueue(item);
+            _signal.Set();
+        }
+        finally { Interlocked.Decrement(ref _adding); }
     }
 
     public bool TryTake(out T item) => _queue.TryDequeue(out item!);
